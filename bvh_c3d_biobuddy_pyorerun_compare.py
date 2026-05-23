@@ -31,6 +31,21 @@ the ROOT OFFSET is a static rest-pose offset, while ROOT X/Y/Zposition channels 
 absolute laboratory coordinates. If the ROOT OFFSET is also kept in the generated bioMod, it
 must be subtracted from the root translational q before animation; otherwise the model is shifted
 relative to the C3D markers. This correction is enabled by default.
+
+Beginner reading notes
+----------------------
+The code uses a few recurring conventions:
+
+- A trajectory is usually a NumPy array. For markers, the shape is
+  ``3 x n_markers x n_frames``: the first axis is X/Y/Z, the second is the
+  marker number, and the third is time.
+- Generalized coordinates ``q`` have shape ``n_q x n_frames``: one row per
+  biorbd degree of freedom, one column per time frame.
+- Rotations sent to biorbd are always in radians. BVH/FBX and many C3D angle
+  exports store angles in degrees, so the script converts them explicitly.
+- BVH, FBX and C3D may not use metres internally. The script keeps BVH/FBX q in
+  the model native unit, then converts C3D marker positions only when comparing
+  or overlaying data.
 """
 
 from __future__ import annotations
@@ -51,7 +66,8 @@ from typing import Any, Iterable
 
 import numpy as np
 
-
+# These labels are Captury angle channels, not marker trajectories. Keeping this
+# list close to the top makes the filtering rule easy to find and edit.
 DEFAULT_C3D_ANGLE_LABELS = {
     "RHip",
     "LHip",
@@ -132,6 +148,8 @@ def as_str_list(value: Any) -> list[str]:
 
 
 def c3d_point_unit_scale_to_m(c3d: dict) -> float:
+    # C3D files store their unit as metadata. We convert through metres so BVH,
+    # FBX and C3D can be compared even when their native units differ.
     units = as_str_list(get_c3d_param(c3d, "POINT", "UNITS", [""]))
     unit = units[0].strip().lower() if units else ""
     if unit in {"mm", "millimeter", "millimeters", "millimetre", "millimetres"}:
@@ -156,6 +174,8 @@ def interpolate_array(data: np.ndarray, source_time: np.ndarray, target_time: np
     if source_time.shape == target_time.shape and np.allclose(source_time, target_time):
         return data.copy()
 
+    # NumPy interpolation is one-dimensional. Flatten every non-time dimension,
+    # interpolate each signal, then reshape back to the original marker/q layout.
     flat = data.reshape((-1, data.shape[-1]))
     out = np.empty((flat.shape[0], target_time.shape[0]), dtype=float)
     for i, y in enumerate(flat):
@@ -230,6 +250,9 @@ def subtract_static_root_offset_from_q(
         return corrected
 
     root_offset = np.asarray(root_offset, dtype=float).reshape(3)
+    # BioBuddy's newer parsers name translations Hips_transX, while the legacy
+    # fallback used names like Hips_Xposition. Support both so old outputs can
+    # still be inspected.
     axis_to_index = {"X": 0, "Y": 1, "Z": 2}
     for axis, axis_index in axis_to_index.items():
         supported_names = {
@@ -290,6 +313,9 @@ def q_unwrap_summary(q_before: np.ndarray, q_after: np.ndarray, q_names: list[st
 
 @dataclass
 class BvhRuntimeData:
+    # Small container for all BVH animation data used later in the pipeline.
+    # Dataclasses avoid passing long tuples where the meaning of each element is
+    # easy to forget.
     parser: Any
     joint_names: list[str]
     channel_entries_file_order: list[tuple[str, str]]
@@ -312,6 +338,7 @@ class FbxRecord:
 
 @dataclass
 class FbxRuntimeData:
+    # Same idea as BvhRuntimeData, but for the FBX parser and animation.
     parser: Any
     joint_names: list[str]
     q: np.ndarray
@@ -378,6 +405,8 @@ def runtime_q_from_parsed_animation(
     root_offset: np.ndarray,
     apply_root_offset_correction: bool,
 ) -> tuple[np.ndarray, np.ndarray, dict[str, Any]]:
+    # BioBuddy gives q in biorbd order. This helper applies the two project-level
+    # corrections that are not BioBuddy's job: root offset policy and angle unwrap.
     q_raw = np.asarray(parsed_animation.q, dtype=float)
     q_root_corrected = subtract_static_root_offset_from_q(
         q=q_raw,
@@ -600,6 +629,8 @@ def extract_q_from_fbx_parser(
 ) -> FbxRuntimeData:
     """Extract FBX generalized coordinates through BioBuddy, with a legacy parser fallback."""
     if hasattr(parser, "to_q"):
+        # Preferred path with the current BioBuddy branch: no custom FBX curve
+        # mapping here, just ask BioBuddy for the animation in model q order.
         parsed_animation = parser.to_q()
         q_names = [str(name) for name in parsed_animation.dof_names]
         joint_names = collect_fbx_joint_names_depth_first(parser)
@@ -969,6 +1000,8 @@ def build_biomod_from_fbx_with_biobuddy(
 
     mesh_dir = biomod_path.parent / "meshes"
     if include_mesh:
+        # Mesh files are generated artifacts. Removing old ones keeps reports and
+        # directory listings from mixing outputs from different parser versions.
         clean_generated_fbx_meshes(mesh_dir)
 
     try:
@@ -1056,6 +1089,8 @@ def extract_q_from_biobuddy_bvh_parser(
     correction, the biorbd model is translated by q_root + root_offset instead of q_root.
     """
     if hasattr(parser, "to_q"):
+        # Preferred path with the current BioBuddy branch. The fallback below is
+        # kept only to make the script easier to run with older development builds.
         parsed_animation = parser.to_q()
         joint_names, file_order, q_order = collect_bvh_channels(parser)
         q_names = [str(name) for name in parsed_animation.dof_names]
@@ -1259,6 +1294,8 @@ def split_c3d_points(
     if len(descriptions) < len(labels):
         descriptions += [""] * (len(labels) - len(descriptions))
 
+    # ezc3d stores point data as 4 x n_points x n_frames. Rows 0, 1 and 2 are
+    # X/Y/Z. Row 3 is a residual/confidence value, so it is not a coordinate.
     points = np.asarray(c3d["data"]["points"], dtype=float)[:3, :, :]
     time = c3d_time_vector(c3d)
     c3d_unit_scale = c3d_point_unit_scale_to_m(c3d)
@@ -1280,6 +1317,8 @@ def split_c3d_points(
         return False
 
     angle_indices = [i for i in range(len(labels)) if is_angle_point(i)]
+    # Angles can live in the POINT section of a C3D, but they are not physical
+    # markers. The rest of the script only animates and localizes marker_indices.
     marker_indices = [i for i in range(len(labels)) if i not in set(angle_indices)]
 
     marker_data_native = points[:, marker_indices, :]
@@ -1454,6 +1493,8 @@ def compute_model_joint_centres_native(
         for i, name in enumerate(names):
             if name not in centres:
                 continue
+            # biorbd.globalJCS gives a segment pose as a 4x4 matrix. The last
+            # column is the global position of that segment origin.
             rt = np.asarray(model.globalJCS(q_frame, i).to_array(), dtype=float)
             centres[name][:, frame] = rt[:3, 3]
     return centres
@@ -1500,6 +1541,8 @@ def choose_root_offset_policy(
     requested_mode: str,
     out_dir: Path,
 ) -> tuple[bool, dict[str, Any], dict[str, np.ndarray]]:
+    # Compare both root-translation conventions against the marker cloud. The
+    # lower median nearest-centre distance is the better visual overlay.
     corrected_centres = compute_model_joint_centres_native(biomod_path, corrected_q, set(joint_names))
     uncorrected_centres = compute_model_joint_centres_native(biomod_path, uncorrected_q, set(joint_names))
     corrected_score = root_alignment_score(corrected_centres, time, c3d_markers_source_units, c3d_time)
@@ -2095,6 +2138,8 @@ def main() -> None:
     out_dir.mkdir(parents=True, exist_ok=True)
     root_offset_mode = "keep" if args.no_root_offset_correction else args.root_offset_mode
 
+    # 1. Build the BVH model. The bioMod is the biorbd model file used by all
+    # later steps: joint centres, local marker coordinates and animation.
     biomod_path = out_dir / "model_from_bvh_biobuddy.bioMod"
     model, parser = build_biomod_from_bvh_with_biobuddy(
         bvh_path=args.bvh,
@@ -2102,6 +2147,9 @@ def main() -> None:
         add_joint_centre_markers=not args.no_biomod_joint_centre_markers,
     )
 
+    # 2. Read the C3D once and split POINT channels into real markers vs angles.
+    # This avoids accidentally animating Captury joint angles as if they were
+    # marker positions.
     c3d_split = split_c3d_points(
         c3d_path=args.c3d,
         bvh_unit_scale_to_m=args.bvh_unit_scale_to_m,
@@ -2110,6 +2158,9 @@ def main() -> None:
     )
     c3d_markers_npz, c3d_angles_npz, detected_angle_labels_txt = save_c3d_split_outputs(c3d_split, out_dir)
 
+    # 3. Extract BVH q twice: one version subtracts the static root offset, the
+    # other keeps root translation exactly as written in the BVH. The policy
+    # selector below keeps the version that overlays better with the C3D markers.
     bvh_corrected_runtime = extract_q_from_biobuddy_bvh_parser(parser, apply_root_offset_correction=True)
     bvh_uncorrected_runtime = extract_q_from_biobuddy_bvh_parser(parser, apply_root_offset_correction=False)
     bvh_use_correction, bvh_policy_report, centres_native = choose_root_offset_policy(
@@ -2126,6 +2177,8 @@ def main() -> None:
         out_dir=out_dir,
     )
     bvh_runtime = bvh_corrected_runtime if bvh_use_correction else bvh_uncorrected_runtime
+    # 4. Save q in both NPZ and CSV. NPZ is convenient for Python; CSV is easier
+    # to inspect in a spreadsheet.
     q_npz, q_csv = save_q_outputs(
         bvh_runtime.q,
         bvh_runtime.q_names,
@@ -2135,6 +2188,8 @@ def main() -> None:
         bvh_runtime.q_units,
     )
     joint_centres_npz = save_model_joint_centres(centres_native, bvh_runtime.time, out_dir, "bvh")
+    # 5. Use biorbd segment poses to express each C3D marker in local segment
+    # frames. A true anatomical marker should be almost fixed in one local frame.
     bvh_local_markers_csv, bvh_local_marker_summary = compute_and_append_c3d_local_markers(
         biomod_path=biomod_path,
         q=bvh_runtime.q,
@@ -2145,6 +2200,8 @@ def main() -> None:
         out_dir=out_dir,
     )
 
+    # 6. Create a C3D copy with generated joint centres so external tools can
+    # inspect markers and model centres on the same time base.
     augmented_c3d_path = append_joint_centres_to_c3d(
         split=c3d_split,
         centres_native=centres_native,
@@ -2166,6 +2223,7 @@ def main() -> None:
         )
     )
 
+    # 7. Compare rotational q channels to the angle channels found in the C3D.
     pairwise_csv, best_csv = write_pairwise_q_vs_c3d_angle_comparison(
         q=bvh_runtime.q,
         q_names=bvh_runtime.q_names,
@@ -2190,6 +2248,8 @@ def main() -> None:
     mapping_template = write_mapping_template(bvh_runtime.q_names, c3d_split.angle_labels, out_dir)
 
     if args.animate:
+        # Animation is optional because it opens/runs rerun. The numeric outputs
+        # above are produced even when --animate is not used.
         if args.headless:
             os.environ["PYORERUN_HEADLESS"] = "1"
         animate_with_pyorerun(
@@ -2205,6 +2265,8 @@ def main() -> None:
     fbx_outputs: dict[str, Any] | None = None
     fbx_report: dict[str, Any] | None = None
     if args.fbx is not None:
+        # Repeat the same model/q/local-marker workflow for the FBX file when it
+        # is provided. The FBX branch also writes segment mesh surfaces.
         fbx_biomod_path = out_dir / "model_from_fbx_biobuddy.bioMod"
         _, fbx_parser, fbx_mesh_report = build_biomod_from_fbx_with_biobuddy(
             fbx_path=args.fbx,
