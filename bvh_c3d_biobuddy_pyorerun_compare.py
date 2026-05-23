@@ -618,39 +618,134 @@ def extract_q_from_fbx_parser(
     )
 
 
-def extract_fbx_mesh_vertices(fbx_tree: dict[str, Any]) -> np.ndarray:
+def polygon_vertex_indices_to_faces(polygon_vertex_indices: np.ndarray) -> list[list[int]]:
+    """Decode FBX polygon indices into zero-based faces.
+
+    FBX encodes the final vertex of each polygon as ``-index - 1``.
+    """
+    faces: list[list[int]] = []
+    current: list[int] = []
+    for raw_index in polygon_vertex_indices.astype(int).tolist():
+        if raw_index < 0:
+            current.append(-raw_index - 1)
+            if len(current) >= 3:
+                faces.append(current)
+            current = []
+        else:
+            current.append(raw_index)
+    return faces
+
+
+def triangulate_faces(faces: list[list[int]]) -> list[tuple[int, int, int]]:
+    triangles: list[tuple[int, int, int]] = []
+    for face in faces:
+        if len(face) == 3:
+            triangles.append((face[0], face[1], face[2]))
+        elif len(face) > 3:
+            for i in range(1, len(face) - 1):
+                triangles.append((face[0], face[i], face[i + 1]))
+    return triangles
+
+
+def extract_fbx_meshes(fbx_tree: dict[str, Any]) -> list[dict[str, Any]]:
     objects = fbx_top_record(fbx_tree, "Objects")
     if objects is None:
-        return np.zeros((3, 0))
-    meshes: list[np.ndarray] = []
+        return []
+    meshes: list[dict[str, Any]] = []
     for record in objects.children:
         if record.name != "Geometry" or len(record.properties) < 3 or str(record.properties[2]) != "Mesh":
             continue
         vertices_record = next((child for child in record.children if child.name == "Vertices"), None)
-        if vertices_record is None or not vertices_record.properties:
+        polygon_record = next((child for child in record.children if child.name == "PolygonVertexIndex"), None)
+        if vertices_record is None or polygon_record is None or not vertices_record.properties or not polygon_record.properties:
             continue
-        values = np.asarray(vertices_record.properties[0], dtype=float)
-        if values.size < 3:
+        vertex_values = np.asarray(vertices_record.properties[0], dtype=float)
+        polygon_values = np.asarray(polygon_record.properties[0], dtype=int)
+        if vertex_values.size < 3 or polygon_values.size < 3:
             continue
-        meshes.append(values.reshape((-1, 3)).T)
-    return np.concatenate(meshes, axis=1) if meshes else np.zeros((3, 0))
+        vertices = vertex_values.reshape((-1, 3)).T
+        faces = polygon_vertex_indices_to_faces(polygon_values)
+        triangles = triangulate_faces(faces)
+        if triangles:
+            meshes.append(
+                {
+                    "name": clean_fbx_name(str(record.properties[1])),
+                    "vertices": vertices,
+                    "triangles": triangles,
+                }
+            )
+    return meshes
 
 
-def append_fbx_mesh_points_to_biomod(
+def write_fbx_mesh_obj(
+    fbx_tree: dict[str, Any],
+    obj_path: Path,
+    root_translation: np.ndarray,
+    max_vertices: int,
+) -> dict[str, Any]:
+    meshes = extract_fbx_meshes(fbx_tree)
+    if not meshes:
+        return {"mesh_file": None, "mesh_vertices": 0, "mesh_faces": 0}
+
+    obj_path.parent.mkdir(parents=True, exist_ok=True)
+    vertex_offset = 0
+    kept_vertices_total = 0
+    kept_faces_total = 0
+    with obj_path.open("w", encoding="utf-8") as f:
+        f.write("# Generated from FBX Geometry/Vertices and PolygonVertexIndex\n")
+        for mesh in meshes:
+            vertices = np.asarray(mesh["vertices"], dtype=float) - root_translation.reshape(3, 1)
+            triangles = list(mesh["triangles"])
+            if vertices.shape[1] > max_vertices > 0:
+                # Keep a deterministic subset of vertices and only faces fully
+                # contained in that subset. Use 0 for all vertices/faces.
+                kept = np.linspace(0, vertices.shape[1] - 1, max_vertices, dtype=int)
+                kept_set = set(int(i) for i in kept)
+                remap = {int(old): new for new, old in enumerate(kept)}
+                vertices = vertices[:, kept]
+                triangles = [
+                    (remap[a], remap[b], remap[c])
+                    for a, b, c in triangles
+                    if a in kept_set and b in kept_set and c in kept_set
+                ]
+            f.write(f"o {sanitize_biomod_name(str(mesh['name']), 'fbx_mesh')}\n")
+            for vertex in vertices.T:
+                f.write(f"v {vertex[0]:0.8f} {vertex[1]:0.8f} {vertex[2]:0.8f}\n")
+            for tri in triangles:
+                a, b, c = (vertex_offset + tri[0] + 1, vertex_offset + tri[1] + 1, vertex_offset + tri[2] + 1)
+                f.write(f"f {a} {b} {c}\n")
+            vertex_offset += vertices.shape[1]
+            kept_vertices_total += int(vertices.shape[1])
+            kept_faces_total += len(triangles)
+    return {
+        "mesh_file": str(obj_path),
+        "mesh_vertices": kept_vertices_total,
+        "mesh_faces": kept_faces_total,
+    }
+
+
+def append_fbx_mesh_file_to_biomod(
     biomod_path: Path,
     fbx_tree: dict[str, Any],
     parent_name: str | None,
     root_translation: np.ndarray,
-    max_points: int,
+    max_vertices: int,
 ) -> dict[str, Any]:
-    vertices = extract_fbx_mesh_vertices(fbx_tree)
-    if vertices.size == 0 or parent_name is None:
-        return {"mesh_points_appended": 0, "mesh_parent": parent_name}
-    if vertices.shape[1] > max_points > 0:
-        indices = np.linspace(0, vertices.shape[1] - 1, max_points, dtype=int)
-        vertices = vertices[:, indices]
+    if parent_name is None:
+        return {"mesh_file": None, "mesh_vertices": 0, "mesh_faces": 0, "mesh_parent": parent_name}
 
-    vertices_local = vertices - root_translation.reshape(3, 1)
+    mesh_dir = biomod_path.parent / "meshes"
+    obj_path = mesh_dir / "unknown_fbx_mesh.obj"
+    mesh_report = write_fbx_mesh_obj(
+        fbx_tree=fbx_tree,
+        obj_path=obj_path,
+        root_translation=root_translation,
+        max_vertices=max_vertices,
+    )
+    if mesh_report["mesh_vertices"] == 0 or mesh_report["mesh_faces"] == 0:
+        mesh_report["mesh_parent"] = parent_name
+        return mesh_report
+
     text = biomod_path.read_text(encoding="utf-8")
     segment_header = f"segment\t{parent_name}"
     start = text.find(segment_header)
@@ -658,16 +753,18 @@ def append_fbx_mesh_points_to_biomod(
         segment_header = f"segment {parent_name}"
         start = text.find(segment_header)
     if start < 0:
-        return {"mesh_points_appended": 0, "mesh_parent": parent_name}
+        mesh_report["mesh_parent"] = parent_name
+        return mesh_report
     end = text.find("endsegment", start)
     if end < 0:
-        return {"mesh_points_appended": 0, "mesh_parent": parent_name}
-    mesh_lines = "".join(
-        f"\tmesh\t{p[0]:0.6f}\t{p[1]:0.6f}\t{p[2]:0.6f}\n" for p in vertices_local.T
-    )
-    text = text[:end] + mesh_lines + text[end:]
+        mesh_report["mesh_parent"] = parent_name
+        return mesh_report
+    meshfile_line = "\tmeshfile\tmeshes/unknown_fbx_mesh.obj\n"
+    meshscale_line = "\tmeshscale\t1\t1\t1\n"
+    text = text[:end] + meshfile_line + meshscale_line + text[end:]
     biomod_path.write_text(text, encoding="utf-8")
-    return {"mesh_points_appended": int(vertices_local.shape[1]), "mesh_parent": parent_name}
+    mesh_report["mesh_parent"] = parent_name
+    return mesh_report
 
 
 def build_biomod_from_bvh_with_biobuddy(
@@ -700,7 +797,7 @@ def build_biomod_from_fbx_with_biobuddy(
     biomod_path: Path,
     add_joint_centre_markers: bool = True,
     include_mesh: bool = True,
-    max_mesh_points: int = 3000,
+    max_mesh_points: int = 0,
 ) -> tuple[Any, Any, dict[str, Any]]:
     """Create a bioMod model from an FBX file and optionally append FBX mesh points."""
     BiomechanicalModelReal, _, FbxModelParser = require_biobuddy()
@@ -717,7 +814,7 @@ def build_biomod_from_fbx_with_biobuddy(
     if add_joint_centre_markers:
         append_joint_centre_markers_to_biomod(biomod_path, joint_names, marker_prefix="FBXJC_")
 
-    mesh_report: dict[str, Any] = {"mesh_points_appended": 0, "mesh_parent": None}
+    mesh_report: dict[str, Any] = {"mesh_file": None, "mesh_vertices": 0, "mesh_faces": 0, "mesh_parent": None}
     if include_mesh:
         fbx_tree = parse_fbx_records(fbx_path)
         root_name = joint_names[0] if joint_names else None
@@ -726,12 +823,12 @@ def build_biomod_from_fbx_with_biobuddy(
             if parser.root_ids
             else np.zeros(3)
         )
-        mesh_report = append_fbx_mesh_points_to_biomod(
+        mesh_report = append_fbx_mesh_file_to_biomod(
             biomod_path=biomod_path,
             fbx_tree=fbx_tree,
             parent_name=root_name,
             root_translation=root_translation,
-            max_points=max_mesh_points,
+            max_vertices=max_mesh_points,
         )
 
     return model, parser, mesh_report
@@ -1722,9 +1819,9 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--max-fbx-mesh-points",
-        default=3000,
+        default=0,
         type=int,
-        help="Maximum FBX mesh vertices to append as bioMod mesh points. Use 0 for all points.",
+        help="Maximum FBX mesh vertices to export to OBJ. Use 0 for all vertices/faces.",
     )
     parser.add_argument("--animate", action="store_true", help="Launch a pyorerun animation.")
     parser.add_argument(
