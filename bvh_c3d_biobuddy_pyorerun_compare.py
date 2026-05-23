@@ -1316,6 +1316,41 @@ def marker_data_in_source_units(split: C3dSplitData, source_unit_scale_to_m: flo
     return split.marker_data_native * (split.c3d_unit_scale_to_m / source_unit_scale_to_m)
 
 
+def build_animation_markers_with_joint_centres(
+    split: C3dSplitData,
+    centres_native: dict[str, np.ndarray],
+    source_time: np.ndarray,
+    source_unit_scale_to_m: float,
+    label_prefix: str,
+    out_dir: Path,
+    source_name: str,
+) -> tuple[np.ndarray, list[str], Path]:
+    """Build animation markers from C3D markers plus generated joint centres.
+
+    The input C3D contains marker points and angle point channels. ``split`` has
+    already removed the angle channels, so this overlay contains only true C3D
+    markers and the model joint centres appended by this pipeline.
+    """
+    marker_data = marker_data_in_source_units(split, source_unit_scale_to_m)
+    marker_labels = list(split.marker_labels)
+    if centres_native:
+        joint_names = list(centres_native.keys())
+        joint_data = np.stack([centres_native[name] for name in joint_names], axis=1)
+        joint_data_on_c3d_time = interpolate_array(joint_data, source_time, split.time)
+        marker_data = np.concatenate((marker_data, joint_data_on_c3d_time), axis=1)
+        marker_labels.extend([f"{label_prefix}{name}" for name in joint_names])
+
+    out_path = out_dir / f"{source_name}_animation_markers_no_angles_with_joint_centres.npz"
+    np.savez(
+        out_path,
+        time=split.time,
+        marker_labels=np.asarray(marker_labels, dtype=object),
+        markers=marker_data,
+        source_name=source_name,
+    )
+    return marker_data, marker_labels, out_path
+
+
 def write_local_marker_csv(rows: list[dict[str, Any]], out_path: Path) -> Path:
     fieldnames = [
         "marker",
@@ -1905,6 +1940,17 @@ def main() -> None:
         label_prefix="BVHJC_",
         description="BVH joint centre generated from BioBuddy BVH parser",
     )
+    bvh_animation_markers, bvh_animation_marker_labels, bvh_animation_markers_npz = (
+        build_animation_markers_with_joint_centres(
+            split=c3d_split,
+            centres_native=centres_native,
+            source_time=bvh_runtime.time,
+            source_unit_scale_to_m=args.bvh_unit_scale_to_m,
+            label_prefix="BVHJC_",
+            out_dir=out_dir,
+            source_name="bvh",
+        )
+    )
 
     pairwise_csv, best_csv = write_pairwise_q_vs_c3d_angle_comparison(
         q=bvh_runtime.q,
@@ -1936,8 +1982,8 @@ def main() -> None:
             biomod_path=biomod_path,
             q=bvh_runtime.q,
             bvh_time=bvh_runtime.time,
-            c3d_markers_bvh_units=c3d_split.marker_data_bvh_units,
-            c3d_marker_labels=c3d_split.marker_labels,
+            c3d_markers_bvh_units=bvh_animation_markers,
+            c3d_marker_labels=bvh_animation_marker_labels,
             c3d_time=c3d_split.time,
             display_q_in_rerun=args.display_q_in_rerun,
         )
@@ -2002,13 +2048,24 @@ def main() -> None:
             label_prefix="FBXJC_",
             description="FBX joint centre generated from BioBuddy FBX parser",
         )
+        fbx_animation_markers, fbx_animation_marker_labels, fbx_animation_markers_npz = (
+            build_animation_markers_with_joint_centres(
+                split=c3d_split,
+                centres_native=fbx_centres_native,
+                source_time=fbx_runtime.time,
+                source_unit_scale_to_m=args.fbx_unit_scale_to_m,
+                label_prefix="FBXJC_",
+                out_dir=out_dir,
+                source_name="fbx",
+            )
+        )
         if args.animate:
             animate_with_pyorerun(
                 biomod_path=fbx_biomod_path,
                 q=fbx_runtime.q,
                 bvh_time=fbx_runtime.time,
-                c3d_markers_bvh_units=marker_data_in_source_units(c3d_split, args.fbx_unit_scale_to_m),
-                c3d_marker_labels=c3d_split.marker_labels,
+                c3d_markers_bvh_units=fbx_animation_markers,
+                c3d_marker_labels=fbx_animation_marker_labels,
                 c3d_time=c3d_split.time,
                 name="fbx_biobuddy_c3d_comparison",
                 display_q_in_rerun=args.display_q_in_rerun,
@@ -2019,6 +2076,7 @@ def main() -> None:
             "fbx_q_csv": str(fbx_q_csv),
             "fbx_joint_centres_npz": str(fbx_joint_centres_npz),
             "augmented_c3d": str(fbx_augmented_c3d_path),
+            "animation_markers_no_angles_with_joint_centres": str(fbx_animation_markers_npz),
             "local_markers_csv": str(fbx_local_markers_csv),
             "root_policy": str(out_dir / "fbx_root_translation_policy.json"),
         }
@@ -2044,6 +2102,7 @@ def main() -> None:
                 "fbx_joints": len(fbx_runtime.joint_names),
                 "fbx_q": int(fbx_runtime.q.shape[0]),
                 "fbx_frames": int(fbx_runtime.q.shape[1]),
+                "fbx_animation_points_with_joint_centres": len(fbx_animation_marker_labels),
             },
             "q_names": fbx_runtime.q_names,
         }
@@ -2068,6 +2127,7 @@ def main() -> None:
             "comparison_mapping_template": str(mapping_template),
             "bvh_local_markers_csv": str(bvh_local_markers_csv),
             "bvh_root_policy": str(out_dir / "bvh_root_translation_policy.json"),
+            "bvh_animation_markers_no_angles_with_joint_centres": str(bvh_animation_markers_npz),
             "fbx": fbx_outputs,
         },
         "counts": {
@@ -2075,6 +2135,7 @@ def main() -> None:
             "bvh_q": int(bvh_runtime.q.shape[0]),
             "bvh_frames": int(bvh_runtime.q.shape[1]),
             "c3d_marker_points_used_for_animation": len(c3d_split.marker_labels),
+            "bvh_animation_points_with_joint_centres": len(bvh_animation_marker_labels),
             "c3d_angle_point_channels_detected": len(c3d_split.angle_labels),
             "c3d_frames": int(c3d_split.marker_data_native.shape[2]),
         },

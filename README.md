@@ -41,6 +41,8 @@ The C3D contains both marker trajectories and angle-like point channels. The pip
 RHip LHip RKne LKne RAnk LAnk RSho LSho RElb LElb RWri LWri
 ```
 
+During animation, the marker overlay contains the C3D marker points after this angle filtering plus the generated joint centres (`BVHJC_*` or `FBXJC_*`). Angle point channels are never sent to pyorerun as markers.
+
 ## Run
 
 ```bash
@@ -71,6 +73,8 @@ Useful generated files include:
 - `fbx_q_biorbd_order.npz`
 - `bvh_c3d_local_markers.csv`
 - `fbx_c3d_local_markers.csv`
+- `bvh_animation_markers_no_angles_with_joint_centres.npz`
+- `fbx_animation_markers_no_angles_with_joint_centres.npz`
 - `run_report.json`
 
 ## Root Translation Policy
