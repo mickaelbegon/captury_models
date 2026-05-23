@@ -30,7 +30,7 @@ conda activate bvh-c3d-biobuddy
 The environment installs BioBuddy from:
 
 ```text
-git+https://github.com/mickaelbegon/biobuddy.git@codex/add-fbx-parser
+git+https://github.com/mickaelbegon/biobuddy.git@codex/add-fbx-segment-meshes
 ```
 
 ## C3D Point Classification
@@ -68,7 +68,7 @@ Useful generated files include:
 
 - `model_from_bvh_biobuddy.bioMod`
 - `model_from_fbx_biobuddy.bioMod`
-- `meshes/unknown_fbx_mesh.obj`
+- `meshes/*.ply`
 - `bvh_q_biorbd_order.npz`
 - `fbx_q_biorbd_order.npz`
 - `bvh_c3d_local_markers.csv`
@@ -88,11 +88,11 @@ Use `--root-offset-mode subtract` or `--root-offset-mode keep` to force either c
 
 ## Generalized Coordinate Units
 
-The exported `*_q_biorbd_order.npz` files follow the DOF order written by BioBuddy into the generated `bioMod`: translations first, then rotations for each segment. Translation channels remain in the native length unit of the BVH/FBX file so they match the `RT` offsets written in the `bioMod`. Rotation channels are converted from source degrees to radians, then unwrapped per Euler channel before saving and animation. The `.npz` files include `q_units`, and `run_report.json` includes an unwrap summary.
+The exported `*_q_biorbd_order.npz` files are now populated from BioBuddy's `to_q()` output for both BVH and FBX, so they follow the DOF order expected by the generated `bioMod` (`*_transX`, `*_rotZ`, etc.). Translation channels remain in the native length unit of the BVH/FBX file so they match the `RT` offsets written in the `bioMod`. Rotation channels are returned by BioBuddy in radians, then unwrapped per Euler channel before saving and animation. The `.npz` files include `q_units`, and `run_report.json` includes an unwrap summary.
 
 ## FBX Mesh
 
-The FBX mesh is exported as an OBJ file with triangulated faces, then referenced from the FBX `bioMod` through `meshfile`. This is required for pyorerun/biorbd to render surfaces. Writing raw `mesh x y z` points into a `bioMod` only provides vertices and typically appears as a line/point cloud in the viewer.
+The FBX mesh is handled by the BioBuddy branch `codex/add-fbx-segment-meshes`: the skinned visual mesh is split into per-segment `.ply` files and referenced from the FBX `bioMod` through `meshfile`. This is required for pyorerun/biorbd to render surfaces. Writing raw `mesh x y z` points into a `bioMod` only provides vertices and typically appears as a line/point cloud in the viewer.
 
 ## Local Marker Test
 

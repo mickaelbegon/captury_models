@@ -4,7 +4,7 @@ BVH/FBX -> bioMod with BioBuddy, q export, C3D marker/angle comparison, and pyor
 
 What this script does
 ---------------------
-1. Uses BioBuddy's BVH/FBX parsers from the branch codex/add-fbx-parser to translate Captury
+1. Uses BioBuddy's BVH/FBX parsers from the branch codex/add-fbx-segment-meshes to translate Captury
    skeleton files into biorbd-compatible .bioMod models.
 2. Exports generalized coordinates in the same DOF order as the generated biorbd model:
    translations first, then rotations, for each joint/segment.
@@ -91,7 +91,7 @@ def require_biobuddy():
     except ImportError as exc:
         raise ImportError(
             "BioBuddy with BVH/FBX support is required. Install the branch with:\n"
-            "pip install git+https://github.com/mickaelbegon/biobuddy.git@codex/add-fbx-parser"
+            "pip install git+https://github.com/mickaelbegon/biobuddy.git@codex/add-fbx-segment-meshes"
         ) from exc
     return BiomechanicalModelReal, BvhModelParser, FbxModelParser
 
@@ -190,13 +190,23 @@ def sanitize_biomod_name(name: str, fallback: str) -> str:
     return cleaned
 
 
+def is_rotation_q_name(name: str) -> bool:
+    lower = name.lower()
+    return lower.endswith("rotation") or bool(re.search(r"_rot[xyz]$", lower))
+
+
+def is_translation_q_name(name: str) -> bool:
+    lower = name.lower()
+    return lower.endswith("position") or bool(re.search(r"_trans[xyz]$", lower))
+
+
 def q_channel_units(q_names: list[str]) -> list[str]:
     """Return the biorbd unit used by each generalized coordinate channel."""
     units: list[str] = []
     for name in q_names:
-        if name.lower().endswith("rotation"):
+        if is_rotation_q_name(name):
             units.append("rad")
-        elif name.lower().endswith("position"):
+        elif is_translation_q_name(name):
             units.append("native_length_unit")
         else:
             units.append("unknown")
@@ -204,7 +214,32 @@ def q_channel_units(q_names: list[str]) -> list[str]:
 
 
 def rotation_q_indices(q_names: list[str]) -> list[int]:
-    return [i for i, name in enumerate(q_names) if name.lower().endswith("rotation")]
+    return [i for i, name in enumerate(q_names) if is_rotation_q_name(name)]
+
+
+def subtract_static_root_offset_from_q(
+    q: np.ndarray,
+    q_names: list[str],
+    root_name: str | None,
+    root_offset: np.ndarray,
+    apply_root_offset_correction: bool,
+) -> np.ndarray:
+    """Subtract the static root RT offset from root translation q channels when requested."""
+    corrected = q.copy()
+    if not apply_root_offset_correction or root_name is None:
+        return corrected
+
+    root_offset = np.asarray(root_offset, dtype=float).reshape(3)
+    axis_to_index = {"X": 0, "Y": 1, "Z": 2}
+    for axis, axis_index in axis_to_index.items():
+        supported_names = {
+            f"{root_name}_trans{axis}",
+            f"{root_name}_{axis}position",
+        }
+        for q_index, q_name in enumerate(q_names):
+            if q_name in supported_names:
+                corrected[q_index, :] = corrected[q_index, :] - root_offset[axis_index]
+    return corrected
 
 
 def unwrap_rotation_q(q: np.ndarray, q_names: list[str]) -> np.ndarray:
@@ -334,6 +369,25 @@ def collect_fbx_joint_names_depth_first(parser: Any) -> list[str]:
     for root_id in parser.root_ids:
         recurse(root_id)
     return names
+
+
+def runtime_q_from_parsed_animation(
+    parsed_animation: Any,
+    q_names: list[str],
+    root_name: str | None,
+    root_offset: np.ndarray,
+    apply_root_offset_correction: bool,
+) -> tuple[np.ndarray, np.ndarray, dict[str, Any]]:
+    q_raw = np.asarray(parsed_animation.q, dtype=float)
+    q_root_corrected = subtract_static_root_offset_from_q(
+        q=q_raw,
+        q_names=q_names,
+        root_name=root_name,
+        root_offset=root_offset,
+        apply_root_offset_correction=apply_root_offset_correction,
+    )
+    q = unwrap_rotation_q(q_root_corrected, q_names)
+    return q, q_root_corrected, q_unwrap_summary(q_root_corrected, q, q_names)
 
 
 def parse_fbx_records(fbx_path: Path) -> dict[str, Any]:
@@ -544,7 +598,33 @@ def extract_q_from_fbx_parser(
     fbx_path: Path,
     apply_root_offset_correction: bool = True,
 ) -> FbxRuntimeData:
-    """Extract animated root translations and XYZ rotations from binary FBX animation curves."""
+    """Extract FBX generalized coordinates through BioBuddy, with a legacy parser fallback."""
+    if hasattr(parser, "to_q"):
+        parsed_animation = parser.to_q()
+        q_names = [str(name) for name in parsed_animation.dof_names]
+        joint_names = collect_fbx_joint_names_depth_first(parser)
+        root_node = parser.skeleton_nodes[parser.root_ids[0]] if parser.root_ids else None
+        root_name = root_node.name if root_node is not None else None
+        root_offset = np.asarray(root_node.translation, dtype=float) if root_node is not None else np.zeros(3)
+        q, _, unwrap_summary = runtime_q_from_parsed_animation(
+            parsed_animation=parsed_animation,
+            q_names=q_names,
+            root_name=root_name,
+            root_offset=root_offset,
+            apply_root_offset_correction=apply_root_offset_correction,
+        )
+        return FbxRuntimeData(
+            parser=parser,
+            joint_names=joint_names,
+            q=q,
+            q_names=q_names,
+            time=np.asarray(parsed_animation.time, dtype=float),
+            root_offset_correction_applied=apply_root_offset_correction,
+            root_offset_native=root_offset,
+            q_units=q_channel_units(q_names),
+            unwrap_summary=unwrap_summary,
+        )
+
     fbx_tree = parse_fbx_records(fbx_path)
     defaults = extract_fbx_model_defaults(fbx_tree)
     curves, ticks = extract_fbx_animation_curves(fbx_tree)
@@ -767,6 +847,91 @@ def append_fbx_mesh_file_to_biomod(
     return mesh_report
 
 
+def count_ascii_ply_mesh(path: Path) -> tuple[int, int]:
+    vertices = 0
+    faces = 0
+    try:
+        with path.open("r", encoding="utf-8") as f:
+            for line in f:
+                if line.startswith("element vertex "):
+                    vertices = int(line.split()[-1])
+                elif line.startswith("element face "):
+                    faces = int(line.split()[-1])
+                elif line.strip() == "end_header":
+                    break
+    except (OSError, ValueError):
+        return 0, 0
+    return vertices, faces
+
+
+def report_biobuddy_segment_meshes(mesh_dir: Path) -> dict[str, Any]:
+    mesh_files = sorted(mesh_dir.glob("*.ply"))
+    mesh_entries: list[dict[str, Any]] = []
+    total_vertices = 0
+    total_faces = 0
+    for mesh_file in mesh_files:
+        vertices, faces = count_ascii_ply_mesh(mesh_file)
+        total_vertices += vertices
+        total_faces += faces
+        mesh_entries.append(
+            {
+                "mesh_file": str(mesh_file),
+                "mesh_vertices": vertices,
+                "mesh_faces": faces,
+            }
+        )
+    return {
+        "mesh_source": "biobuddy_segment_ply",
+        "mesh_directory": str(mesh_dir),
+        "mesh_files": mesh_entries,
+        "mesh_file_count": len(mesh_entries),
+        "mesh_vertices": total_vertices,
+        "mesh_faces": total_faces,
+        "mesh_parent": "per_segment",
+    }
+
+
+def normalize_biomod_meshfile_paths(biomod_path: Path) -> None:
+    """Make generated meshfile paths relative to the bioMod location for biorbd."""
+    text = biomod_path.read_text(encoding="utf-8")
+    lines: list[str] = []
+    changed = False
+    for line in text.splitlines():
+        stripped = line.strip()
+        if not stripped.startswith("meshfile"):
+            lines.append(line)
+            continue
+
+        parts = stripped.split(maxsplit=1)
+        if len(parts) != 2:
+            lines.append(line)
+            continue
+        mesh_path = Path(parts[1])
+        if mesh_path.is_absolute():
+            try:
+                mesh_path = Path(os.path.relpath(mesh_path, start=biomod_path.parent))
+            except ValueError:
+                lines.append(line)
+                continue
+            indent = line[: len(line) - len(line.lstrip())]
+            lines.append(f"{indent}meshfile\t{mesh_path.as_posix()}")
+            changed = True
+        else:
+            lines.append(line)
+
+    if changed:
+        biomod_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+
+def clean_generated_fbx_meshes(mesh_dir: Path) -> None:
+    if not mesh_dir.exists():
+        return
+    for pattern in ("*.ply", "unknown_fbx_mesh.obj"):
+        for mesh_file in mesh_dir.glob(pattern):
+            if mesh_file.is_file():
+                mesh_file.unlink()
+
+
 def build_biomod_from_bvh_with_biobuddy(
     bvh_path: Path,
     biomod_path: Path,
@@ -799,23 +964,43 @@ def build_biomod_from_fbx_with_biobuddy(
     include_mesh: bool = True,
     max_mesh_points: int = 0,
 ) -> tuple[Any, Any, dict[str, Any]]:
-    """Create a bioMod model from an FBX file and optionally append FBX mesh points."""
+    """Create a bioMod model from an FBX file and optionally attach per-segment FBX meshes."""
     BiomechanicalModelReal, _, FbxModelParser = require_biobuddy()
 
+    mesh_dir = biomod_path.parent / "meshes"
+    if include_mesh:
+        clean_generated_fbx_meshes(mesh_dir)
+
     try:
-        model = BiomechanicalModelReal().from_fbx(filepath=str(fbx_path))
+        model = BiomechanicalModelReal().from_fbx(
+            filepath=str(fbx_path),
+            load_visual_meshes=include_mesh,
+            mesh_output_dir=str(mesh_dir) if include_mesh else None,
+        )
+        parser = FbxModelParser(
+            str(fbx_path),
+            load_visual_meshes=include_mesh,
+            mesh_output_dir=str(mesh_dir) if include_mesh else None,
+        )
+    except TypeError:
+        parser_for_model = FbxModelParser(str(fbx_path))
+        model = parser_for_model.to_real()
+        parser = FbxModelParser(str(fbx_path))
     except AttributeError:
         parser_for_model = FbxModelParser(str(fbx_path))
         model = parser_for_model.to_real()
+        parser = FbxModelParser(str(fbx_path))
 
     model.to_biomod(str(biomod_path), with_mesh=include_mesh)
-    parser = FbxModelParser(str(fbx_path))
+    normalize_biomod_meshfile_paths(biomod_path)
     joint_names = collect_fbx_joint_names_depth_first(parser)
     if add_joint_centre_markers:
         append_joint_centre_markers_to_biomod(biomod_path, joint_names, marker_prefix="FBXJC_")
 
     mesh_report: dict[str, Any] = {"mesh_file": None, "mesh_vertices": 0, "mesh_faces": 0, "mesh_parent": None}
-    if include_mesh:
+    if include_mesh and mesh_dir.exists() and any(mesh_dir.glob("*.ply")):
+        mesh_report = report_biobuddy_segment_meshes(mesh_dir)
+    elif include_mesh:
         fbx_tree = parse_fbx_records(fbx_path)
         root_name = joint_names[0] if joint_names else None
         root_translation = (
@@ -830,6 +1015,7 @@ def build_biomod_from_fbx_with_biobuddy(
             root_translation=root_translation,
             max_vertices=max_mesh_points,
         )
+        mesh_report["mesh_source"] = "legacy_whole_body_obj"
 
     return model, parser, mesh_report
 
@@ -863,11 +1049,39 @@ def extract_q_from_biobuddy_bvh_parser(
 ) -> BvhRuntimeData:
     """Extract q from BioBuddy's BvhModelParser.
 
-    Rotation channels are converted from degrees to radians. Translation channels are kept in
+    BioBuddy's public ``to_q`` API converts rotations to radians and orders the
+    channels like the generated biorbd model. Translation channels are kept in
     native BVH units. By default, the ROOT OFFSET is subtracted from the root translation
     channels because BioBuddy also writes this OFFSET in the generated bioMod. Without this
     correction, the biorbd model is translated by q_root + root_offset instead of q_root.
     """
+    if hasattr(parser, "to_q"):
+        parsed_animation = parser.to_q()
+        joint_names, file_order, q_order = collect_bvh_channels(parser)
+        q_names = [str(name) for name in parsed_animation.dof_names]
+        root_name = parser.root.name if parser.root is not None else None
+        root_offset = np.asarray(parser.root.offset, dtype=float) if parser.root is not None else np.zeros(3)
+        q, _, unwrap_summary = runtime_q_from_parsed_animation(
+            parsed_animation=parsed_animation,
+            q_names=q_names,
+            root_name=root_name,
+            root_offset=root_offset,
+            apply_root_offset_correction=apply_root_offset_correction,
+        )
+        return BvhRuntimeData(
+            parser=parser,
+            joint_names=joint_names,
+            channel_entries_file_order=file_order,
+            channel_entries_q_order=q_order,
+            q=q,
+            q_names=q_names,
+            time=np.asarray(parsed_animation.time, dtype=float),
+            root_offset_correction_applied=apply_root_offset_correction,
+            root_offset_native=root_offset,
+            q_units=q_channel_units(q_names),
+            unwrap_summary=unwrap_summary,
+        )
+
     if parser.motion_data is None or parser.frame_time is None or parser.frame_count is None:
         raise ValueError("The BVH file contains no MOTION block.")
 
@@ -1551,7 +1765,7 @@ def comparison_metrics(bvh_values_rad: np.ndarray, c3d_values_rad: np.ndarray) -
 
 
 def bvh_rotation_q_indices(q_names: list[str]) -> list[int]:
-    return [i for i, name in enumerate(q_names) if name.lower().endswith("rotation")]
+    return rotation_q_indices(q_names)
 
 
 def write_pairwise_q_vs_c3d_angle_comparison(
@@ -1641,7 +1855,7 @@ def write_explicit_q_vs_c3d_angle_comparison(
 
     Mapping format:
     [
-      {"name": "right_knee_flexion", "bvh_q": "RightLeg_Xrotation", "c3d_label": "RKneeAngles", "c3d_component": "X"}
+      {"name": "right_knee_flexion", "bvh_q": "RightLeg_rotX", "c3d_label": "RKneeAngles", "c3d_component": "X"}
     ]
     """
     if mapping_path is None:
@@ -1704,7 +1918,7 @@ def write_explicit_q_vs_c3d_angle_comparison(
 
 def write_mapping_template(q_names: list[str], c3d_angle_labels: list[str], out_dir: Path) -> Path:
     template_path = out_dir / "comparison_mapping_template.json"
-    rotation_q = [name for name in q_names if name.lower().endswith("rotation")]
+    rotation_q = [name for name in q_names if is_rotation_q_name(name)]
     template = []
     for q_name in rotation_q[: min(12, len(rotation_q))]:
         template.append(
@@ -2111,7 +2325,7 @@ def main() -> None:
         "input_bvh": str(args.bvh),
         "input_fbx": str(args.fbx) if args.fbx else None,
         "input_c3d": str(args.c3d),
-        "biobuddy_branch": "mickaelbegon/biobuddy@codex/add-fbx-parser",
+        "biobuddy_branch": "mickaelbegon/biobuddy@codex/add-fbx-segment-meshes",
         "outputs": {
             "biomod": str(biomod_path),
             "bvh_q_npz": str(q_npz),
