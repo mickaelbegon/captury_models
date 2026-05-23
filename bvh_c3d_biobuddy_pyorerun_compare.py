@@ -1470,6 +1470,11 @@ def biorbd_segment_names(model: Any) -> list[str]:
     return [model.segment(i).name().to_string() for i in range(model.nbSegment())]
 
 
+def biorbd_strings_to_list(values: Iterable[Any]) -> list[str]:
+    """Convert biorbd's SWIG string objects to normal Python strings."""
+    return [value.to_string() if hasattr(value, "to_string") else str(value) for value in values]
+
+
 def compute_model_joint_centres_native(
     biomod_path: Path,
     q: np.ndarray,
@@ -1752,6 +1757,183 @@ def compute_and_append_c3d_local_markers(
         json.dumps(summary, indent=2), encoding="utf-8"
     )
     return csv_path, summary
+
+
+# =============================================================================
+# Inverse dynamics from C3D markers
+# =============================================================================
+
+
+def read_local_marker_rows(csv_path: Path) -> list[dict[str, str]]:
+    with csv_path.open("r", newline="", encoding="utf-8") as f:
+        return list(csv.DictReader(f))
+
+
+def finite_difference_by_time(data: np.ndarray, time: np.ndarray) -> np.ndarray:
+    """Differentiate each row of data with respect to a time vector."""
+    if data.shape[1] != time.shape[0]:
+        raise ValueError("data and time must have the same number of frames.")
+    if time.shape[0] < 2:
+        return np.zeros_like(data)
+    edge_order = 2 if time.shape[0] > 2 else 1
+    return np.gradient(data, time, axis=1, edge_order=edge_order)
+
+
+def build_marker_data_for_biorbd_ik(
+    model: Any,
+    split: C3dSplitData,
+    local_marker_rows: list[dict[str, str]],
+    source_unit_scale_to_m: float,
+    frame_indices: np.ndarray,
+) -> tuple[np.ndarray, list[str]]:
+    """Build the marker array expected by biorbd.InverseKinematics.
+
+    biorbd expects one marker slot per marker in the bioMod. We fill only the
+    generated C3D local markers and leave all other model markers as NaN, which
+    tells biorbd to ignore them during inverse kinematics.
+    """
+    model_marker_names = biorbd_strings_to_list(model.markerNames())
+    model_marker_index = {name: i for i, name in enumerate(model_marker_names)}
+    c3d_marker_index = {label: i for i, label in enumerate(split.marker_labels)}
+    c3d_markers_source_units = marker_data_in_source_units(split, source_unit_scale_to_m)
+
+    marker_data = np.full((3, len(model_marker_names), frame_indices.shape[0]), np.nan, dtype=float)
+    used_marker_names: list[str] = []
+    for row in local_marker_rows:
+        biomod_marker = row["biomod_marker"]
+        c3d_marker = row["marker"]
+        if biomod_marker not in model_marker_index or c3d_marker not in c3d_marker_index:
+            continue
+        marker_data[:, model_marker_index[biomod_marker], :] = c3d_markers_source_units[
+            :, c3d_marker_index[c3d_marker], :
+        ][:, frame_indices]
+        used_marker_names.append(biomod_marker)
+
+    if not used_marker_names:
+        raise RuntimeError("No generated C3D local markers were found in the bioMod for inverse kinematics.")
+    return marker_data, used_marker_names
+
+
+def save_inverse_dynamics_outputs(
+    out_dir: Path,
+    source_name: str,
+    time: np.ndarray,
+    q: np.ndarray,
+    qdot: np.ndarray,
+    qddot: np.ndarray,
+    tau: np.ndarray,
+    q_names: list[str],
+    marker_names: list[str],
+) -> tuple[Path, Path, Path]:
+    npz_path = out_dir / f"{source_name}_inverse_dynamics_from_c3d_markers.npz"
+    csv_path = out_dir / f"{source_name}_inverse_dynamics_from_c3d_markers.csv"
+    summary_path = out_dir / f"{source_name}_inverse_dynamics_from_c3d_markers_summary.json"
+
+    np.savez(
+        npz_path,
+        time=time,
+        q=q,
+        qdot=qdot,
+        qddot=qddot,
+        tau=tau,
+        q_names=np.asarray(q_names, dtype=object),
+        marker_names=np.asarray(marker_names, dtype=object),
+    )
+
+    with csv_path.open("w", newline="", encoding="utf-8") as f:
+        writer = csv.writer(f)
+        writer.writerow(["time", *[f"tau_{name}" for name in q_names]])
+        for frame in range(tau.shape[1]):
+            writer.writerow([time[frame], *tau[:, frame].tolist()])
+
+    summary = {
+        "source": source_name,
+        "frames": int(time.shape[0]),
+        "nb_q": int(q.shape[0]),
+        "markers_used": len(marker_names),
+        "marker_names": marker_names,
+        "outputs": {
+            "npz": str(npz_path),
+            "csv": str(csv_path),
+        },
+        "important_note": (
+            "Inverse dynamics was computed from marker-based inverse kinematics without external force plates. "
+            "Root and contact-related generalized forces should therefore be interpreted as residual efforts."
+        ),
+    }
+    summary_path.write_text(json.dumps(summary, indent=2), encoding="utf-8")
+    return npz_path, csv_path, summary_path
+
+
+def run_inverse_dynamics_from_c3d_markers(
+    biomod_path: Path,
+    split: C3dSplitData,
+    local_marker_csv: Path,
+    source_unit_scale_to_m: float,
+    source_name: str,
+    out_dir: Path,
+    method: str = "trf",
+    max_frames: int = 0,
+) -> dict[str, Any]:
+    """Run marker-based IK followed by biorbd inverse dynamics.
+
+    The C3D angle channels are already excluded in ``split``. Only markers that
+    were written into the bioMod by ``compute_and_append_c3d_local_markers`` are
+    used for inverse kinematics.
+    """
+    biorbd = require_biorbd()
+    model = biorbd.Model(str(biomod_path))
+    local_marker_rows = read_local_marker_rows(local_marker_csv)
+
+    n_c3d_frames = split.time.shape[0]
+    n_frames = n_c3d_frames if max_frames <= 0 else min(max_frames, n_c3d_frames)
+    frame_indices = np.arange(n_frames, dtype=int)
+    time = split.time[frame_indices]
+
+    marker_data, used_marker_names = build_marker_data_for_biorbd_ik(
+        model=model,
+        split=split,
+        local_marker_rows=local_marker_rows,
+        source_unit_scale_to_m=source_unit_scale_to_m,
+        frame_indices=frame_indices,
+    )
+
+    ik = biorbd.InverseKinematics(model, marker_data)
+    q = np.asarray(ik.solve(method=method), dtype=float)
+    if q.shape[0] != model.nbQ():
+        q = q.T
+    if q.shape != (model.nbQ(), time.shape[0]):
+        raise RuntimeError(f"Inverse kinematics returned q with shape {q.shape}, expected {(model.nbQ(), time.shape[0])}.")
+
+    qdot = finite_difference_by_time(q, time)
+    qddot = finite_difference_by_time(qdot, time)
+    tau = np.zeros((model.nbGeneralizedTorque(), time.shape[0]), dtype=float)
+    for frame in range(time.shape[0]):
+        q_frame = np.ascontiguousarray(q[:, frame], dtype=float)
+        qdot_frame = np.ascontiguousarray(qdot[:, frame], dtype=float)
+        qddot_frame = np.ascontiguousarray(qddot[:, frame], dtype=float)
+        tau[:, frame] = np.asarray(model.InverseDynamics(q_frame, qdot_frame, qddot_frame).to_array(), dtype=float).ravel()
+
+    q_names = biorbd_strings_to_list(model.nameDof())
+    npz_path, csv_path, summary_path = save_inverse_dynamics_outputs(
+        out_dir=out_dir,
+        source_name=source_name,
+        time=time,
+        q=q,
+        qdot=qdot,
+        qddot=qddot,
+        tau=tau,
+        q_names=q_names,
+        marker_names=used_marker_names,
+    )
+    return {
+        "npz": str(npz_path),
+        "csv": str(csv_path),
+        "summary": str(summary_path),
+        "frames": int(time.shape[0]),
+        "markers_used": len(used_marker_names),
+        "method": method,
+    }
 
 
 # =============================================================================
@@ -2045,7 +2227,7 @@ def parse_args() -> argparse.Namespace:
         description="Generate a biorbd bioMod from BVH using BioBuddy, export BVH q, overlay C3D markers, and compare q to C3D angles."
     )
     parser.add_argument("--bvh", default=Path("unknown.bvh"), type=Path, help="Input BVH file.")
-    parser.add_argument("--fbx", default=Path("unknown.fbx"), type=Path, help="Optional input FBX file.")
+    parser.add_argument("--fbx", default=None, type=Path, help="Optional input FBX file.")
     parser.add_argument("--c3d", default=Path("unknown.c3d"), type=Path, help="Input C3D file.")
     parser.add_argument("--out-dir", default=Path("out_biobuddy_bvh_c3d"), type=Path, help="Output directory.")
     parser.add_argument(
@@ -2129,6 +2311,26 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Set PYORERUN_HEADLESS=1 before animation. Useful for tests or servers.",
     )
+    parser.add_argument(
+        "--inverse-dynamics",
+        action="store_true",
+        help=(
+            "Run marker-based inverse kinematics from the C3D markers, then biorbd inverse dynamics. "
+            "C3D angle channels are ignored."
+        ),
+    )
+    parser.add_argument(
+        "--inverse-dynamics-method",
+        default="trf",
+        choices=["trf", "lm", "only_lm"],
+        help="Least-squares method passed to biorbd.InverseKinematics.solve. Default: trf.",
+    )
+    parser.add_argument(
+        "--inverse-dynamics-max-frames",
+        default=0,
+        type=int,
+        help="Limit inverse dynamics to the first N C3D frames. Use 0 for all frames.",
+    )
     return parser.parse_args()
 
 
@@ -2199,6 +2401,18 @@ def main() -> None:
         source_name="bvh",
         out_dir=out_dir,
     )
+    bvh_inverse_dynamics_report: dict[str, Any] | None = None
+    if args.inverse_dynamics:
+        bvh_inverse_dynamics_report = run_inverse_dynamics_from_c3d_markers(
+            biomod_path=biomod_path,
+            split=c3d_split,
+            local_marker_csv=bvh_local_markers_csv,
+            source_unit_scale_to_m=args.bvh_unit_scale_to_m,
+            source_name="bvh",
+            out_dir=out_dir,
+            method=args.inverse_dynamics_method,
+            max_frames=args.inverse_dynamics_max_frames,
+        )
 
     # 6. Create a C3D copy with generated joint centres so external tools can
     # inspect markers and model centres on the same time base.
@@ -2315,6 +2529,18 @@ def main() -> None:
             source_name="fbx",
             out_dir=out_dir,
         )
+        fbx_inverse_dynamics_report: dict[str, Any] | None = None
+        if args.inverse_dynamics:
+            fbx_inverse_dynamics_report = run_inverse_dynamics_from_c3d_markers(
+                biomod_path=fbx_biomod_path,
+                split=c3d_split,
+                local_marker_csv=fbx_local_markers_csv,
+                source_unit_scale_to_m=args.fbx_unit_scale_to_m,
+                source_name="fbx",
+                out_dir=out_dir,
+                method=args.inverse_dynamics_method,
+                max_frames=args.inverse_dynamics_max_frames,
+            )
         fbx_augmented_c3d_path = append_joint_centres_to_c3d(
             split=c3d_split,
             centres_native=fbx_centres_native,
@@ -2355,6 +2581,7 @@ def main() -> None:
             "animation_markers_no_angles_with_joint_centres": str(fbx_animation_markers_npz),
             "local_markers_csv": str(fbx_local_markers_csv),
             "root_policy": str(out_dir / "fbx_root_translation_policy.json"),
+            "inverse_dynamics": fbx_inverse_dynamics_report,
         }
         fbx_report = {
             "input_fbx": str(args.fbx),
@@ -2374,6 +2601,7 @@ def main() -> None:
             },
             "q_unwrap": fbx_runtime.unwrap_summary,
             "local_marker_stability": fbx_local_marker_summary,
+            "inverse_dynamics_from_c3d_markers": fbx_inverse_dynamics_report,
             "counts": {
                 "fbx_joints": len(fbx_runtime.joint_names),
                 "fbx_q": int(fbx_runtime.q.shape[0]),
@@ -2404,6 +2632,7 @@ def main() -> None:
             "bvh_local_markers_csv": str(bvh_local_markers_csv),
             "bvh_root_policy": str(out_dir / "bvh_root_translation_policy.json"),
             "bvh_animation_markers_no_angles_with_joint_centres": str(bvh_animation_markers_npz),
+            "bvh_inverse_dynamics": bvh_inverse_dynamics_report,
             "fbx": fbx_outputs,
         },
         "counts": {
@@ -2438,6 +2667,7 @@ def main() -> None:
         },
         "q_unwrap": bvh_runtime.unwrap_summary,
         "local_marker_stability": bvh_local_marker_summary,
+        "inverse_dynamics_from_c3d_markers": bvh_inverse_dynamics_report,
         "fbx_report": fbx_report,
         "q_names": bvh_runtime.q_names,
         "c3d_angle_labels": c3d_split.angle_labels,
@@ -2450,10 +2680,14 @@ def main() -> None:
     print(f"BVH q: {q_npz}")
     print(f"Augmented C3D: {augmented_c3d_path}")
     print(f"BVH local C3D markers: {bvh_local_markers_csv}")
+    if bvh_inverse_dynamics_report is not None:
+        print(f"BVH inverse dynamics: {bvh_inverse_dynamics_report['npz']}")
     if fbx_outputs:
         print(f"FBX bioMod: {fbx_outputs['biomod']}")
         print(f"FBX q: {fbx_outputs['fbx_q_npz']}")
         print(f"FBX augmented C3D: {fbx_outputs['augmented_c3d']}")
+        if fbx_outputs.get("inverse_dynamics") is not None:
+            print(f"FBX inverse dynamics: {fbx_outputs['inverse_dynamics']['npz']}")
     print(f"Pairwise comparison: {pairwise_csv}")
     print(f"Best matches: {best_csv}")
     print(f"Report: {report_path}")
