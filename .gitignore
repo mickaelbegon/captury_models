@@ -1,0 +1,13 @@
+.DS_Store
+__pycache__/
+*.py[cod]
+
+# Generated analysis outputs can be recreated with the main script.
+out_biobuddy_bvh_c3d/
+
+# Local archives/backups.
+Archive.zip
+
+# Rerun and plotting caches.
+.rerun/
+.matplotlib/

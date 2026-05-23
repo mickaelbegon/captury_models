@@ -1,0 +1,16 @@
+name: bvh-c3d-biobuddy
+channels:
+  - conda-forge
+dependencies:
+  - python=3.11
+  - numpy
+  - scipy
+  - pandas
+  - matplotlib
+  - ezc3d
+  - biorbd
+  - pyorerun
+  - rerun-sdk=0.21.0
+  - pip
+  - pip:
+      - git+https://github.com/mickaelbegon/biobuddy.git@codex/add-fbx-parser
