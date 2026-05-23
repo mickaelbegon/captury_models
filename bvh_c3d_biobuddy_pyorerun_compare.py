@@ -1760,7 +1760,7 @@ def compute_and_append_c3d_local_markers(
 
 
 # =============================================================================
-# Inverse dynamics from C3D markers
+# Inverse kinematics from C3D markers
 # =============================================================================
 
 
@@ -1814,20 +1814,20 @@ def build_marker_data_for_biorbd_ik(
     return marker_data, used_marker_names
 
 
-def save_inverse_dynamics_outputs(
+def save_inverse_kinematics_outputs(
     out_dir: Path,
     source_name: str,
     time: np.ndarray,
     q: np.ndarray,
     qdot: np.ndarray,
     qddot: np.ndarray,
-    tau: np.ndarray,
     q_names: list[str],
     marker_names: list[str],
+    solver: str,
 ) -> tuple[Path, Path, Path]:
-    npz_path = out_dir / f"{source_name}_inverse_dynamics_from_c3d_markers.npz"
-    csv_path = out_dir / f"{source_name}_inverse_dynamics_from_c3d_markers.csv"
-    summary_path = out_dir / f"{source_name}_inverse_dynamics_from_c3d_markers_summary.json"
+    npz_path = out_dir / f"{source_name}_inverse_kinematics_from_c3d_markers.npz"
+    csv_path = out_dir / f"{source_name}_inverse_kinematics_from_c3d_markers.csv"
+    summary_path = out_dir / f"{source_name}_inverse_kinematics_from_c3d_markers_summary.json"
 
     np.savez(
         npz_path,
@@ -1835,19 +1835,26 @@ def save_inverse_dynamics_outputs(
         q=q,
         qdot=qdot,
         qddot=qddot,
-        tau=tau,
         q_names=np.asarray(q_names, dtype=object),
         marker_names=np.asarray(marker_names, dtype=object),
+        solver=solver,
     )
 
     with csv_path.open("w", newline="", encoding="utf-8") as f:
         writer = csv.writer(f)
-        writer.writerow(["time", *[f"tau_{name}" for name in q_names]])
-        for frame in range(tau.shape[1]):
-            writer.writerow([time[frame], *tau[:, frame].tolist()])
+        fieldnames = (
+            ["time"]
+            + [f"q_{name}" for name in q_names]
+            + [f"qdot_{name}" for name in q_names]
+            + [f"qddot_{name}" for name in q_names]
+        )
+        writer.writerow(fieldnames)
+        for frame in range(q.shape[1]):
+            writer.writerow([time[frame], *q[:, frame].tolist(), *qdot[:, frame].tolist(), *qddot[:, frame].tolist()])
 
     summary = {
         "source": source_name,
+        "solver": solver,
         "frames": int(time.shape[0]),
         "nb_q": int(q.shape[0]),
         "markers_used": len(marker_names),
@@ -1857,25 +1864,72 @@ def save_inverse_dynamics_outputs(
             "csv": str(csv_path),
         },
         "important_note": (
-            "Inverse dynamics was computed from marker-based inverse kinematics without external force plates. "
-            "Root and contact-related generalized forces should therefore be interpreted as residual efforts."
+            "Inverse kinematics uses only C3D marker channels; C3D angle channels are filtered out before solving."
         ),
     }
     summary_path.write_text(json.dumps(summary, indent=2), encoding="utf-8")
     return npz_path, csv_path, summary_path
 
 
-def run_inverse_dynamics_from_c3d_markers(
+def solve_inverse_kinematics_least_squares(model: Any, marker_data: np.ndarray, time: np.ndarray, method: str) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Solve inverse kinematics with biorbd's nonlinear least-squares wrapper."""
+    biorbd = require_biorbd()
+    ik = biorbd.InverseKinematics(model, marker_data)
+    q = np.asarray(ik.solve(method=method), dtype=float)
+    if q.shape[0] != model.nbQ():
+        q = q.T
+    if q.shape != (model.nbQ(), time.shape[0]):
+        raise RuntimeError(f"Inverse kinematics returned q with shape {q.shape}, expected {(model.nbQ(), time.shape[0])}.")
+    qdot = finite_difference_by_time(q, time)
+    qddot = finite_difference_by_time(qdot, time)
+    return q, qdot, qddot
+
+
+def solve_inverse_kinematics_kalman(
+    model: Any,
+    marker_data: np.ndarray,
+    time: np.ndarray,
+    noise_factor: float,
+    error_factor: float,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Solve inverse kinematics with biorbd's extended Kalman marker reconstructor."""
+    biorbd = require_biorbd()
+    if time.shape[0] > 1:
+        frequency = 1.0 / float(np.nanmedian(np.diff(time)))
+    else:
+        frequency = 100.0
+    params = biorbd.KalmanParam(frequency, noise_factor, error_factor)
+    kalman = biorbd.KalmanReconsMarkers(model, params)
+
+    q_state = biorbd.GeneralizedCoordinates(model)
+    qdot_state = biorbd.GeneralizedVelocity(model)
+    qddot_state = biorbd.GeneralizedAcceleration(model)
+    q = np.zeros((model.nbQ(), time.shape[0]), dtype=float)
+    qdot = np.zeros((model.nbQdot(), time.shape[0]), dtype=float)
+    qddot = np.zeros((model.nbQddot(), time.shape[0]), dtype=float)
+    for frame in range(time.shape[0]):
+        markers_flat = np.reshape(marker_data[:, :, frame].T, -1)
+        kalman.reconstructFrame(model, markers_flat, q_state, qdot_state, qddot_state)
+        q[:, frame] = np.asarray(q_state.to_array(), dtype=float).ravel()
+        qdot[:, frame] = np.asarray(qdot_state.to_array(), dtype=float).ravel()
+        qddot[:, frame] = np.asarray(qddot_state.to_array(), dtype=float).ravel()
+    return q, qdot, qddot
+
+
+def run_inverse_kinematics_from_c3d_markers(
     biomod_path: Path,
     split: C3dSplitData,
     local_marker_csv: Path,
     source_unit_scale_to_m: float,
     source_name: str,
     out_dir: Path,
-    method: str = "trf",
+    solver: str = "least_squares",
+    least_squares_method: str = "trf",
     max_frames: int = 0,
+    kalman_noise_factor: float = 1e-10,
+    kalman_error_factor: float = 1e-5,
 ) -> dict[str, Any]:
-    """Run marker-based IK followed by biorbd inverse dynamics.
+    """Run marker-based inverse kinematics from C3D markers.
 
     The C3D angle channels are already excluded in ``split``. Only markers that
     were written into the bioMod by ``compute_and_append_c3d_local_markers`` are
@@ -1898,33 +1952,37 @@ def run_inverse_dynamics_from_c3d_markers(
         frame_indices=frame_indices,
     )
 
-    ik = biorbd.InverseKinematics(model, marker_data)
-    q = np.asarray(ik.solve(method=method), dtype=float)
-    if q.shape[0] != model.nbQ():
-        q = q.T
-    if q.shape != (model.nbQ(), time.shape[0]):
-        raise RuntimeError(f"Inverse kinematics returned q with shape {q.shape}, expected {(model.nbQ(), time.shape[0])}.")
-
-    qdot = finite_difference_by_time(q, time)
-    qddot = finite_difference_by_time(qdot, time)
-    tau = np.zeros((model.nbGeneralizedTorque(), time.shape[0]), dtype=float)
-    for frame in range(time.shape[0]):
-        q_frame = np.ascontiguousarray(q[:, frame], dtype=float)
-        qdot_frame = np.ascontiguousarray(qdot[:, frame], dtype=float)
-        qddot_frame = np.ascontiguousarray(qddot[:, frame], dtype=float)
-        tau[:, frame] = np.asarray(model.InverseDynamics(q_frame, qdot_frame, qddot_frame).to_array(), dtype=float).ravel()
+    if solver == "least_squares":
+        q, qdot, qddot = solve_inverse_kinematics_least_squares(
+            model=model,
+            marker_data=marker_data,
+            time=time,
+            method=least_squares_method,
+        )
+        solver_label = f"least_squares:{least_squares_method}"
+    elif solver == "kalman":
+        q, qdot, qddot = solve_inverse_kinematics_kalman(
+            model=model,
+            marker_data=marker_data,
+            time=time,
+            noise_factor=kalman_noise_factor,
+            error_factor=kalman_error_factor,
+        )
+        solver_label = "kalman"
+    else:
+        raise ValueError("solver must be 'least_squares' or 'kalman'.")
 
     q_names = biorbd_strings_to_list(model.nameDof())
-    npz_path, csv_path, summary_path = save_inverse_dynamics_outputs(
+    npz_path, csv_path, summary_path = save_inverse_kinematics_outputs(
         out_dir=out_dir,
         source_name=source_name,
         time=time,
         q=q,
         qdot=qdot,
         qddot=qddot,
-        tau=tau,
         q_names=q_names,
         marker_names=used_marker_names,
+        solver=solver_label,
     )
     return {
         "npz": str(npz_path),
@@ -1932,7 +1990,7 @@ def run_inverse_dynamics_from_c3d_markers(
         "summary": str(summary_path),
         "frames": int(time.shape[0]),
         "markers_used": len(used_marker_names),
-        "method": method,
+        "solver": solver_label,
     }
 
 
@@ -2312,30 +2370,74 @@ def parse_args() -> argparse.Namespace:
         help="Set PYORERUN_HEADLESS=1 before animation. Useful for tests or servers.",
     )
     parser.add_argument(
-        "--inverse-dynamics",
+        "--inverse-kinematics",
         action="store_true",
         help=(
-            "Run marker-based inverse kinematics from the C3D markers, then biorbd inverse dynamics. "
-            "C3D angle channels are ignored."
+            "Run marker-based inverse kinematics from the C3D markers. C3D angle channels are ignored."
         ),
     )
     parser.add_argument(
-        "--inverse-dynamics-method",
+        "--inverse-kinematics-solver",
+        default="least_squares",
+        choices=["least_squares", "kalman"],
+        help="Inverse kinematics solver. Default: least_squares.",
+    )
+    parser.add_argument(
+        "--inverse-kinematics-method",
         default="trf",
         choices=["trf", "lm", "only_lm"],
-        help="Least-squares method passed to biorbd.InverseKinematics.solve. Default: trf.",
+        help="Least-squares method passed to biorbd.InverseKinematics.solve. Used only with --inverse-kinematics-solver least_squares.",
+    )
+    parser.add_argument(
+        "--inverse-kinematics-max-frames",
+        default=0,
+        type=int,
+        help="Limit inverse kinematics to the first N C3D frames. Use 0 for all frames.",
+    )
+    parser.add_argument(
+        "--kalman-noise-factor",
+        default=1e-10,
+        type=float,
+        help="Noise factor for biorbd.KalmanParam when using the Kalman IK solver.",
+    )
+    parser.add_argument(
+        "--kalman-error-factor",
+        default=1e-5,
+        type=float,
+        help="Error factor for biorbd.KalmanParam when using the Kalman IK solver.",
+    )
+    parser.add_argument(
+        "--inverse-dynamics",
+        action="store_true",
+        help=argparse.SUPPRESS,
+    )
+    parser.add_argument(
+        "--inverse-dynamics-method",
+        default=None,
+        choices=["trf", "lm", "only_lm"],
+        help=argparse.SUPPRESS,
     )
     parser.add_argument(
         "--inverse-dynamics-max-frames",
-        default=0,
+        default=None,
         type=int,
-        help="Limit inverse dynamics to the first N C3D frames. Use 0 for all frames.",
+        help=argparse.SUPPRESS,
     )
     return parser.parse_args()
 
 
 def main() -> None:
     args = parse_args()
+    if args.inverse_dynamics:
+        warnings.warn(
+            "--inverse-dynamics is deprecated; use --inverse-kinematics. The script now computes IK only.",
+            DeprecationWarning,
+        )
+        args.inverse_kinematics = True
+    if args.inverse_dynamics_method is not None:
+        args.inverse_kinematics_method = args.inverse_dynamics_method
+    if args.inverse_dynamics_max_frames is not None:
+        args.inverse_kinematics_max_frames = args.inverse_dynamics_max_frames
     out_dir: Path = args.out_dir
     out_dir.mkdir(parents=True, exist_ok=True)
     root_offset_mode = "keep" if args.no_root_offset_correction else args.root_offset_mode
@@ -2401,17 +2503,20 @@ def main() -> None:
         source_name="bvh",
         out_dir=out_dir,
     )
-    bvh_inverse_dynamics_report: dict[str, Any] | None = None
-    if args.inverse_dynamics:
-        bvh_inverse_dynamics_report = run_inverse_dynamics_from_c3d_markers(
+    bvh_inverse_kinematics_report: dict[str, Any] | None = None
+    if args.inverse_kinematics:
+        bvh_inverse_kinematics_report = run_inverse_kinematics_from_c3d_markers(
             biomod_path=biomod_path,
             split=c3d_split,
             local_marker_csv=bvh_local_markers_csv,
             source_unit_scale_to_m=args.bvh_unit_scale_to_m,
             source_name="bvh",
             out_dir=out_dir,
-            method=args.inverse_dynamics_method,
-            max_frames=args.inverse_dynamics_max_frames,
+            solver=args.inverse_kinematics_solver,
+            least_squares_method=args.inverse_kinematics_method,
+            max_frames=args.inverse_kinematics_max_frames,
+            kalman_noise_factor=args.kalman_noise_factor,
+            kalman_error_factor=args.kalman_error_factor,
         )
 
     # 6. Create a C3D copy with generated joint centres so external tools can
@@ -2529,17 +2634,20 @@ def main() -> None:
             source_name="fbx",
             out_dir=out_dir,
         )
-        fbx_inverse_dynamics_report: dict[str, Any] | None = None
-        if args.inverse_dynamics:
-            fbx_inverse_dynamics_report = run_inverse_dynamics_from_c3d_markers(
+        fbx_inverse_kinematics_report: dict[str, Any] | None = None
+        if args.inverse_kinematics:
+            fbx_inverse_kinematics_report = run_inverse_kinematics_from_c3d_markers(
                 biomod_path=fbx_biomod_path,
                 split=c3d_split,
                 local_marker_csv=fbx_local_markers_csv,
                 source_unit_scale_to_m=args.fbx_unit_scale_to_m,
                 source_name="fbx",
                 out_dir=out_dir,
-                method=args.inverse_dynamics_method,
-                max_frames=args.inverse_dynamics_max_frames,
+                solver=args.inverse_kinematics_solver,
+                least_squares_method=args.inverse_kinematics_method,
+                max_frames=args.inverse_kinematics_max_frames,
+                kalman_noise_factor=args.kalman_noise_factor,
+                kalman_error_factor=args.kalman_error_factor,
             )
         fbx_augmented_c3d_path = append_joint_centres_to_c3d(
             split=c3d_split,
@@ -2581,7 +2689,7 @@ def main() -> None:
             "animation_markers_no_angles_with_joint_centres": str(fbx_animation_markers_npz),
             "local_markers_csv": str(fbx_local_markers_csv),
             "root_policy": str(out_dir / "fbx_root_translation_policy.json"),
-            "inverse_dynamics": fbx_inverse_dynamics_report,
+            "inverse_kinematics": fbx_inverse_kinematics_report,
         }
         fbx_report = {
             "input_fbx": str(args.fbx),
@@ -2601,7 +2709,7 @@ def main() -> None:
             },
             "q_unwrap": fbx_runtime.unwrap_summary,
             "local_marker_stability": fbx_local_marker_summary,
-            "inverse_dynamics_from_c3d_markers": fbx_inverse_dynamics_report,
+            "inverse_kinematics_from_c3d_markers": fbx_inverse_kinematics_report,
             "counts": {
                 "fbx_joints": len(fbx_runtime.joint_names),
                 "fbx_q": int(fbx_runtime.q.shape[0]),
@@ -2632,7 +2740,7 @@ def main() -> None:
             "bvh_local_markers_csv": str(bvh_local_markers_csv),
             "bvh_root_policy": str(out_dir / "bvh_root_translation_policy.json"),
             "bvh_animation_markers_no_angles_with_joint_centres": str(bvh_animation_markers_npz),
-            "bvh_inverse_dynamics": bvh_inverse_dynamics_report,
+            "bvh_inverse_kinematics": bvh_inverse_kinematics_report,
             "fbx": fbx_outputs,
         },
         "counts": {
@@ -2667,7 +2775,7 @@ def main() -> None:
         },
         "q_unwrap": bvh_runtime.unwrap_summary,
         "local_marker_stability": bvh_local_marker_summary,
-        "inverse_dynamics_from_c3d_markers": bvh_inverse_dynamics_report,
+        "inverse_kinematics_from_c3d_markers": bvh_inverse_kinematics_report,
         "fbx_report": fbx_report,
         "q_names": bvh_runtime.q_names,
         "c3d_angle_labels": c3d_split.angle_labels,
@@ -2680,14 +2788,14 @@ def main() -> None:
     print(f"BVH q: {q_npz}")
     print(f"Augmented C3D: {augmented_c3d_path}")
     print(f"BVH local C3D markers: {bvh_local_markers_csv}")
-    if bvh_inverse_dynamics_report is not None:
-        print(f"BVH inverse dynamics: {bvh_inverse_dynamics_report['npz']}")
+    if bvh_inverse_kinematics_report is not None:
+        print(f"BVH inverse kinematics: {bvh_inverse_kinematics_report['npz']}")
     if fbx_outputs:
         print(f"FBX bioMod: {fbx_outputs['biomod']}")
         print(f"FBX q: {fbx_outputs['fbx_q_npz']}")
         print(f"FBX augmented C3D: {fbx_outputs['augmented_c3d']}")
-        if fbx_outputs.get("inverse_dynamics") is not None:
-            print(f"FBX inverse dynamics: {fbx_outputs['inverse_dynamics']['npz']}")
+        if fbx_outputs.get("inverse_kinematics") is not None:
+            print(f"FBX inverse kinematics: {fbx_outputs['inverse_kinematics']['npz']}")
     print(f"Pairwise comparison: {pairwise_csv}")
     print(f"Best matches: {best_csv}")
     print(f"Report: {report_path}")

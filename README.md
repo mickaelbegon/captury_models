@@ -64,7 +64,7 @@ python bvh_c3d_biobuddy_pyorerun_compare.py \
   --animate
 ```
 
-To compute inverse dynamics from the C3D markers, add:
+To compute inverse kinematics from the C3D markers with biorbd nonlinear least squares, add:
 
 ```bash
 python bvh_c3d_biobuddy_pyorerun_compare.py \
@@ -72,10 +72,11 @@ python bvh_c3d_biobuddy_pyorerun_compare.py \
   --fbx unknown.fbx \
   --c3d unknown.c3d \
   --out-dir out_biobuddy_bvh_c3d \
-  --inverse-dynamics
+  --inverse-kinematics \
+  --inverse-kinematics-solver least_squares
 ```
 
-For a quick smoke test, limit the inverse dynamics to the first few frames:
+To use biorbd's marker Kalman reconstruction instead:
 
 ```bash
 python bvh_c3d_biobuddy_pyorerun_compare.py \
@@ -83,8 +84,20 @@ python bvh_c3d_biobuddy_pyorerun_compare.py \
   --fbx unknown.fbx \
   --c3d unknown.c3d \
   --out-dir out_biobuddy_bvh_c3d \
-  --inverse-dynamics \
-  --inverse-dynamics-max-frames 5
+  --inverse-kinematics \
+  --inverse-kinematics-solver kalman
+```
+
+For a quick smoke test, limit inverse kinematics to the first few frames:
+
+```bash
+python bvh_c3d_biobuddy_pyorerun_compare.py \
+  --bvh unknown.bvh \
+  --fbx unknown.fbx \
+  --c3d unknown.c3d \
+  --out-dir out_biobuddy_bvh_c3d \
+  --inverse-kinematics \
+  --inverse-kinematics-max-frames 5
 ```
 
 Useful generated files include:
@@ -98,8 +111,8 @@ Useful generated files include:
 - `fbx_c3d_local_markers.csv`
 - `bvh_animation_markers_no_angles_with_joint_centres.npz`
 - `fbx_animation_markers_no_angles_with_joint_centres.npz`
-- `bvh_inverse_dynamics_from_c3d_markers.npz`
-- `fbx_inverse_dynamics_from_c3d_markers.npz`
+- `bvh_inverse_kinematics_from_c3d_markers.npz`
+- `fbx_inverse_kinematics_from_c3d_markers.npz`
 - `run_report.json`
 
 ## Root Translation Policy
@@ -123,6 +136,6 @@ The FBX mesh is handled by the BioBuddy branch `codex/add-fbx-segment-meshes`: t
 
 For each C3D marker, the script uses biorbd segment rototranslations to express the marker in every segment's local frame. It assigns the marker to the segment where that local position varies least across frames, writes the local mean position into the corresponding `bioMod`, and reports stability statistics in the local marker CSV files.
 
-## Inverse Dynamics
+## Inverse Kinematics
 
-With `--inverse-dynamics`, the script uses only the C3D marker channels, never the C3D angle channels. It runs biorbd marker-based inverse kinematics on the generated local C3D markers, differentiates the reconstructed generalized coordinates to obtain `qdot` and `qddot`, then calls `biorbd.Model.InverseDynamics`. No force plate or external contact force is included, so root and contact-related generalized forces should be interpreted as residual efforts rather than final biomechanical joint moments.
+With `--inverse-kinematics`, the script uses only the C3D marker channels, never the C3D angle channels. The solver can be `least_squares`, which calls `biorbd.InverseKinematics`, or `kalman`, which calls `biorbd.KalmanReconsMarkers`. The outputs contain reconstructed `q`, `qdot`, and `qddot`; no inverse dynamics or generalized forces are computed in this step.
