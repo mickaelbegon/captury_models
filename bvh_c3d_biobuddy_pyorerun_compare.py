@@ -52,6 +52,22 @@ from typing import Any, Iterable
 import numpy as np
 
 
+DEFAULT_C3D_ANGLE_LABELS = {
+    "RHip",
+    "LHip",
+    "RKne",
+    "LKne",
+    "RAnk",
+    "LAnk",
+    "RSho",
+    "LSho",
+    "RElb",
+    "LElb",
+    "RWri",
+    "LWri",
+}
+
+
 # =============================================================================
 # Small utilities
 # =============================================================================
@@ -858,7 +874,7 @@ def split_c3d_points(
 
     regex = re.compile(angle_label_regex) if angle_label_regex else None
     c3d_angle_param_labels = get_angle_label_set_from_c3d_parameters(c3d)
-    extra_angle_label_set = {label.strip() for label in (extra_angle_labels or [])}
+    extra_angle_label_set = DEFAULT_C3D_ANGLE_LABELS | {label.strip() for label in (extra_angle_labels or [])}
 
     def is_angle_point(i: int) -> bool:
         label = labels[i]
@@ -866,7 +882,7 @@ def split_c3d_points(
         description = descriptions[i]
         if label in c3d_angle_param_labels or compact_label in c3d_angle_param_labels:
             return True
-        if label in extra_angle_label_set:
+        if label in extra_angle_label_set or compact_label in extra_angle_label_set:
             return True
         if regex is not None and (regex.search(label) or regex.search(description)):
             return True

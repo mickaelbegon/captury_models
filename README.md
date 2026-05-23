@@ -33,6 +33,14 @@ The environment installs BioBuddy from:
 git+https://github.com/mickaelbegon/biobuddy.git@codex/add-fbx-parser
 ```
 
+## C3D Point Classification
+
+The C3D contains both marker trajectories and angle-like point channels. The pipeline excludes detected angle channels from the marker cloud used for animation and local marker placement. In addition to labels/descriptions matching the angle regex, these Captury joint labels are treated as angles by default:
+
+```text
+RHip LHip RKne LKne RAnk LAnk RSho LSho RElb LElb RWri LWri
+```
+
 ## Run
 
 ```bash

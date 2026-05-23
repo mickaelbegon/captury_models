@@ -30,6 +30,21 @@ import matplotlib.pyplot as plt
 
 AXIS_TO_INDEX = {"X": 0, "Y": 1, "Z": 2, "x": 0, "y": 1, "z": 2}
 
+DEFAULT_C3D_ANGLE_LABELS = {
+    "RHip",
+    "LHip",
+    "RKne",
+    "LKne",
+    "RAnk",
+    "LAnk",
+    "RSho",
+    "LSho",
+    "RElb",
+    "LElb",
+    "RWri",
+    "LWri",
+}
+
 
 def require_ezc3d():
     try:
@@ -103,7 +118,7 @@ def split_c3d_points(c3d_path: Path, angle_label_regex: str = r"Angles?$", extra
     time = c3d_time_vector(c3d)
     regex = re.compile(angle_label_regex) if angle_label_regex else None
     c3d_angle_param_labels = get_angle_label_set_from_c3d_parameters(c3d)
-    extra_angle_label_set = {label.strip() for label in (extra_angle_labels or [])}
+    extra_angle_label_set = DEFAULT_C3D_ANGLE_LABELS | {label.strip() for label in (extra_angle_labels or [])}
 
     def is_angle_point(i: int) -> bool:
         label = labels[i]
@@ -111,7 +126,7 @@ def split_c3d_points(c3d_path: Path, angle_label_regex: str = r"Angles?$", extra
         description = descriptions[i]
         if label in c3d_angle_param_labels or compact_label in c3d_angle_param_labels:
             return True
-        if label in extra_angle_label_set:
+        if label in extra_angle_label_set or compact_label in extra_angle_label_set:
             return True
         if regex is not None and (regex.search(label) or regex.search(description)):
             return True
