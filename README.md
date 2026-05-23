@@ -7,7 +7,7 @@ Small workspace for comparing Captury BVH/FBX skeleton exports with C3D marker d
 - `bvh_c3d_biobuddy_pyorerun_compare.py`: main BVH/FBX to `bioMod` pipeline.
 - `plot_bvh_c3d_angle_comparisons.py`: optional plotting helper for BVH q versus C3D angle channels.
 - `environment_bvh_c3d_biobuddy.yml`: conda environment definition.
-- `unknown 1.bvh`, `unknown.fbx`, `unknown 1.c3d`: example Captury files.
+- `unknown.bvh`, `unknown.fbx`, `unknown.c3d`: expected local Captury input files. They are ignored by git because they are data files.
 
 Generated outputs are written to `out_biobuddy_bvh_c3d/` and are intentionally ignored by git.
 
@@ -47,9 +47,9 @@ During animation, the marker overlay contains the C3D marker points after this a
 
 ```bash
 python bvh_c3d_biobuddy_pyorerun_compare.py \
-  --bvh "unknown 1.bvh" \
+  --bvh unknown.bvh \
   --fbx unknown.fbx \
-  --c3d "unknown 1.c3d" \
+  --c3d unknown.c3d \
   --out-dir out_biobuddy_bvh_c3d
 ```
 
@@ -57,9 +57,9 @@ To also launch pyorerun animations:
 
 ```bash
 python bvh_c3d_biobuddy_pyorerun_compare.py \
-  --bvh "unknown 1.bvh" \
+  --bvh unknown.bvh \
   --fbx unknown.fbx \
-  --c3d "unknown 1.c3d" \
+  --c3d unknown.c3d \
   --out-dir out_biobuddy_bvh_c3d \
   --animate
 ```

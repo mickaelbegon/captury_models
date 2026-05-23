@@ -5,6 +5,12 @@ __pycache__/
 # Generated analysis outputs can be recreated with the main script.
 out_biobuddy_bvh_c3d/
 
+# Captury/source data are local inputs and should not be committed.
+*.bvh
+*.hbv
+*.c3d
+*.fbx
+
 # Local archives/backups.
 Archive.zip
 

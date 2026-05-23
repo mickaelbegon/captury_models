@@ -18,9 +18,9 @@ What this script does
 Typical usage
 -------------
 python bvh_c3d_biobuddy_pyorerun_compare.py \
-    --bvh "unknown 1.bvh" \
+    --bvh unknown.bvh \
     --fbx "unknown.fbx" \
-    --c3d "unknown 1.c3d" \
+    --c3d unknown.c3d \
     --out-dir out_biobuddy_bvh_c3d \
     --animate
 
@@ -2001,9 +2001,9 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Generate a biorbd bioMod from BVH using BioBuddy, export BVH q, overlay C3D markers, and compare q to C3D angles."
     )
-    parser.add_argument("--bvh", required=True, type=Path, help="Input BVH file.")
-    parser.add_argument("--fbx", default=None, type=Path, help="Optional input FBX file.")
-    parser.add_argument("--c3d", required=True, type=Path, help="Input C3D file.")
+    parser.add_argument("--bvh", default=Path("unknown.bvh"), type=Path, help="Input BVH file.")
+    parser.add_argument("--fbx", default=Path("unknown.fbx"), type=Path, help="Optional input FBX file.")
+    parser.add_argument("--c3d", default=Path("unknown.c3d"), type=Path, help="Input C3D file.")
     parser.add_argument("--out-dir", default=Path("out_biobuddy_bvh_c3d"), type=Path, help="Output directory.")
     parser.add_argument(
         "--bvh-unit-scale-to-m",
