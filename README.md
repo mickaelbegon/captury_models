@@ -81,6 +81,10 @@ Captury exports may store a static root offset in the skeleton while also storin
 
 Use `--root-offset-mode subtract` or `--root-offset-mode keep` to force either convention.
 
+## Generalized Coordinate Units
+
+The exported `*_q_biorbd_order.npz` files follow the DOF order written by BioBuddy into the generated `bioMod`: translations first, then rotations for each segment. Translation channels remain in the native length unit of the BVH/FBX file so they match the `RT` offsets written in the `bioMod`. Rotation channels are converted from source degrees to radians, then unwrapped per Euler channel before saving and animation. The `.npz` files include `q_units`, and `run_report.json` includes an unwrap summary.
+
 ## Local Marker Test
 
 For each C3D marker, the script uses biorbd segment rototranslations to express the marker in every segment's local frame. It assigns the marker to the segment where that local position varies least across frames, writes the local mean position into the corresponding `bioMod`, and reports stability statistics in the local marker CSV files.

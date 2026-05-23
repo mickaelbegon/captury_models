@@ -190,6 +190,64 @@ def sanitize_biomod_name(name: str, fallback: str) -> str:
     return cleaned
 
 
+def q_channel_units(q_names: list[str]) -> list[str]:
+    """Return the biorbd unit used by each generalized coordinate channel."""
+    units: list[str] = []
+    for name in q_names:
+        if name.lower().endswith("rotation"):
+            units.append("rad")
+        elif name.lower().endswith("position"):
+            units.append("native_length_unit")
+        else:
+            units.append("unknown")
+    return units
+
+
+def rotation_q_indices(q_names: list[str]) -> list[int]:
+    return [i for i, name in enumerate(q_names) if name.lower().endswith("rotation")]
+
+
+def unwrap_rotation_q(q: np.ndarray, q_names: list[str]) -> np.ndarray:
+    """Unwrap rotational generalized coordinates in radians, channel by channel.
+
+    biorbd expects rotational q in radians. BVH and FBX store Euler channels in
+    degrees and may wrap at +/-180 or 0/360 degrees. Unwrapping after conversion
+    to radians preserves the intended continuous trajectory without changing the
+    represented pose modulo 2*pi.
+    """
+    q_unwrapped = q.copy()
+    for idx in rotation_q_indices(q_names):
+        values = q_unwrapped[idx, :]
+        finite = np.isfinite(values)
+        if finite.sum() > 1:
+            q_unwrapped[idx, finite] = np.unwrap(values[finite])
+    return q_unwrapped
+
+
+def q_unwrap_summary(q_before: np.ndarray, q_after: np.ndarray, q_names: list[str]) -> dict[str, Any]:
+    rows: list[dict[str, Any]] = []
+    for idx in rotation_q_indices(q_names):
+        delta = q_after[idx, :] - q_before[idx, :]
+        finite = np.isfinite(delta)
+        if not finite.any():
+            continue
+        max_abs_delta = float(np.nanmax(np.abs(delta[finite])))
+        if max_abs_delta > 1e-12:
+            rows.append(
+                {
+                    "q_name": q_names[idx],
+                    "max_abs_unwrap_delta_rad": max_abs_delta,
+                    "max_abs_unwrap_delta_deg": math.degrees(max_abs_delta),
+                }
+            )
+    return {
+        "applied": True,
+        "rotation_channels": len(rotation_q_indices(q_names)),
+        "channels_changed": len(rows),
+        "changed_channels": rows,
+    }
+
+
 # =============================================================================
 # BVH through BioBuddy
 # =============================================================================
@@ -206,6 +264,8 @@ class BvhRuntimeData:
     time: np.ndarray
     root_offset_correction_applied: bool = False
     root_offset_native: np.ndarray | None = None
+    q_units: list[str] = field(default_factory=list)
+    unwrap_summary: dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass
@@ -224,6 +284,8 @@ class FbxRuntimeData:
     time: np.ndarray
     root_offset_correction_applied: bool = False
     root_offset_native: np.ndarray | None = None
+    q_units: list[str] = field(default_factory=list)
+    unwrap_summary: dict[str, Any] = field(default_factory=dict)
 
 
 def iter_bvh_joints_depth_first(joint: Any) -> Iterable[Any]:
@@ -536,7 +598,8 @@ def extract_q_from_fbx_parser(
     for root_id in parser.root_ids:
         append_node(root_id)
 
-    q = np.vstack(q_rows) if q_rows else np.zeros((0, time.shape[0]))
+    q_raw_units = np.vstack(q_rows) if q_rows else np.zeros((0, time.shape[0]))
+    q = unwrap_rotation_q(q_raw_units, q_names)
     root_offset = (
         np.asarray(parser.skeleton_nodes[parser.root_ids[0]].translation, dtype=float)
         if parser.root_ids
@@ -550,6 +613,8 @@ def extract_q_from_fbx_parser(
         time=time,
         root_offset_correction_applied=apply_root_offset_correction,
         root_offset_native=root_offset,
+        q_units=q_channel_units(q_names),
+        unwrap_summary=q_unwrap_summary(q_raw_units, q, q_names),
     )
 
 
@@ -732,7 +797,8 @@ def extract_q_from_biobuddy_bvh_parser(
         q_rows.append(values)
         q_names.append(f"{joint_name}_{channel}")
 
-    q = np.vstack(q_rows) if q_rows else np.zeros((0, int(parser.frame_count)))
+    q_raw_units = np.vstack(q_rows) if q_rows else np.zeros((0, int(parser.frame_count)))
+    q = unwrap_rotation_q(q_raw_units, q_names)
     time = np.arange(int(parser.frame_count), dtype=float) * float(parser.frame_time)
     return BvhRuntimeData(
         parser=parser,
@@ -744,15 +810,29 @@ def extract_q_from_biobuddy_bvh_parser(
         time=time,
         root_offset_correction_applied=apply_root_offset_correction,
         root_offset_native=root_offset,
+        q_units=q_channel_units(q_names),
+        unwrap_summary=q_unwrap_summary(q_raw_units, q, q_names),
     )
 
 
 def save_q_outputs(
-    q: np.ndarray, q_names: list[str], time: np.ndarray, out_dir: Path, source_name: str = "bvh"
+    q: np.ndarray,
+    q_names: list[str],
+    time: np.ndarray,
+    out_dir: Path,
+    source_name: str = "bvh",
+    q_units: list[str] | None = None,
 ) -> tuple[Path, Path]:
     npz_path = out_dir / f"{source_name}_q_biorbd_order.npz"
     csv_path = out_dir / f"{source_name}_q_biorbd_order.csv"
-    np.savez(npz_path, q=q, q_names=np.asarray(q_names, dtype=object), time=time)
+    q_units = q_units if q_units is not None else q_channel_units(q_names)
+    np.savez(
+        npz_path,
+        q=q,
+        q_names=np.asarray(q_names, dtype=object),
+        q_units=np.asarray(q_units, dtype=object),
+        time=time,
+    )
 
     with csv_path.open("w", newline="", encoding="utf-8") as f:
         writer = csv.writer(f)
@@ -1700,7 +1780,14 @@ def main() -> None:
         out_dir=out_dir,
     )
     bvh_runtime = bvh_corrected_runtime if bvh_use_correction else bvh_uncorrected_runtime
-    q_npz, q_csv = save_q_outputs(bvh_runtime.q, bvh_runtime.q_names, bvh_runtime.time, out_dir, "bvh")
+    q_npz, q_csv = save_q_outputs(
+        bvh_runtime.q,
+        bvh_runtime.q_names,
+        bvh_runtime.time,
+        out_dir,
+        "bvh",
+        bvh_runtime.q_units,
+    )
     joint_centres_npz = save_model_joint_centres(centres_native, bvh_runtime.time, out_dir, "bvh")
     bvh_local_markers_csv, bvh_local_marker_summary = compute_and_append_c3d_local_markers(
         biomod_path=biomod_path,
@@ -1789,7 +1876,14 @@ def main() -> None:
             out_dir=out_dir,
         )
         fbx_runtime = fbx_corrected_runtime if fbx_use_correction else fbx_uncorrected_runtime
-        fbx_q_npz, fbx_q_csv = save_q_outputs(fbx_runtime.q, fbx_runtime.q_names, fbx_runtime.time, out_dir, "fbx")
+        fbx_q_npz, fbx_q_csv = save_q_outputs(
+            fbx_runtime.q,
+            fbx_runtime.q_names,
+            fbx_runtime.time,
+            out_dir,
+            "fbx",
+            fbx_runtime.q_units,
+        )
         fbx_joint_centres_npz = save_model_joint_centres(
             fbx_centres_native, fbx_runtime.time, out_dir, "fbx"
         )
@@ -1843,6 +1937,11 @@ def main() -> None:
                 ),
                 "policy": fbx_policy_report,
             },
+            "q_units": {
+                "translations": "native FBX length unit, matching the generated bioMod RT values",
+                "rotations": "radians, converted from FBX degrees and unwrapped per Euler channel",
+            },
+            "q_unwrap": fbx_runtime.unwrap_summary,
             "local_marker_stability": fbx_local_marker_summary,
             "counts": {
                 "fbx_joints": len(fbx_runtime.joint_names),
@@ -1883,8 +1982,8 @@ def main() -> None:
             "c3d_frames": int(c3d_split.marker_data_native.shape[2]),
         },
         "units": {
-            "q_translations": "native BVH unit; root translations corrected for BioBuddy root OFFSET unless --no-root-offset-correction is used",
-            "q_rotations": "radians",
+            "q_translations": "native BVH/FBX length unit, matching the generated bioMod RT values; root translations corrected for static root offset according to the selected policy",
+            "q_rotations": "radians, converted from source degrees and unwrapped per Euler channel",
             "bvh_unit_scale_to_m": args.bvh_unit_scale_to_m,
             "fbx_unit_scale_to_m": args.fbx_unit_scale_to_m,
             "c3d_point_unit_scale_to_m": c3d_split.c3d_unit_scale_to_m,
@@ -1899,6 +1998,11 @@ def main() -> None:
             ),
             "policy": bvh_policy_report,
         },
+        "q_units": {
+            "translations": "native BVH length unit, matching the generated bioMod RT values",
+            "rotations": "radians, converted from BVH degrees and unwrapped per Euler channel",
+        },
+        "q_unwrap": bvh_runtime.unwrap_summary,
         "local_marker_stability": bvh_local_marker_summary,
         "fbx_report": fbx_report,
         "q_names": bvh_runtime.q_names,
