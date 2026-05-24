@@ -2275,6 +2275,73 @@ def animate_with_pyorerun(
     phase.rerun(name)
 
 
+def animate_superposed_models_with_pyorerun(
+    bvh_biomod_path: Path,
+    bvh_q: np.ndarray,
+    bvh_time: np.ndarray,
+    fbx_biomod_path: Path,
+    fbx_q: np.ndarray,
+    fbx_time: np.ndarray,
+    c3d_markers_bvh_units: np.ndarray,
+    c3d_marker_labels: list[str],
+    c3d_time: np.ndarray,
+    name: str = "bvh_fbx_c3d_superposed",
+    display_q_in_rerun: bool = False,
+) -> None:
+    """Animate the BVH model, the FBX model and C3D markers in one Rerun scene."""
+    BiorbdModel, PhaseRerun, PyoMarkers = require_pyorerun()
+
+    # Use the BVH sampling times as the shared timeline. Both FBX q and the C3D
+    # points are interpolated to it so pyorerun can add every object to one phase.
+    fbx_q_on_bvh_time = interpolate_array(fbx_q, fbx_time, bvh_time)
+    c3d_markers_on_bvh_time = interpolate_array(c3d_markers_bvh_units, c3d_time, bvh_time)
+
+    bvh_model = BiorbdModel(str(bvh_biomod_path))
+    fbx_model = BiorbdModel(str(fbx_biomod_path))
+    if bvh_q.shape[0] != bvh_model.nb_q:
+        raise RuntimeError(f"BVH q has {bvh_q.shape[0]} rows, but its model has {bvh_model.nb_q} DoFs.")
+    if fbx_q_on_bvh_time.shape[0] != fbx_model.nb_q:
+        raise RuntimeError(f"FBX q has {fbx_q_on_bvh_time.shape[0]} rows, but its model has {fbx_model.nb_q} DoFs.")
+
+    for model in (bvh_model, fbx_model):
+        model.options.show_marker_labels = False
+        model.options.show_center_of_mass_labels = False
+
+    # The FBX model carries the body surfaces. A light transparent color leaves
+    # the BVH joint-centre markers and experimental C3D markers visible inside.
+    fbx_model.options.mesh_color = (70, 178, 160)
+    fbx_model.options.transparent_mesh = True
+
+    def _build_phase(display_q: bool):
+        phase_local = PhaseRerun(bvh_time)
+        phase_local.add_animated_model(bvh_model, bvh_q, display_q=display_q)
+        phase_local.add_animated_model(fbx_model, fbx_q_on_bvh_time, display_q=display_q)
+        if c3d_markers_on_bvh_time.size and c3d_marker_labels:
+            phase_local.add_xp_markers(
+                "c3d_markers_no_angle_channels",
+                PyoMarkers(
+                    data=c3d_markers_on_bvh_time,
+                    channels=c3d_marker_labels,
+                    show_labels=False,
+                ),
+            )
+        return phase_local
+
+    try:
+        phase = _build_phase(display_q=display_q_in_rerun)
+    except AttributeError as exc:
+        if display_q_in_rerun and "SeriesLine" in str(exc):
+            warnings.warn(
+                "pyorerun could not display q time-series; displaying the superposed animation without q plots.",
+                RuntimeWarning,
+            )
+            phase = _build_phase(display_q=False)
+        else:
+            raise
+
+    phase.rerun(name)
+
+
 # =============================================================================
 # CLI
 # =============================================================================
@@ -2357,6 +2424,11 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--animate", action="store_true", help="Launch a pyorerun animation.")
     parser.add_argument(
+        "--animate-superposed",
+        action="store_true",
+        help="Launch one pyorerun scene containing the BVH model, FBX model and filtered C3D markers.",
+    )
+    parser.add_argument(
         "--display-q-in-rerun",
         action="store_true",
         help=(
@@ -2438,6 +2510,8 @@ def main() -> None:
         args.inverse_kinematics_method = args.inverse_dynamics_method
     if args.inverse_dynamics_max_frames is not None:
         args.inverse_kinematics_max_frames = args.inverse_dynamics_max_frames
+    if args.animate_superposed and args.fbx is None:
+        raise ValueError("--animate-superposed requires --fbx because both generated models are displayed.")
     out_dir: Path = args.out_dir
     out_dir.mkdir(parents=True, exist_ok=True)
     root_offset_mode = "keep" if args.no_root_offset_correction else args.root_offset_mode
@@ -2566,7 +2640,7 @@ def main() -> None:
     )
     mapping_template = write_mapping_template(bvh_runtime.q_names, c3d_split.angle_labels, out_dir)
 
-    if args.animate:
+    if args.animate and not args.animate_superposed:
         # Animation is optional because it opens/runs rerun. The numeric outputs
         # above are produced even when --animate is not used.
         if args.headless:
@@ -2669,7 +2743,7 @@ def main() -> None:
                 source_name="fbx",
             )
         )
-        if args.animate:
+        if args.animate and not args.animate_superposed:
             animate_with_pyorerun(
                 biomod_path=fbx_biomod_path,
                 q=fbx_runtime.q,
@@ -2678,6 +2752,26 @@ def main() -> None:
                 c3d_marker_labels=fbx_animation_marker_labels,
                 c3d_time=c3d_split.time,
                 name="fbx_biobuddy_c3d_comparison",
+                display_q_in_rerun=args.display_q_in_rerun,
+            )
+        if args.animate_superposed:
+            if args.headless:
+                os.environ["PYORERUN_HEADLESS"] = "1"
+            if not math.isclose(args.bvh_unit_scale_to_m, args.fbx_unit_scale_to_m):
+                warnings.warn(
+                    "BVH and FBX native unit scales differ; the shared overlay uses BVH units for C3D markers.",
+                    RuntimeWarning,
+                )
+            animate_superposed_models_with_pyorerun(
+                bvh_biomod_path=biomod_path,
+                bvh_q=bvh_runtime.q,
+                bvh_time=bvh_runtime.time,
+                fbx_biomod_path=fbx_biomod_path,
+                fbx_q=fbx_runtime.q,
+                fbx_time=fbx_runtime.time,
+                c3d_markers_bvh_units=marker_data_in_source_units(c3d_split, args.bvh_unit_scale_to_m),
+                c3d_marker_labels=c3d_split.marker_labels,
+                c3d_time=c3d_split.time,
                 display_q_in_rerun=args.display_q_in_rerun,
             )
         fbx_outputs = {
@@ -2690,6 +2784,7 @@ def main() -> None:
             "local_markers_csv": str(fbx_local_markers_csv),
             "root_policy": str(out_dir / "fbx_root_translation_policy.json"),
             "inverse_kinematics": fbx_inverse_kinematics_report,
+            "superposed_animation_requested": bool(args.animate_superposed),
         }
         fbx_report = {
             "input_fbx": str(args.fbx),

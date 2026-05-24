@@ -64,6 +64,17 @@ python bvh_c3d_biobuddy_pyorerun_compare.py \
   --animate
 ```
 
+To display the BVH model, the FBX surface model and filtered C3D markers superposed in one scene:
+
+```bash
+python bvh_c3d_biobuddy_pyorerun_compare.py \
+  --bvh unknown.bvh \
+  --fbx unknown.fbx \
+  --c3d unknown.c3d \
+  --out-dir out_biobuddy_bvh_c3d \
+  --animate-superposed
+```
+
 To compute inverse kinematics from the C3D markers with biorbd nonlinear least squares, add:
 
 ```bash
