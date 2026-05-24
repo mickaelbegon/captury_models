@@ -120,6 +120,9 @@ Useful generated files include:
 - `fbx_q_biorbd_order.npz`
 - `bvh_c3d_local_markers.csv`
 - `fbx_c3d_local_markers.csv`
+- `bvh_c3d_marker_error_norm_boxplot.png`
+- `fbx_c3d_marker_error_norm_boxplot.png`
+- `bvh_fbx_c3d_marker_error_norm_overall_boxplot.png`
 - `bvh_animation_markers_no_angles_with_joint_centres.npz`
 - `fbx_animation_markers_no_angles_with_joint_centres.npz`
 - `bvh_inverse_kinematics_from_c3d_markers.npz`
@@ -146,6 +149,8 @@ The FBX mesh is handled by the BioBuddy branch `codex/add-fbx-segment-meshes`: t
 ## Local Marker Test
 
 For each C3D marker, the script uses biorbd segment rototranslations to express the marker in every segment's local frame. It assigns the marker to the segment where that local position varies least across frames, writes the local mean position into the corresponding `bioMod`, and reports stability statistics in the local marker CSV files.
+
+The script then recomputes each local marker position in the global frame while the BVH or FBX model is animated. The Euclidean norm between this model marker and the measured C3D marker is saved in `*_c3d_marker_error_norm_mm.csv`, summarized in JSON, and displayed as per-marker and overall boxplots in millimetres. If several C3D channels have the same visible marker label, their channel indices are retained so every physical marker remains distinct. This measures residual fit on the same trial used to attach markers to segments; it is not an independent validation trial.
 
 ## Inverse Kinematics
 

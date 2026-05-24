@@ -1616,6 +1616,7 @@ def build_animation_markers_with_joint_centres(
 def write_local_marker_csv(rows: list[dict[str, Any]], out_path: Path) -> Path:
     fieldnames = [
         "marker",
+        "marker_index",
         "biomod_marker",
         "parent_segment",
         "x",
@@ -1729,6 +1730,7 @@ def compute_and_append_c3d_local_markers(
         rows.append(
             {
                 "marker": marker_label,
+                "marker_index": marker_idx,
                 "biomod_marker": marker_name,
                 "parent_segment": segment_names[best_seg_idx],
                 "x": float(mean_local[0]),
@@ -1769,6 +1771,203 @@ def read_local_marker_rows(csv_path: Path) -> list[dict[str, str]]:
         return list(csv.DictReader(f))
 
 
+def c3d_index_from_local_marker_row(row: dict[str, str], split: C3dSplitData) -> int:
+    """Get the original C3D channel index, even when labels are duplicated.
+
+    Captury files may contain distinct physical markers sharing one visible
+    label. Their channel indices therefore carry information that the label
+    alone cannot preserve.
+    """
+    marker_label = row["marker"]
+    marker_index = row.get("marker_index", "")
+    if marker_index:
+        index = int(marker_index)
+        if index < 0 or index >= len(split.marker_labels) or split.marker_labels[index] != marker_label:
+            raise RuntimeError(f"Invalid C3D marker index stored for {marker_label}: {marker_index}.")
+        return index
+
+    matching_indices = [i for i, label in enumerate(split.marker_labels) if label == marker_label]
+    if len(matching_indices) != 1:
+        raise RuntimeError(
+            f"The local marker CSV does not identify duplicated C3D marker {marker_label}; regenerate it."
+        )
+    return matching_indices[0]
+
+
+def finite_error_values(errors_by_marker: dict[str, np.ndarray]) -> np.ndarray:
+    """Gather finite marker error samples from a marker-to-trajectory dictionary."""
+    if not errors_by_marker:
+        return np.zeros(0, dtype=float)
+    values = np.concatenate([errors for errors in errors_by_marker.values()])
+    return values[np.isfinite(values)]
+
+
+def save_and_plot_c3d_marker_error_norms(
+    biomod_path: Path,
+    q: np.ndarray,
+    source_time: np.ndarray,
+    split: C3dSplitData,
+    local_marker_csv: Path,
+    source_unit_scale_to_m: float,
+    source_name: str,
+    out_dir: Path,
+) -> tuple[Path, Path, Path, dict[str, Any], dict[str, np.ndarray]]:
+    """Compute and boxplot the norm of model-to-C3D marker errors.
+
+    The local marker positions have already been appended to the bioMod. For
+    every frame this function animates those markers with ``q``, compares them
+    to the matching measured C3D marker, and reports the Euclidean distance.
+    Distances are converted to millimetres for readable biomechanics plots.
+    """
+    biorbd = require_biorbd()
+    model = biorbd.Model(str(biomod_path))
+    if q.shape[0] != model.nbQ():
+        raise RuntimeError(f"{biomod_path} expects {model.nbQ()} q, got {q.shape[0]}.")
+
+    local_marker_rows = read_local_marker_rows(local_marker_csv)
+    model_marker_index = {
+        name: i for i, name in enumerate(biorbd_strings_to_list(model.markerNames()))
+    }
+    measured = interpolate_array(
+        marker_data_in_source_units(split, source_unit_scale_to_m),
+        split.time,
+        source_time,
+    )
+    native_to_mm = source_unit_scale_to_m * 1000.0
+
+    marker_pairs: list[tuple[str, str, int, int]] = []
+    for row in local_marker_rows:
+        marker_label = row["marker"]
+        biomod_marker = row["biomod_marker"]
+        if biomod_marker in model_marker_index:
+            marker_pairs.append(
+                (
+                    biomod_marker,
+                    marker_label,
+                    c3d_index_from_local_marker_row(row, split),
+                    model_marker_index[biomod_marker],
+                )
+            )
+    if not marker_pairs:
+        raise RuntimeError(f"No C3D/local marker pair available to compute errors for {source_name}.")
+
+    errors_by_marker = {
+        biomod_marker: np.full(source_time.shape[0], np.nan, dtype=float)
+        for biomod_marker, _, _, _ in marker_pairs
+    }
+    for frame in range(source_time.shape[0]):
+        predicted = model.markers(np.ascontiguousarray(q[:, frame], dtype=float))
+        for biomod_marker, _, c3d_index, model_index in marker_pairs:
+            measured_position = measured[:, c3d_index, frame]
+            if not np.all(np.isfinite(measured_position)):
+                continue
+            predicted_position = np.asarray(predicted[model_index].to_array(), dtype=float).ravel()
+            errors_by_marker[biomod_marker][frame] = (
+                np.linalg.norm(predicted_position - measured_position) * native_to_mm
+            )
+
+    csv_path = out_dir / f"{source_name}_c3d_marker_error_norm_mm.csv"
+    with csv_path.open("w", newline="", encoding="utf-8") as f:
+        writer = csv.writer(f)
+        writer.writerow(["source", "marker", "marker_index", "biomod_marker", "frame", "time", "error_norm_mm"])
+        for biomod_marker, marker_label, c3d_index, _ in marker_pairs:
+            errors = errors_by_marker[biomod_marker]
+            for frame, error in enumerate(errors):
+                writer.writerow(
+                    [source_name, marker_label, c3d_index, biomod_marker, frame, source_time[frame], error]
+                )
+
+    finite_all = finite_error_values(errors_by_marker)
+    per_marker_summary: dict[str, dict[str, Any]] = {}
+    for biomod_marker, marker_label, c3d_index, _ in marker_pairs:
+        errors = errors_by_marker[biomod_marker]
+        finite = errors[np.isfinite(errors)]
+        per_marker_summary[biomod_marker] = {
+            "c3d_label": marker_label,
+            "c3d_marker_index": c3d_index,
+            "n": int(finite.size),
+            "median_mm": float(np.nanmedian(finite)) if finite.size else None,
+            "p95_mm": float(np.nanpercentile(finite, 95)) if finite.size else None,
+            "max_mm": float(np.nanmax(finite)) if finite.size else None,
+        }
+    summary = {
+        "source": source_name,
+        "error_definition": "Euclidean norm of model marker position minus measured C3D marker position",
+        "unit": "mm",
+        "markers": len(errors_by_marker),
+        "samples": int(finite_all.size),
+        "median_mm": float(np.nanmedian(finite_all)) if finite_all.size else None,
+        "p95_mm": float(np.nanpercentile(finite_all, 95)) if finite_all.size else None,
+        "max_mm": float(np.nanmax(finite_all)) if finite_all.size else None,
+        "per_marker": per_marker_summary,
+        "csv": str(csv_path),
+    }
+    summary_path = out_dir / f"{source_name}_c3d_marker_error_norm_summary.json"
+    summary_path.write_text(json.dumps(summary, indent=2), encoding="utf-8")
+
+    import matplotlib.pyplot as plt  # Imported only when generating requested error figures.
+
+    marker_labels = [biomod_marker.removeprefix("C3D_") for biomod_marker, _, _, _ in marker_pairs]
+    box_values = [
+        errors_by_marker[biomod_marker][np.isfinite(errors_by_marker[biomod_marker])]
+        for biomod_marker, _, _, _ in marker_pairs
+    ]
+    flier_style = {
+        "marker": ".",
+        "markersize": 1.0,
+        "markerfacecolor": "#314b57",
+        "markeredgecolor": "none",
+        "alpha": 0.12,
+    }
+    figure, axis = plt.subplots(figsize=(max(12.0, 0.38 * len(marker_labels)), 6.0), constrained_layout=True)
+    axis.boxplot(box_values, tick_labels=marker_labels, showfliers=True, flierprops=flier_style)
+    axis.set_title(f"{source_name.upper()} - erreur marqueur modele vs C3D")
+    axis.set_xlabel("Marqueur C3D")
+    axis.set_ylabel("Norme de l'erreur (mm)")
+    axis.tick_params(axis="x", labelrotation=65)
+    axis.grid(axis="y", alpha=0.3)
+    figure_path = out_dir / f"{source_name}_c3d_marker_error_norm_boxplot.png"
+    figure.savefig(figure_path, dpi=180)
+    plt.close(figure)
+
+    return csv_path, summary_path, figure_path, summary, errors_by_marker
+
+
+def plot_overall_model_marker_error_boxplot(
+    errors_by_source: dict[str, dict[str, np.ndarray]],
+    out_dir: Path,
+) -> Path:
+    """Plot one error distribution per source model for quick comparison."""
+    import matplotlib.pyplot as plt
+
+    labels: list[str] = []
+    values: list[np.ndarray] = []
+    for source_name, errors_by_marker in errors_by_source.items():
+        finite = finite_error_values(errors_by_marker)
+        if finite.size:
+            labels.append(source_name.upper())
+            values.append(finite)
+    if not values:
+        raise RuntimeError("No finite marker error was available for the overall boxplot.")
+
+    flier_style = {
+        "marker": ".",
+        "markersize": 1.0,
+        "markerfacecolor": "#314b57",
+        "markeredgecolor": "none",
+        "alpha": 0.12,
+    }
+    figure, axis = plt.subplots(figsize=(7.0, 5.0), constrained_layout=True)
+    axis.boxplot(values, tick_labels=labels, showfliers=True, flierprops=flier_style)
+    axis.set_title("Erreur globale des marqueurs C3D")
+    axis.set_ylabel("Norme de l'erreur (mm)")
+    axis.grid(axis="y", alpha=0.3)
+    figure_path = out_dir / "bvh_fbx_c3d_marker_error_norm_overall_boxplot.png"
+    figure.savefig(figure_path, dpi=180)
+    plt.close(figure)
+    return figure_path
+
+
 def finite_difference_by_time(data: np.ndarray, time: np.ndarray) -> np.ndarray:
     """Differentiate each row of data with respect to a time vector."""
     if data.shape[1] != time.shape[0]:
@@ -1794,18 +1993,17 @@ def build_marker_data_for_biorbd_ik(
     """
     model_marker_names = biorbd_strings_to_list(model.markerNames())
     model_marker_index = {name: i for i, name in enumerate(model_marker_names)}
-    c3d_marker_index = {label: i for i, label in enumerate(split.marker_labels)}
     c3d_markers_source_units = marker_data_in_source_units(split, source_unit_scale_to_m)
 
     marker_data = np.full((3, len(model_marker_names), frame_indices.shape[0]), np.nan, dtype=float)
     used_marker_names: list[str] = []
     for row in local_marker_rows:
         biomod_marker = row["biomod_marker"]
-        c3d_marker = row["marker"]
-        if biomod_marker not in model_marker_index or c3d_marker not in c3d_marker_index:
+        if biomod_marker not in model_marker_index:
             continue
+        c3d_marker_index = c3d_index_from_local_marker_row(row, split)
         marker_data[:, model_marker_index[biomod_marker], :] = c3d_markers_source_units[
-            :, c3d_marker_index[c3d_marker], :
+            :, c3d_marker_index, :
         ][:, frame_indices]
         used_marker_names.append(biomod_marker)
 
@@ -2577,6 +2775,18 @@ def main() -> None:
         source_name="bvh",
         out_dir=out_dir,
     )
+    bvh_marker_error_csv, bvh_marker_error_summary_path, bvh_marker_error_boxplot, bvh_marker_error_summary, bvh_marker_errors = (
+        save_and_plot_c3d_marker_error_norms(
+            biomod_path=biomod_path,
+            q=bvh_runtime.q,
+            source_time=bvh_runtime.time,
+            split=c3d_split,
+            local_marker_csv=bvh_local_markers_csv,
+            source_unit_scale_to_m=args.bvh_unit_scale_to_m,
+            source_name="bvh",
+            out_dir=out_dir,
+        )
+    )
     bvh_inverse_kinematics_report: dict[str, Any] | None = None
     if args.inverse_kinematics:
         bvh_inverse_kinematics_report = run_inverse_kinematics_from_c3d_markers(
@@ -2708,6 +2918,18 @@ def main() -> None:
             source_name="fbx",
             out_dir=out_dir,
         )
+        fbx_marker_error_csv, fbx_marker_error_summary_path, fbx_marker_error_boxplot, fbx_marker_error_summary, fbx_marker_errors = (
+            save_and_plot_c3d_marker_error_norms(
+                biomod_path=fbx_biomod_path,
+                q=fbx_runtime.q,
+                source_time=fbx_runtime.time,
+                split=c3d_split,
+                local_marker_csv=fbx_local_markers_csv,
+                source_unit_scale_to_m=args.fbx_unit_scale_to_m,
+                source_name="fbx",
+                out_dir=out_dir,
+            )
+        )
         fbx_inverse_kinematics_report: dict[str, Any] | None = None
         if args.inverse_kinematics:
             fbx_inverse_kinematics_report = run_inverse_kinematics_from_c3d_markers(
@@ -2782,6 +3004,9 @@ def main() -> None:
             "augmented_c3d": str(fbx_augmented_c3d_path),
             "animation_markers_no_angles_with_joint_centres": str(fbx_animation_markers_npz),
             "local_markers_csv": str(fbx_local_markers_csv),
+            "marker_error_norm_csv": str(fbx_marker_error_csv),
+            "marker_error_norm_summary": str(fbx_marker_error_summary_path),
+            "marker_error_norm_boxplot": str(fbx_marker_error_boxplot),
             "root_policy": str(out_dir / "fbx_root_translation_policy.json"),
             "inverse_kinematics": fbx_inverse_kinematics_report,
             "superposed_animation_requested": bool(args.animate_superposed),
@@ -2804,6 +3029,7 @@ def main() -> None:
             },
             "q_unwrap": fbx_runtime.unwrap_summary,
             "local_marker_stability": fbx_local_marker_summary,
+            "marker_error_norm_mm": fbx_marker_error_summary,
             "inverse_kinematics_from_c3d_markers": fbx_inverse_kinematics_report,
             "counts": {
                 "fbx_joints": len(fbx_runtime.joint_names),
@@ -2813,6 +3039,11 @@ def main() -> None:
             },
             "q_names": fbx_runtime.q_names,
         }
+
+    marker_error_sets = {"bvh": bvh_marker_errors}
+    if args.fbx is not None:
+        marker_error_sets["fbx"] = fbx_marker_errors
+    overall_marker_error_boxplot = plot_overall_model_marker_error_boxplot(marker_error_sets, out_dir)
 
     report = {
         "input_bvh": str(args.bvh),
@@ -2833,6 +3064,10 @@ def main() -> None:
             "explicit_mapping_csv": str(explicit_csv) if explicit_csv else None,
             "comparison_mapping_template": str(mapping_template),
             "bvh_local_markers_csv": str(bvh_local_markers_csv),
+            "bvh_marker_error_norm_csv": str(bvh_marker_error_csv),
+            "bvh_marker_error_norm_summary": str(bvh_marker_error_summary_path),
+            "bvh_marker_error_norm_boxplot": str(bvh_marker_error_boxplot),
+            "overall_marker_error_norm_boxplot": str(overall_marker_error_boxplot),
             "bvh_root_policy": str(out_dir / "bvh_root_translation_policy.json"),
             "bvh_animation_markers_no_angles_with_joint_centres": str(bvh_animation_markers_npz),
             "bvh_inverse_kinematics": bvh_inverse_kinematics_report,
@@ -2870,6 +3105,7 @@ def main() -> None:
         },
         "q_unwrap": bvh_runtime.unwrap_summary,
         "local_marker_stability": bvh_local_marker_summary,
+        "marker_error_norm_mm": bvh_marker_error_summary,
         "inverse_kinematics_from_c3d_markers": bvh_inverse_kinematics_report,
         "fbx_report": fbx_report,
         "q_names": bvh_runtime.q_names,
@@ -2883,16 +3119,19 @@ def main() -> None:
     print(f"BVH q: {q_npz}")
     print(f"Augmented C3D: {augmented_c3d_path}")
     print(f"BVH local C3D markers: {bvh_local_markers_csv}")
+    print(f"BVH marker error boxplot: {bvh_marker_error_boxplot}")
     if bvh_inverse_kinematics_report is not None:
         print(f"BVH inverse kinematics: {bvh_inverse_kinematics_report['npz']}")
     if fbx_outputs:
         print(f"FBX bioMod: {fbx_outputs['biomod']}")
         print(f"FBX q: {fbx_outputs['fbx_q_npz']}")
         print(f"FBX augmented C3D: {fbx_outputs['augmented_c3d']}")
+        print(f"FBX marker error boxplot: {fbx_outputs['marker_error_norm_boxplot']}")
         if fbx_outputs.get("inverse_kinematics") is not None:
             print(f"FBX inverse kinematics: {fbx_outputs['inverse_kinematics']['npz']}")
     print(f"Pairwise comparison: {pairwise_csv}")
     print(f"Best matches: {best_csv}")
+    print(f"Overall marker error boxplot: {overall_marker_error_boxplot}")
     print(f"Report: {report_path}")
 
 
