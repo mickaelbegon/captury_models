@@ -18,9 +18,9 @@ What this script does
 Typical usage
 -------------
 python bvh_c3d_biobuddy_pyorerun_compare.py \
-    --bvh unknown.bvh \
-    --fbx "unknown.fbx" \
-    --c3d unknown.c3d \
+    --bvh data/unknown.bvh \
+    --fbx data/unknown.fbx \
+    --c3d data/unknown.c3d \
     --out-dir out_biobuddy_bvh_c3d \
     --animate
 
@@ -52,6 +52,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+import inspect
 import json
 import math
 import os
@@ -988,6 +989,23 @@ def build_biomod_from_bvh_with_biobuddy(
     return model, parser
 
 
+def fbx_visual_mesh_kwargs(callable_obj: Any, include_mesh: bool, mesh_dir: Path) -> dict[str, Any]:
+    """Return FBX visual-mesh kwargs matching the installed BioBuddy API."""
+    parameters = inspect.signature(callable_obj).parameters
+    mesh_output_dir = str(mesh_dir) if include_mesh else None
+    if "split_meshes_per_segment" in parameters:
+        return {
+            "split_meshes_per_segment": include_mesh,
+            "mesh_output_dir": mesh_output_dir,
+        }
+    if "load_visual_meshes" in parameters:
+        return {
+            "load_visual_meshes": include_mesh,
+            "mesh_output_dir": mesh_output_dir,
+        }
+    return {}
+
+
 def build_biomod_from_fbx_with_biobuddy(
     fbx_path: Path,
     biomod_path: Path,
@@ -1005,16 +1023,13 @@ def build_biomod_from_fbx_with_biobuddy(
         clean_generated_fbx_meshes(mesh_dir)
 
     try:
+        model_kwargs = fbx_visual_mesh_kwargs(BiomechanicalModelReal.from_fbx, include_mesh, mesh_dir)
+        parser_kwargs = fbx_visual_mesh_kwargs(FbxModelParser, include_mesh, mesh_dir)
         model = BiomechanicalModelReal().from_fbx(
             filepath=str(fbx_path),
-            load_visual_meshes=include_mesh,
-            mesh_output_dir=str(mesh_dir) if include_mesh else None,
+            **model_kwargs,
         )
-        parser = FbxModelParser(
-            str(fbx_path),
-            load_visual_meshes=include_mesh,
-            mesh_output_dir=str(mesh_dir) if include_mesh else None,
-        )
+        parser = FbxModelParser(str(fbx_path), **parser_kwargs)
     except TypeError:
         parser_for_model = FbxModelParser(str(fbx_path))
         model = parser_for_model.to_real()
@@ -2549,9 +2564,9 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Generate a biorbd bioMod from BVH using BioBuddy, export BVH q, overlay C3D markers, and compare q to C3D angles."
     )
-    parser.add_argument("--bvh", default=Path("unknown.bvh"), type=Path, help="Input BVH file.")
+    parser.add_argument("--bvh", default=Path("data/unknown.bvh"), type=Path, help="Input BVH file.")
     parser.add_argument("--fbx", default=None, type=Path, help="Optional input FBX file.")
-    parser.add_argument("--c3d", default=Path("unknown.c3d"), type=Path, help="Input C3D file.")
+    parser.add_argument("--c3d", default=Path("data/unknown.c3d"), type=Path, help="Input C3D file.")
     parser.add_argument("--out-dir", default=Path("out_biobuddy_bvh_c3d"), type=Path, help="Output directory.")
     parser.add_argument(
         "--bvh-unit-scale-to-m",

@@ -3,7 +3,7 @@ __pycache__/
 *.py[cod]
 
 # Generated analysis outputs can be recreated with the main script.
-out_biobuddy_bvh_c3d/
+out_biobuddy_bvh_c3d*/
 
 # Captury/source data are local inputs and should not be committed.
 *.bvh

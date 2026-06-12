@@ -7,7 +7,7 @@ Small workspace for comparing Captury BVH/FBX skeleton exports with C3D marker d
 - `bvh_c3d_biobuddy_pyorerun_compare.py`: main BVH/FBX to `bioMod` pipeline.
 - `plot_bvh_c3d_angle_comparisons.py`: optional plotting helper for BVH q versus C3D angle channels.
 - `environment_bvh_c3d_biobuddy.yml`: conda environment definition.
-- `unknown.bvh`, `unknown.fbx`, `unknown.c3d`: expected local Captury input files. They are ignored by git because they are data files.
+- `data/unknown.bvh`, `data/unknown.fbx`, `data/unknown.c3d`: expected local Captury input files. They are ignored by git because they are data files.
 
 Generated outputs are written to `out_biobuddy_bvh_c3d/` and are intentionally ignored by git.
 
@@ -53,9 +53,9 @@ During animation, the marker overlay contains the C3D marker points after this a
 
 ```bash
 python bvh_c3d_biobuddy_pyorerun_compare.py \
-  --bvh unknown.bvh \
-  --fbx unknown.fbx \
-  --c3d unknown.c3d \
+  --bvh data/unknown.bvh \
+  --fbx data/unknown.fbx \
+  --c3d data/unknown.c3d \
   --out-dir out_biobuddy_bvh_c3d
 ```
 
@@ -63,9 +63,9 @@ To also launch pyorerun animations:
 
 ```bash
 python bvh_c3d_biobuddy_pyorerun_compare.py \
-  --bvh unknown.bvh \
-  --fbx unknown.fbx \
-  --c3d unknown.c3d \
+  --bvh data/unknown.bvh \
+  --fbx data/unknown.fbx \
+  --c3d data/unknown.c3d \
   --out-dir out_biobuddy_bvh_c3d \
   --animate
 ```
@@ -74,9 +74,9 @@ To display the BVH model, the FBX surface model and filtered C3D markers superpo
 
 ```bash
 python bvh_c3d_biobuddy_pyorerun_compare.py \
-  --bvh unknown.bvh \
-  --fbx unknown.fbx \
-  --c3d unknown.c3d \
+  --bvh data/unknown.bvh \
+  --fbx data/unknown.fbx \
+  --c3d data/unknown.c3d \
   --out-dir out_biobuddy_bvh_c3d \
   --animate-superposed
 ```
@@ -85,9 +85,9 @@ To compute inverse kinematics from the C3D markers with biorbd nonlinear least s
 
 ```bash
 python bvh_c3d_biobuddy_pyorerun_compare.py \
-  --bvh unknown.bvh \
-  --fbx unknown.fbx \
-  --c3d unknown.c3d \
+  --bvh data/unknown.bvh \
+  --fbx data/unknown.fbx \
+  --c3d data/unknown.c3d \
   --out-dir out_biobuddy_bvh_c3d \
   --inverse-kinematics \
   --inverse-kinematics-solver least_squares
@@ -97,9 +97,9 @@ To use biorbd's marker Kalman reconstruction instead:
 
 ```bash
 python bvh_c3d_biobuddy_pyorerun_compare.py \
-  --bvh unknown.bvh \
-  --fbx unknown.fbx \
-  --c3d unknown.c3d \
+  --bvh data/unknown.bvh \
+  --fbx data/unknown.fbx \
+  --c3d data/unknown.c3d \
   --out-dir out_biobuddy_bvh_c3d \
   --inverse-kinematics \
   --inverse-kinematics-solver kalman
@@ -109,9 +109,9 @@ For a quick smoke test, limit inverse kinematics to the first few frames:
 
 ```bash
 python bvh_c3d_biobuddy_pyorerun_compare.py \
-  --bvh unknown.bvh \
-  --fbx unknown.fbx \
-  --c3d unknown.c3d \
+  --bvh data/unknown.bvh \
+  --fbx data/unknown.fbx \
+  --c3d data/unknown.c3d \
   --out-dir out_biobuddy_bvh_c3d \
   --inverse-kinematics \
   --inverse-kinematics-max-frames 5
