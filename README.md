@@ -17,14 +17,14 @@ Create or update the conda environment:
 
 ```bash
 conda env create -f environment_bvh_c3d_biobuddy.yml
-conda activate bvh-c3d-biobuddy
+conda activate captury_biobuddy
 ```
 
 If the environment already exists:
 
 ```bash
-conda env update -n bvh-c3d-biobuddy -f environment_bvh_c3d_biobuddy.yml --prune
-conda activate bvh-c3d-biobuddy
+conda env update -n captury_biobuddy -f environment_bvh_c3d_biobuddy.yml --prune
+conda activate captury_biobuddy
 ```
 
 The environment installs BioBuddy from:

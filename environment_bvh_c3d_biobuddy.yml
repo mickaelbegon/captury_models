@@ -1,4 +1,4 @@
-name: bvh-c3d-biobuddy
+name: captury_biobuddy
 channels:
   - conda-forge
 dependencies:
