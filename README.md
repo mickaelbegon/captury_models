@@ -30,7 +30,13 @@ conda activate bvh-c3d-biobuddy
 The environment installs BioBuddy from:
 
 ```text
-git+https://github.com/mickaelbegon/biobuddy.git@codex/add-fbx-segment-meshes
+biobuddy @ git+https://github.com/mickaelbegon/biobuddy.git@codex/add-fbx-segment-meshes
+```
+
+This corresponds to the BioBuddy branch:
+
+```text
+https://github.com/mickaelbegon/biobuddy/tree/codex/add-fbx-segment-meshes
 ```
 
 ## C3D Point Classification
