@@ -5,6 +5,7 @@ Small workspace for comparing Captury BVH/FBX skeleton exports with C3D marker d
 ## Contents
 
 - `bvh_c3d_biobuddy_pyorerun_compare.py`: main BVH/FBX to `bioMod` pipeline.
+- `captury_biobuddy_gui.py`: graphical launcher for the pipeline options.
 - `plot_bvh_c3d_angle_comparisons.py`: optional plotting helper for BVH q versus C3D angle channels.
 - `environment_bvh_c3d_biobuddy.yml`: conda environment definition.
 - `data/unknown.bvh`, `data/unknown.fbx`, `data/unknown.c3d`: expected local Captury input files. They are ignored by git because they are data files.
@@ -51,6 +52,19 @@ During animation, the marker overlay contains the C3D marker points after this a
 
 ## Run
 
+To launch the graphical interface:
+
+```bash
+conda activate captury_biobuddy
+python captury_biobuddy_gui.py
+```
+
+The interface exposes the same options as the command line pipeline: BVH/FBX/C3D paths, output folder, mesh/root-offset settings, Rerun visualization, display filters, inverse kinematics and advanced compatibility flags. It also shows the generated command and streams the pipeline log while it runs.
+
+The `Modèles` tab can also launch BioBuddy's model explorer/editor. Select a `.bioMod`, `.osim`, `.urdf` or `.bvh` model manually, or use the `BVH généré` / `FBX généré` shortcuts to inspect the generated BioBuddy models.
+
+For direct command line use:
+
 ```bash
 python bvh_c3d_biobuddy_pyorerun_compare.py \
   --bvh data/unknown.bvh \
@@ -78,7 +92,8 @@ python bvh_c3d_biobuddy_pyorerun_compare.py \
   --fbx data/unknown.fbx \
   --c3d data/unknown.c3d \
   --out-dir out_biobuddy_bvh_c3d \
-  --animate-superposed
+  --animate-superposed \
+  --hide-extremities-in-rerun
 ```
 
 To compute inverse kinematics from the C3D markers with biorbd nonlinear least squares, add:
@@ -150,7 +165,13 @@ The exported `*_q_biorbd_order.npz` files are now populated from BioBuddy's `to_
 
 ## FBX Mesh
 
-The FBX mesh is handled by the BioBuddy branch `codex/add-fbx-segment-meshes`: the skinned visual mesh is split into per-segment `.ply` files and referenced from the FBX `bioMod` through `meshfile`. This is required for pyorerun/biorbd to render surfaces. Writing raw `mesh x y z` points into a `bioMod` only provides vertices and typically appears as a line/point cloud in the viewer.
+The FBX mesh is handled by the BioBuddy branch `codex/add-fbx-segment-meshes`: the skinned visual mesh is split into per-segment `.ply` files for the FBX `bioMod`. The script also converts those generated `.ply` files to per-segment `.vtp` files before animation, because pyorerun accepts `.stl`/`.vtp` mesh files for rendering surfaces while biorbd keeps reading the `.ply` paths from the `bioMod`. Writing raw `mesh x y z` points into a `bioMod` only provides vertices and typically appears as a line/point cloud in the viewer.
+
+The pyorerun display uses millimetre-scale marker radii by default (`--rerun-marker-radius 15`) and keeps the FBX mesh opaque so the scene is visible immediately in Rerun.
+
+Use `--hide-hands-in-rerun`, `--hide-feet-in-rerun`, or `--hide-extremities-in-rerun` to hide hand/wrist/finger and/or foot/ankle/toe markers and meshes from pyorerun animations without changing the numerical outputs.
+
+The script declares `Y` as the vertical axis in Rerun by default (`--rerun-up-axis y`). Use `--rerun-up-axis z`, `x`, or `none` if the viewer orientation should follow another convention.
 
 ## Local Marker Test
 

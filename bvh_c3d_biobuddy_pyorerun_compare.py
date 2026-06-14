@@ -58,6 +58,7 @@ import math
 import os
 import re
 import struct
+import time
 import warnings
 import zlib
 from dataclasses import dataclass
@@ -83,6 +84,14 @@ DEFAULT_C3D_ANGLE_LABELS = {
     "RWri",
     "LWri",
 }
+
+DEFAULT_RERUN_MARKER_RADIUS_NATIVE = 15.0
+DEFAULT_RERUN_WAIT_SECONDS = 2.0
+DEFAULT_RERUN_UP_AXIS = "y"
+CAPTURY_HAND_MARKER_LABELS = {"Q_LH", "Q_RH", "Q_LW", "Q_RW", "LH", "RH", "LW", "RW"}
+CAPTURY_FOOT_MARKER_LABELS = {"Q_LF", "Q_RF", "Q_LA", "Q_RA", "LF", "RF", "LA", "RA"}
+HAND_NAME_PATTERN = re.compile(r"(hand|wrist|thumb|index|middle|ring|pinky)", re.IGNORECASE)
+FOOT_NAME_PATTERN = re.compile(r"(foot|toe|ankle|heel)", re.IGNORECASE)
 
 
 # =============================================================================
@@ -209,6 +218,31 @@ def sanitize_biomod_name(name: str, fallback: str) -> str:
     if cleaned[0].isdigit():
         cleaned = f"m_{cleaned}"
     return cleaned
+
+
+def strip_known_marker_prefix(name: str) -> str:
+    for prefix in ("BVHJC_", "FBXJC_", "C3D_"):
+        if name.startswith(prefix):
+            return name[len(prefix) :]
+    return name
+
+
+def is_hand_display_name(name: str) -> bool:
+    base = strip_known_marker_prefix(str(name)).strip()
+    if base in CAPTURY_HAND_MARKER_LABELS:
+        return True
+    return bool(HAND_NAME_PATTERN.search(base))
+
+
+def is_foot_display_name(name: str) -> bool:
+    base = strip_known_marker_prefix(str(name)).strip()
+    if base in CAPTURY_FOOT_MARKER_LABELS:
+        return True
+    return bool(FOOT_NAME_PATTERN.search(base))
+
+
+def is_hidden_display_name(name: str, hide_hands: bool, hide_feet: bool) -> bool:
+    return (hide_hands and is_hand_display_name(name)) or (hide_feet and is_foot_display_name(name))
 
 
 def is_rotation_q_name(name: str) -> bool:
@@ -879,46 +913,151 @@ def append_fbx_mesh_file_to_biomod(
     return mesh_report
 
 
-def count_ascii_ply_mesh(path: Path) -> tuple[int, int]:
-    vertices = 0
-    faces = 0
-    try:
-        with path.open("r", encoding="utf-8") as f:
-            for line in f:
-                if line.startswith("element vertex "):
-                    vertices = int(line.split()[-1])
-                elif line.startswith("element face "):
-                    faces = int(line.split()[-1])
-                elif line.strip() == "end_header":
-                    break
-    except (OSError, ValueError):
-        return 0, 0
+def read_ascii_ply_mesh(path: Path) -> tuple[np.ndarray, list[list[int]]]:
+    """Read the simple ASCII PLY files emitted by BioBuddy for segment meshes."""
+    with path.open("r", encoding="utf-8") as f:
+        first_line = f.readline().strip()
+        if first_line != "ply":
+            raise ValueError(f"{path} is not a PLY file.")
+
+        vertex_count = 0
+        face_count = 0
+        is_ascii = False
+        for line in f:
+            stripped = line.strip()
+            if stripped == "format ascii 1.0":
+                is_ascii = True
+            elif stripped.startswith("element vertex "):
+                vertex_count = int(stripped.split()[-1])
+            elif stripped.startswith("element face "):
+                face_count = int(stripped.split()[-1])
+            elif stripped == "end_header":
+                break
+
+        if not is_ascii:
+            raise ValueError(f"{path} is not an ASCII PLY file.")
+
+        vertices = np.zeros((vertex_count, 3), dtype=float)
+        for i in range(vertex_count):
+            parts = f.readline().split()
+            if len(parts) < 3:
+                raise ValueError(f"{path} has an invalid vertex row at index {i}.")
+            vertices[i, :] = [float(parts[0]), float(parts[1]), float(parts[2])]
+
+        faces: list[list[int]] = []
+        for i in range(face_count):
+            parts = f.readline().split()
+            if not parts:
+                raise ValueError(f"{path} has an invalid face row at index {i}.")
+            n_vertices = int(parts[0])
+            if len(parts) < n_vertices + 1:
+                raise ValueError(f"{path} has an incomplete face row at index {i}.")
+            faces.append([int(index) for index in parts[1 : n_vertices + 1]])
+
     return vertices, faces
 
 
-def report_biobuddy_segment_meshes(mesh_dir: Path) -> dict[str, Any]:
-    mesh_files = sorted(mesh_dir.glob("*.ply"))
+def face_normal(vertices: np.ndarray, triangle: tuple[int, int, int]) -> np.ndarray:
+    a, b, c = (vertices[index] for index in triangle)
+    normal = np.cross(b - a, c - a)
+    norm = float(np.linalg.norm(normal))
+    if norm == 0.0 or not np.isfinite(norm):
+        return np.zeros(3)
+    return normal / norm
+
+
+def triangulate_mesh_faces(faces: list[list[int]]) -> list[tuple[int, int, int]]:
+    triangles: list[tuple[int, int, int]] = []
+    for face in faces:
+        if len(face) < 3:
+            continue
+        triangles.extend((face[0], face[i], face[i + 1]) for i in range(1, len(face) - 1))
+    return triangles
+
+
+def vertex_normals(vertices: np.ndarray, triangles: list[tuple[int, int, int]]) -> np.ndarray:
+    normals = np.zeros_like(vertices, dtype=float)
+    for triangle in triangles:
+        normal = face_normal(vertices, triangle)
+        for index in triangle:
+            normals[index] += normal
+    norms = np.linalg.norm(normals, axis=1)
+    nonzero = norms > 0
+    normals[nonzero] /= norms[nonzero, None]
+    return normals
+
+
+def write_ascii_vtp_mesh(path: Path, vertices: np.ndarray, faces: list[list[int]]) -> int:
+    """Write a triangular ASCII VTP mesh in the shape expected by pyorerun."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    triangles = triangulate_mesh_faces(faces)
+    normals = vertex_normals(vertices, triangles)
+    offsets = [3 * (i + 1) for i in range(len(triangles))]
+
+    with path.open("w", encoding="utf-8") as f:
+        f.write('<?xml version="1.0"?>\n')
+        f.write('<VTKFile type="PolyData" version="0.1" byte_order="LittleEndian">\n')
+        f.write("  <PolyData>\n")
+        f.write(f'    <Piece NumberOfPoints="{vertices.shape[0]}" NumberOfPolys="{len(triangles)}">\n')
+        f.write('      <PointData Normals="Normals">\n')
+        f.write('        <DataArray type="Float32" Name="Normals" NumberOfComponents="3" format="ascii">\n')
+        for normal in normals:
+            f.write(f"          {normal[0]:.8g} {normal[1]:.8g} {normal[2]:.8g}\n")
+        f.write("        </DataArray>\n")
+        f.write("      </PointData>\n")
+        f.write("      <Points>\n")
+        f.write('        <DataArray type="Float32" NumberOfComponents="3" format="ascii">\n')
+        for vertex in vertices:
+            f.write(f"          {vertex[0]:.8g} {vertex[1]:.8g} {vertex[2]:.8g}\n")
+        f.write("        </DataArray>\n")
+        f.write("      </Points>\n")
+        f.write("      <Polys>\n")
+        f.write('        <DataArray type="Int32" Name="connectivity" format="ascii">\n')
+        for triangle in triangles:
+            f.write(f"          {triangle[0]} {triangle[1]} {triangle[2]}\n")
+        f.write("        </DataArray>\n")
+        f.write('        <DataArray type="Int32" Name="offsets" format="ascii">\n')
+        if offsets:
+            f.write("          " + " ".join(str(offset) for offset in offsets) + "\n")
+        f.write("        </DataArray>\n")
+        f.write("      </Polys>\n")
+        f.write("    </Piece>\n")
+        f.write("  </PolyData>\n")
+        f.write("</VTKFile>\n")
+    return len(triangles)
+
+
+def convert_biobuddy_ply_meshes_to_vtp(mesh_dir: Path) -> dict[str, Any]:
+    """Convert BioBuddy's per-segment PLY meshes to VTP files accepted by pyorerun."""
     mesh_entries: list[dict[str, Any]] = []
     total_vertices = 0
     total_faces = 0
-    for mesh_file in mesh_files:
-        vertices, faces = count_ascii_ply_mesh(mesh_file)
-        total_vertices += vertices
-        total_faces += faces
+    total_triangles = 0
+    for ply_file in sorted(mesh_dir.glob("*.ply")):
+        vertices, faces = read_ascii_ply_mesh(ply_file)
+        vtp_file = ply_file.with_suffix(".vtp")
+        triangles = write_ascii_vtp_mesh(vtp_file, vertices=vertices, faces=faces)
+        total_vertices += int(vertices.shape[0])
+        total_faces += len(faces)
+        total_triangles += triangles
         mesh_entries.append(
             {
-                "mesh_file": str(mesh_file),
-                "mesh_vertices": vertices,
-                "mesh_faces": faces,
+                "source_mesh_file": str(ply_file),
+                "mesh_file": str(vtp_file),
+                "mesh_vertices": int(vertices.shape[0]),
+                "mesh_faces": len(faces),
+                "mesh_triangles": triangles,
             }
         )
+
     return {
-        "mesh_source": "biobuddy_segment_ply",
+        "mesh_source": "biobuddy_segment_vtp_from_ply",
         "mesh_directory": str(mesh_dir),
         "mesh_files": mesh_entries,
         "mesh_file_count": len(mesh_entries),
         "mesh_vertices": total_vertices,
         "mesh_faces": total_faces,
+        "mesh_triangles": total_triangles,
         "mesh_parent": "per_segment",
     }
 
@@ -958,7 +1097,7 @@ def normalize_biomod_meshfile_paths(biomod_path: Path) -> None:
 def clean_generated_fbx_meshes(mesh_dir: Path) -> None:
     if not mesh_dir.exists():
         return
-    for pattern in ("*.ply", "unknown_fbx_mesh.obj"):
+    for pattern in ("*.ply", "*.stl", "*.vtp", "unknown_fbx_mesh.obj"):
         for mesh_file in mesh_dir.glob(pattern):
             if mesh_file.is_file():
                 mesh_file.unlink()
@@ -1047,7 +1186,7 @@ def build_biomod_from_fbx_with_biobuddy(
 
     mesh_report: dict[str, Any] = {"mesh_file": None, "mesh_vertices": 0, "mesh_faces": 0, "mesh_parent": None}
     if include_mesh and mesh_dir.exists() and any(mesh_dir.glob("*.ply")):
-        mesh_report = report_biobuddy_segment_meshes(mesh_dir)
+        mesh_report = convert_biobuddy_ply_meshes_to_vtp(mesh_dir)
     elif include_mesh:
         fbx_tree = parse_fbx_records(fbx_path)
         root_name = joint_names[0] if joint_names else None
@@ -2434,6 +2573,158 @@ def write_mapping_template(q_names: list[str], c3d_angle_labels: list[str], out_
 # =============================================================================
 
 
+def filter_display_markers_for_rerun(
+    markers: np.ndarray,
+    marker_labels: list[str],
+    hide_hands: bool,
+    hide_feet: bool,
+) -> tuple[np.ndarray, list[str]]:
+    if not (hide_hands or hide_feet) or not marker_labels:
+        return markers, marker_labels
+    keep_indices = [
+        i for i, label in enumerate(marker_labels) if not is_hidden_display_name(label, hide_hands, hide_feet)
+    ]
+    return markers[:, keep_indices, :], [marker_labels[i] for i in keep_indices]
+
+
+def marker_block_parent(marker_block: list[str]) -> str | None:
+    for line in marker_block:
+        stripped = line.strip()
+        if stripped.startswith("parent"):
+            parts = stripped.split(maxsplit=1)
+            if len(parts) == 2:
+                return parts[1].strip()
+    return None
+
+
+def remove_display_markers_from_biomod_text(text: str, hide_hands: bool, hide_feet: bool) -> str:
+    lines = text.splitlines()
+    output: list[str] = []
+    i = 0
+    while i < len(lines):
+        stripped = lines[i].strip()
+        if not stripped.startswith("marker"):
+            output.append(lines[i])
+            i += 1
+            continue
+
+        marker_block = [lines[i]]
+        marker_name = stripped.split(maxsplit=1)[1].strip() if len(stripped.split(maxsplit=1)) == 2 else ""
+        i += 1
+        while i < len(lines):
+            marker_block.append(lines[i])
+            if lines[i].strip() == "endmarker":
+                i += 1
+                break
+            i += 1
+
+        parent_name = marker_block_parent(marker_block)
+        if is_hidden_display_name(marker_name, hide_hands, hide_feet) or (
+            parent_name is not None and is_hidden_display_name(parent_name, hide_hands, hide_feet)
+        ):
+            continue
+        output.extend(marker_block)
+
+    return "\n".join(output) + "\n"
+
+
+def remove_display_meshes_from_biomod_text(text: str, hide_hands: bool, hide_feet: bool) -> str:
+    output: list[str] = []
+    current_segment: str | None = None
+    for line in text.splitlines():
+        stripped = line.strip()
+        if stripped.startswith("segment"):
+            parts = stripped.split(maxsplit=1)
+            current_segment = parts[1].strip() if len(parts) == 2 else None
+            output.append(line)
+            continue
+        if stripped == "endsegment":
+            current_segment = None
+            output.append(line)
+            continue
+        if current_segment is not None and is_hidden_display_name(current_segment, hide_hands, hide_feet):
+            if stripped.startswith(("meshfile", "meshscale", "meshrt")):
+                continue
+        output.append(line)
+    return "\n".join(output) + "\n"
+
+
+def pyorerun_display_biomod_path(biomod_path: Path, hide_hands: bool, hide_feet: bool) -> Path:
+    if not (hide_hands or hide_feet):
+        return biomod_path
+    text = biomod_path.read_text(encoding="utf-8")
+    text = remove_display_markers_from_biomod_text(text, hide_hands, hide_feet)
+    text = remove_display_meshes_from_biomod_text(text, hide_hands, hide_feet)
+    if hide_hands and hide_feet:
+        suffix = "no_extremities"
+    elif hide_hands:
+        suffix = "no_hands"
+    else:
+        suffix = "no_feet"
+    display_path = biomod_path.with_name(f"{biomod_path.stem}_pyorerun_{suffix}{biomod_path.suffix}")
+    display_path.write_text(text, encoding="utf-8")
+    return display_path
+
+
+def use_vtp_meshes_for_pyorerun(model: Any) -> None:
+    """Point pyorerun mesh paths to VTP siblings while keeping the bioMod PLY paths intact."""
+    for segment in model.segments:
+        mesh_paths: list[str] = []
+        changed = False
+        for mesh_path in segment.mesh_path:
+            path = Path(mesh_path)
+            if path.suffix.lower() == ".ply":
+                vtp_path = path.with_suffix(".vtp")
+                if not vtp_path.exists():
+                    vertices, faces = read_ascii_ply_mesh(path)
+                    write_ascii_vtp_mesh(vtp_path, vertices=vertices, faces=faces)
+                mesh_paths.append(str(vtp_path))
+                changed = True
+            else:
+                mesh_paths.append(mesh_path)
+        if changed:
+            segment.__dict__["mesh_path"] = mesh_paths
+
+
+def set_pyorerun_marker_radius(phase: Any, marker_radius: float) -> None:
+    """Make model and experimental markers visible when source units are millimetres."""
+    for rerun_model in phase.models.rerun_models:
+        if hasattr(rerun_model.markers, "marker_properties"):
+            rerun_model.markers.marker_properties.radius = marker_radius
+    for xp_data in phase.xp_data.xp_data:
+        if hasattr(xp_data, "markers_properties"):
+            xp_data.markers_properties.radius = marker_radius
+
+
+def rerun_view_coordinates(up_axis: str) -> Any | None:
+    if up_axis == "none":
+        return None
+    import rerun as rr
+
+    return {
+        "x": rr.ViewCoordinates.RIGHT_HAND_X_UP,
+        "y": rr.ViewCoordinates.RIGHT_HAND_Y_UP,
+        "z": rr.ViewCoordinates.RIGHT_HAND_Z_UP,
+    }[up_axis]
+
+
+def run_phase_with_rerun_view(
+    phase: Any,
+    name: str,
+    up_axis: str,
+    rerun_wait_seconds: float,
+) -> None:
+    import rerun as rr
+
+    rr.init(f"{name}_{phase.phase}", spawn=True)
+    coordinates = rerun_view_coordinates(up_axis)
+    if coordinates is not None:
+        rr.log(phase.name, coordinates, static=True)
+    phase.rerun(name, init=False)
+    if rerun_wait_seconds > 0:
+        time.sleep(rerun_wait_seconds)
+
+
 def animate_with_pyorerun(
     biomod_path: Path,
     q: np.ndarray,
@@ -2443,12 +2734,25 @@ def animate_with_pyorerun(
     c3d_time: np.ndarray,
     name: str = "bvh_biobuddy_c3d_comparison",
     display_q_in_rerun: bool = False,
+    rerun_marker_radius: float = DEFAULT_RERUN_MARKER_RADIUS_NATIVE,
+    rerun_wait_seconds: float = DEFAULT_RERUN_WAIT_SECONDS,
+    rerun_up_axis: str = DEFAULT_RERUN_UP_AXIS,
+    hide_hands_in_rerun: bool = False,
+    hide_feet_in_rerun: bool = False,
 ) -> None:
     BiorbdModel, PhaseRerun, PyoMarkers = require_pyorerun()
 
     c3d_markers_on_bvh_time = interpolate_array(c3d_markers_bvh_units, c3d_time, bvh_time)
+    c3d_markers_on_bvh_time, c3d_marker_labels = filter_display_markers_for_rerun(
+        c3d_markers_on_bvh_time,
+        c3d_marker_labels,
+        hide_hands_in_rerun,
+        hide_feet_in_rerun,
+    )
+    biomod_path = pyorerun_display_biomod_path(biomod_path, hide_hands_in_rerun, hide_feet_in_rerun)
 
     model = BiorbdModel(str(biomod_path))
+    use_vtp_meshes_for_pyorerun(model)
     if q.shape[0] != model.nb_q:
         raise RuntimeError(
             f"q has {q.shape[0]} rows, but the generated pyorerun/biorbd model has {model.nb_q} DoFs. "
@@ -2457,6 +2761,8 @@ def animate_with_pyorerun(
 
     model.options.show_marker_labels = False
     model.options.show_center_of_mass_labels = False
+    model.options.markers_radius = rerun_marker_radius
+    model.options.centers_of_mass_radius = rerun_marker_radius
 
     def _build_phase(display_q: bool):
         phase_local = PhaseRerun(bvh_time)
@@ -2466,6 +2772,7 @@ def animate_with_pyorerun(
                 "c3d_markers_no_angle_channels",
                 PyoMarkers(data=c3d_markers_on_bvh_time, channels=c3d_marker_labels),
             )
+        set_pyorerun_marker_radius(phase_local, rerun_marker_radius)
         return phase_local
 
     try:
@@ -2485,7 +2792,7 @@ def animate_with_pyorerun(
         else:
             raise
 
-    phase.rerun(name)
+    run_phase_with_rerun_view(phase, name, rerun_up_axis, rerun_wait_seconds)
 
 
 def animate_superposed_models_with_pyorerun(
@@ -2500,6 +2807,11 @@ def animate_superposed_models_with_pyorerun(
     c3d_time: np.ndarray,
     name: str = "bvh_fbx_c3d_superposed",
     display_q_in_rerun: bool = False,
+    rerun_marker_radius: float = DEFAULT_RERUN_MARKER_RADIUS_NATIVE,
+    rerun_wait_seconds: float = DEFAULT_RERUN_WAIT_SECONDS,
+    rerun_up_axis: str = DEFAULT_RERUN_UP_AXIS,
+    hide_hands_in_rerun: bool = False,
+    hide_feet_in_rerun: bool = False,
 ) -> None:
     """Animate the BVH model, the FBX model and C3D markers in one Rerun scene."""
     BiorbdModel, PhaseRerun, PyoMarkers = require_pyorerun()
@@ -2508,9 +2820,19 @@ def animate_superposed_models_with_pyorerun(
     # points are interpolated to it so pyorerun can add every object to one phase.
     fbx_q_on_bvh_time = interpolate_array(fbx_q, fbx_time, bvh_time)
     c3d_markers_on_bvh_time = interpolate_array(c3d_markers_bvh_units, c3d_time, bvh_time)
+    c3d_markers_on_bvh_time, c3d_marker_labels = filter_display_markers_for_rerun(
+        c3d_markers_on_bvh_time,
+        c3d_marker_labels,
+        hide_hands_in_rerun,
+        hide_feet_in_rerun,
+    )
+    bvh_biomod_path = pyorerun_display_biomod_path(bvh_biomod_path, hide_hands_in_rerun, hide_feet_in_rerun)
+    fbx_biomod_path = pyorerun_display_biomod_path(fbx_biomod_path, hide_hands_in_rerun, hide_feet_in_rerun)
 
     bvh_model = BiorbdModel(str(bvh_biomod_path))
     fbx_model = BiorbdModel(str(fbx_biomod_path))
+    use_vtp_meshes_for_pyorerun(bvh_model)
+    use_vtp_meshes_for_pyorerun(fbx_model)
     if bvh_q.shape[0] != bvh_model.nb_q:
         raise RuntimeError(f"BVH q has {bvh_q.shape[0]} rows, but its model has {bvh_model.nb_q} DoFs.")
     if fbx_q_on_bvh_time.shape[0] != fbx_model.nb_q:
@@ -2519,11 +2841,14 @@ def animate_superposed_models_with_pyorerun(
     for model in (bvh_model, fbx_model):
         model.options.show_marker_labels = False
         model.options.show_center_of_mass_labels = False
+        model.options.markers_radius = rerun_marker_radius
+        model.options.centers_of_mass_radius = rerun_marker_radius
 
-    # The FBX model carries the body surfaces. A light transparent color leaves
-    # the BVH joint-centre markers and experimental C3D markers visible inside.
+    # The FBX model carries the body surfaces. Keep it opaque because pyorerun's
+    # transparent mode draws a very thin wireframe that is almost invisible for
+    # millimetre-scale models.
     fbx_model.options.mesh_color = (70, 178, 160)
-    fbx_model.options.transparent_mesh = True
+    fbx_model.options.transparent_mesh = False
 
     def _build_phase(display_q: bool):
         phase_local = PhaseRerun(bvh_time)
@@ -2538,6 +2863,7 @@ def animate_superposed_models_with_pyorerun(
                     show_labels=False,
                 ),
             )
+        set_pyorerun_marker_radius(phase_local, rerun_marker_radius)
         return phase_local
 
     try:
@@ -2552,7 +2878,7 @@ def animate_superposed_models_with_pyorerun(
         else:
             raise
 
-    phase.rerun(name)
+    run_phase_with_rerun_view(phase, name, rerun_up_axis, rerun_wait_seconds)
 
 
 # =============================================================================
@@ -2650,6 +2976,48 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument(
+        "--rerun-marker-radius",
+        default=DEFAULT_RERUN_MARKER_RADIUS_NATIVE,
+        type=float,
+        help="Marker radius used in pyorerun scenes, in the model native length unit. Default: 15 for mm models.",
+    )
+    parser.add_argument(
+        "--rerun-wait-seconds",
+        default=DEFAULT_RERUN_WAIT_SECONDS,
+        type=float,
+        help="Seconds to keep the Python process alive after sending data to Rerun. Default: 2.",
+    )
+    parser.add_argument(
+        "--rerun-up-axis",
+        default=DEFAULT_RERUN_UP_AXIS,
+        choices=["x", "y", "z", "none"],
+        help="Vertical axis declared to Rerun for pyorerun 3D views. Default: y for Captury/BioBuddy models.",
+    )
+    parser.add_argument(
+        "--hide-hands-in-rerun",
+        action="store_true",
+        help=(
+            "Hide hand/wrist/finger meshes and markers in pyorerun animations. "
+            "Numerical outputs and generated bioMod files remain complete."
+        ),
+    )
+    parser.add_argument(
+        "--hide-feet-in-rerun",
+        action="store_true",
+        help=(
+            "Hide foot/ankle/toe meshes and markers in pyorerun animations. "
+            "Numerical outputs and generated bioMod files remain complete."
+        ),
+    )
+    parser.add_argument(
+        "--hide-extremities-in-rerun",
+        action="store_true",
+        help=(
+            "Hide both hands and feet in pyorerun animations. This is a display-only alias for "
+            "--hide-hands-in-rerun plus --hide-feet-in-rerun."
+        ),
+    )
+    parser.add_argument(
         "--headless",
         action="store_true",
         help="Set PYORERUN_HEADLESS=1 before animation. Useful for tests or servers.",
@@ -2725,6 +3093,8 @@ def main() -> None:
         args.inverse_kinematics_max_frames = args.inverse_dynamics_max_frames
     if args.animate_superposed and args.fbx is None:
         raise ValueError("--animate-superposed requires --fbx because both generated models are displayed.")
+    hide_hands_in_rerun = args.hide_hands_in_rerun or args.hide_extremities_in_rerun
+    hide_feet_in_rerun = args.hide_feet_in_rerun or args.hide_extremities_in_rerun
     out_dir: Path = args.out_dir
     out_dir.mkdir(parents=True, exist_ok=True)
     root_offset_mode = "keep" if args.no_root_offset_correction else args.root_offset_mode
@@ -2878,6 +3248,11 @@ def main() -> None:
             c3d_marker_labels=bvh_animation_marker_labels,
             c3d_time=c3d_split.time,
             display_q_in_rerun=args.display_q_in_rerun,
+            rerun_marker_radius=args.rerun_marker_radius,
+            rerun_wait_seconds=args.rerun_wait_seconds,
+            rerun_up_axis=args.rerun_up_axis,
+            hide_hands_in_rerun=hide_hands_in_rerun,
+            hide_feet_in_rerun=hide_feet_in_rerun,
         )
 
     fbx_outputs: dict[str, Any] | None = None
@@ -2990,6 +3365,11 @@ def main() -> None:
                 c3d_time=c3d_split.time,
                 name="fbx_biobuddy_c3d_comparison",
                 display_q_in_rerun=args.display_q_in_rerun,
+                rerun_marker_radius=args.rerun_marker_radius,
+                rerun_wait_seconds=args.rerun_wait_seconds,
+                rerun_up_axis=args.rerun_up_axis,
+                hide_hands_in_rerun=hide_hands_in_rerun,
+                hide_feet_in_rerun=hide_feet_in_rerun,
             )
         if args.animate_superposed:
             if args.headless:
@@ -3010,6 +3390,11 @@ def main() -> None:
                 c3d_marker_labels=c3d_split.marker_labels,
                 c3d_time=c3d_split.time,
                 display_q_in_rerun=args.display_q_in_rerun,
+                rerun_marker_radius=args.rerun_marker_radius,
+                rerun_wait_seconds=args.rerun_wait_seconds,
+                rerun_up_axis=args.rerun_up_axis,
+                hide_hands_in_rerun=hide_hands_in_rerun,
+                hide_feet_in_rerun=hide_feet_in_rerun,
             )
         fbx_outputs = {
             "biomod": str(fbx_biomod_path),
