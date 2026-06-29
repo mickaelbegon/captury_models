@@ -1,0 +1,22 @@
+[
+  {"name": "pelvis_center", "reference": ["LIAS", "RIAS", "LIPS", "RIPS"], "test": ["Q_Wa"]},
+  {"name": "left_hip_region", "reference": ["LFTC"], "test": ["Q_LT"]},
+  {"name": "right_hip_region", "reference": ["RFTC"], "test": ["Q_RT"]},
+  {"name": "left_knee_center", "reference": ["LFLE", "LFME"], "test": ["Q_LK"]},
+  {"name": "right_knee_center", "reference": ["RFLE", "RFME"], "test": ["Q_RK"]},
+  {"name": "left_ankle_center", "reference": ["LFAL", "LTAM"], "test": ["Q_LA"]},
+  {"name": "right_ankle_center", "reference": ["RFAL", "RTAM"], "test": ["Q_RA"]},
+  {"name": "left_foot_center", "reference": ["LFM1", "LFM2", "LFM5", "LFCC", "LDP1"], "test": ["Q_LF"]},
+  {"name": "right_foot_center", "reference": ["RFM1", "RFM2", "RFM5", "RFCC", "RDP1"], "test": ["Q_RF"]},
+  {"name": "chest_center", "reference": ["SJN", "SXS"], "test": ["Q_Ch"]},
+  {"name": "upper_spine_center", "reference": ["TV2", "TV7", "CV7"], "test": ["Q_Sp"]},
+  {"name": "head_center", "reference": ["LAH", "RAH", "LPH", "RPH"], "test": ["Q_He"]},
+  {"name": "left_shoulder_region", "reference": ["LCAJ"], "test": ["Q_LS"]},
+  {"name": "right_shoulder_region", "reference": ["RCAJ"], "test": ["Q_RS"]},
+  {"name": "left_elbow_center", "reference": ["LHLE", "LHME"], "test": ["Q_LE"]},
+  {"name": "right_elbow_center", "reference": ["RHLE", "RHME"], "test": ["Q_RE"]},
+  {"name": "left_wrist_center", "reference": ["LUSP", "LRSP"], "test": ["Q_LW"]},
+  {"name": "right_wrist_center", "reference": ["RUSP", "RRSP"], "test": ["Q_RW"]},
+  {"name": "left_hand_region", "reference": ["LHM2"], "test": ["Q_LH"]},
+  {"name": "right_hand_region", "reference": ["RHM2"], "test": ["Q_RH"]}
+]

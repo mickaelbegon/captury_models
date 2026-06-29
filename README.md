@@ -6,6 +6,9 @@ Small workspace for comparing Captury BVH/FBX skeleton exports with C3D marker d
 
 - `bvh_c3d_biobuddy_pyorerun_compare.py`: main BVH/FBX to `bioMod` pipeline.
 - `captury_biobuddy_gui.py`: graphical launcher for the pipeline options.
+- `compare_capture_systems.py`: compare Motive marker-based C3D trials against Captury markerless C3D trials.
+- `model_comparison_metrics.py`: agreement metrics used by the comparison script.
+- `motive_captury_landmark_map.json`: editable Motive/Captury anatomical landmark correspondence map.
 - `plot_bvh_c3d_angle_comparisons.py`: optional plotting helper for BVH q versus C3D angle channels.
 - `environment_bvh_c3d_biobuddy.yml`: conda environment definition.
 - `data/unknown.bvh`, `data/unknown.fbx`, `data/unknown.c3d`: expected local Captury input files. They are ignored by git because they are data files.
@@ -62,6 +65,8 @@ python captury_biobuddy_gui.py
 The interface exposes the same options as the command line pipeline: BVH/FBX/C3D paths, output folder, mesh/root-offset settings, Rerun visualization, display filters, inverse kinematics and advanced compatibility flags. It also shows the generated command and streams the pipeline log while it runs.
 
 The `Modèles` tab can also launch BioBuddy's model explorer/editor. Select a `.bioMod`, `.osim`, `.urdf` or `.bvh` model manually, or use the `BVH généré` / `FBX généré` shortcuts to inspect the generated BioBuddy models.
+
+The `Comparaison` tab runs the Motive/Captury comparison workflow. It can discover trial pairs from a local data root containing one directory per system, a population folder with one directory per participant, or compare one explicit pair with C3D/BVH/FBX files for both systems.
 
 For direct command line use:
 
@@ -172,6 +177,77 @@ The pyorerun display uses millimetre-scale marker radii by default (`--rerun-mar
 Use `--hide-hands-in-rerun`, `--hide-feet-in-rerun`, or `--hide-extremities-in-rerun` to hide hand/wrist/finger and/or foot/ankle/toe markers and meshes from pyorerun animations without changing the numerical outputs.
 
 The script declares `Y` as the vertical axis in Rerun by default (`--rerun-up-axis y`). Use `--rerun-up-axis z`, `x`, or `none` if the viewer orientation should follow another convention.
+
+## Motive vs Captury Comparison
+
+The local Motive/Captury trial archive can be extracted into `local_trials/`, which is ignored by git:
+
+```bash
+mkdir -p local_trials
+unzip -oq /Users/mickaelbegon/Downloads/data.zip -d local_trials
+```
+
+Run the comparison across all discovered trial pairs:
+
+```bash
+python compare_capture_systems.py \
+  --data-root local_trials/data \
+  --reference-system Motive \
+  --test-system Captury \
+  --landmark-map motive_captury_landmark_map.json \
+  --out-dir out_capture_system_comparison
+```
+
+The comparison script is prepared for C3D, BVH and FBX on both systems. The current single-participant layout remains valid. It discovers either flat files:
+
+```text
+local_trials/data/Motive/P5_Marche_001.c3d
+local_trials/data/Motive/P5_Marche_001.bvh
+local_trials/data/Motive/P5_Marche_001.fbx
+```
+
+or one folder per trial:
+
+```text
+local_trials/data/Captury/P5_Marche_001/unknown.c3d
+local_trials/data/Captury/P5_Marche_001/unknown.bvh
+local_trials/data/Captury/P5_Marche_001/unknown.fbx
+```
+
+For population studies, use one directory per participant, with the same trial naming convention under each system:
+
+```text
+local_trials/data/P01/Motive/P01_Marche_001.c3d
+local_trials/data/P01/Motive/P01_Marche_001.bvh
+local_trials/data/P01/Motive/P01_Marche_001.fbx
+local_trials/data/P01/Captury/P01_Marche_001/unknown.c3d
+local_trials/data/P01/Captury/P01_Marche_001/unknown.bvh
+local_trials/data/P01/Captury/P01_Marche_001/unknown.fbx
+local_trials/data/P02/Motive/P02_Marche_001.c3d
+local_trials/data/P02/Captury/P02_Marche_001/unknown.c3d
+```
+
+The GUI exposes participant and trial filters. From the command line, use repeated regex filters when needed:
+
+```bash
+python compare_capture_systems.py \
+  --data-root local_trials/data \
+  --participant-filter "P0[1-5]" \
+  --trial-filter "Marche" \
+  --landmark-map motive_captury_landmark_map.json \
+  --out-dir out_capture_system_comparison
+```
+
+The current numerical comparison derives comparable anatomical landmarks from Motive markers and Captury `Q_*` points, time-normalizes each trial, applies a global rigid alignment by default, and writes raw/aligned landmark errors plus C3D and model-file inventories. Main outputs:
+
+- `out_capture_system_comparison/all_landmark_metrics.csv`
+- `out_capture_system_comparison/all_angle_metrics.csv`
+- `out_capture_system_comparison/all_model_inventory.csv`
+- `out_capture_system_comparison/population_landmark_summary.csv`
+- `out_capture_system_comparison/population_angle_summary.csv`
+- `out_capture_system_comparison/run_report.json`
+
+For the current sample archive, Motive C3D files contain marker trajectories but no joint-angle POINT channels. Captury C3D files contain markerless `Q_*` points and joint-angle channels listed in `POINT:ANGLES`; therefore the script reports Captury angles in the inventory, but only computes angle agreement when both systems provide matching angle channels.
 
 ## Local Marker Test
 

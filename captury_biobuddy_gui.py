@@ -16,11 +16,12 @@ from tkinter import filedialog, messagebox, ttk
 PROJECT_DIR = Path(__file__).resolve().parent
 PIPELINE_SCRIPT = PROJECT_DIR / "bvh_c3d_biobuddy_pyorerun_compare.py"
 MODEL_EDITOR_SCRIPT = PROJECT_DIR / "launch_biobuddy_model_editor.py"
+COMPARISON_SCRIPT = PROJECT_DIR / "compare_capture_systems.py"
 
 
 class CapturyBioBuddyGui(tk.Tk):
     def __init__(self) -> None:
-        super().__init__()
+        super().__init__(baseName="captury_biobuddy", className="CapturyBioBuddy")
         self.title("Captury BioBuddy")
         self.geometry("1180x780")
         self.minsize(980, 680)
@@ -73,6 +74,22 @@ class CapturyBioBuddyGui(tk.Tk):
             "inverse_dynamics": False,
             "inverse_dynamics_method": "",
             "inverse_dynamics_max_frames": "",
+            "compare_data_root": "local_trials/data",
+            "compare_reference_system": "Motive",
+            "compare_test_system": "Captury",
+            "compare_reference_c3d": "",
+            "compare_reference_bvh": "",
+            "compare_reference_fbx": "",
+            "compare_test_c3d": "",
+            "compare_test_bvh": "",
+            "compare_test_fbx": "",
+            "compare_trial_name": "",
+            "compare_participant_filter": "",
+            "compare_trial_filter": "",
+            "compare_out_dir": "out_capture_system_comparison",
+            "compare_landmark_map": "motive_captury_landmark_map.json",
+            "compare_resample_points": "101",
+            "compare_alignment": "global_rigid",
         }
         for name, value in defaults.items():
             var_cls = tk.BooleanVar if isinstance(value, bool) else tk.StringVar
@@ -124,6 +141,7 @@ class CapturyBioBuddyGui(tk.Tk):
         self._build_model_tab(notebook)
         self._build_rerun_tab(notebook)
         self._build_ik_tab(notebook)
+        self._build_comparison_tab(notebook)
         self._build_advanced_tab(notebook)
 
         right.rowconfigure(1, weight=1)
@@ -236,6 +254,51 @@ class CapturyBioBuddyGui(tk.Tk):
             text="0 frame max signifie que toutes les frames du C3D sont utilisées.",
             style="Status.TLabel",
         ).grid(row=6, column=0, columnspan=3, sticky="w", padx=10, pady=(4, 10))
+
+    def _build_comparison_tab(self, notebook: ttk.Notebook) -> None:
+        tab = self._tab(notebook, "Comparaison")
+        batch = ttk.LabelFrame(tab, text="Mode dossier ou population")
+        batch.grid(row=0, column=0, sticky="ew")
+        batch.columnconfigure(1, weight=1)
+        self._path_row(batch, 0, "Racine", "compare_data_root", directory=True)
+        self._entry_row(batch, 1, "Système référence", "compare_reference_system")
+        self._entry_row(batch, 2, "Système test", "compare_test_system")
+        self._entry_row(batch, 3, "Filtre participants", "compare_participant_filter")
+        self._entry_row(batch, 4, "Filtre essais", "compare_trial_filter")
+
+        single = ttk.LabelFrame(tab, text="Mode paire C3D explicite")
+        single.grid(row=1, column=0, sticky="ew", pady=(12, 0))
+        single.columnconfigure(1, weight=1)
+        self._path_row(single, 0, "Référence C3D", "compare_reference_c3d", [("C3D", "*.c3d"), ("Tous les fichiers", "*")])
+        self._path_row(single, 1, "Référence BVH", "compare_reference_bvh", [("BVH", "*.bvh"), ("Tous les fichiers", "*")])
+        self._path_row(single, 2, "Référence FBX", "compare_reference_fbx", [("FBX", "*.fbx"), ("Tous les fichiers", "*")])
+        self._path_row(single, 3, "Test C3D", "compare_test_c3d", [("C3D", "*.c3d"), ("Tous les fichiers", "*")])
+        self._path_row(single, 4, "Test BVH", "compare_test_bvh", [("BVH", "*.bvh"), ("Tous les fichiers", "*")])
+        self._path_row(single, 5, "Test FBX", "compare_test_fbx", [("FBX", "*.fbx"), ("Tous les fichiers", "*")])
+        self._entry_row(single, 6, "Nom essai", "compare_trial_name")
+
+        options = ttk.LabelFrame(tab, text="Options")
+        options.grid(row=2, column=0, sticky="ew", pady=(12, 0))
+        options.columnconfigure(1, weight=1)
+        self._path_row(options, 0, "Sortie", "compare_out_dir", directory=True)
+        self._path_row(options, 1, "Carte repères", "compare_landmark_map", [("JSON", "*.json"), ("Tous les fichiers", "*")])
+        self._entry_row(options, 2, "Points normalisés", "compare_resample_points")
+        self._combo_row(options, 3, "Alignement", "compare_alignment", ("global_rigid", "per_frame_rigid", "none"))
+
+        actions = ttk.Frame(tab)
+        actions.grid(row=3, column=0, sticky="ew", pady=(12, 0))
+        actions.columnconfigure(0, weight=1)
+        actions.columnconfigure(1, weight=1)
+        self.compare_button = ttk.Button(
+            actions,
+            text="Lancer la comparaison",
+            style="Primary.TButton",
+            command=self._run_comparison,
+        )
+        self.compare_button.grid(row=0, column=0, sticky="ew", padx=(0, 6))
+        ttk.Button(actions, text="Copier commande comparaison", command=self._copy_comparison_command).grid(
+            row=0, column=1, sticky="ew", padx=(6, 0)
+        )
 
     def _build_advanced_tab(self, notebook: ttk.Notebook) -> None:
         tab = self._tab(notebook, "Avancé")
@@ -402,6 +465,42 @@ class CapturyBioBuddyGui(tk.Tk):
         raw = str(self.vars["extra_angle_labels"].get())
         return [part.strip() for part in raw.replace("\n", ",").split(",") if part.strip()]
 
+    def _comparison_args(self) -> list[str]:
+        args = [sys.executable, str(COMPARISON_SCRIPT)]
+        reference_c3d = str(self.vars["compare_reference_c3d"].get()).strip()
+        test_c3d = str(self.vars["compare_test_c3d"].get()).strip()
+        self._append_value_to(args, "--reference-system", "compare_reference_system")
+        self._append_value_to(args, "--test-system", "compare_test_system")
+        if reference_c3d or test_c3d:
+            args.extend(["--reference-c3d", reference_c3d, "--test-c3d", test_c3d])
+            self._append_value_to(args, "--reference-bvh", "compare_reference_bvh")
+            self._append_value_to(args, "--reference-fbx", "compare_reference_fbx")
+            self._append_value_to(args, "--test-bvh", "compare_test_bvh")
+            self._append_value_to(args, "--test-fbx", "compare_test_fbx")
+            trial_name = str(self.vars["compare_trial_name"].get()).strip()
+            if trial_name:
+                args.extend(["--trial-name", trial_name])
+        else:
+            args.extend(["--data-root", str(self.vars["compare_data_root"].get()).strip()])
+            for pattern in self._split_var_lines("compare_participant_filter"):
+                args.extend(["--participant-filter", pattern])
+            for pattern in self._split_var_lines("compare_trial_filter"):
+                args.extend(["--trial-filter", pattern])
+        self._append_value_to(args, "--out-dir", "compare_out_dir")
+        self._append_value_to(args, "--landmark-map", "compare_landmark_map")
+        self._append_value_to(args, "--resample-points", "compare_resample_points")
+        self._append_value_to(args, "--alignment", "compare_alignment")
+        return args
+
+    def _append_value_to(self, args: list[str], option: str, var_name: str) -> None:
+        value = str(self.vars[var_name].get()).strip()
+        if value:
+            args.extend([option, value])
+
+    def _split_var_lines(self, var_name: str) -> list[str]:
+        raw = str(self.vars[var_name].get())
+        return [part.strip() for part in raw.replace("\n", ",").split(",") if part.strip()]
+
     def _update_command_preview(self) -> None:
         command = " ".join(shlex.quote(part) for part in self._command_args())
         self.command_text.configure(state=tk.NORMAL)
@@ -471,6 +570,73 @@ class CapturyBioBuddyGui(tk.Tk):
 
         threading.Thread(target=worker, daemon=True).start()
 
+    def _validate_comparison(self) -> bool:
+        reference_c3d = str(self.vars["compare_reference_c3d"].get()).strip()
+        test_c3d = str(self.vars["compare_test_c3d"].get()).strip()
+        if reference_c3d or test_c3d:
+            if not reference_c3d or not test_c3d:
+                messagebox.showerror("Paire incomplète", "Référence C3D et Test C3D doivent être fournis ensemble.")
+                return False
+            explicit_paths = [
+                ("Référence C3D", reference_c3d),
+                ("Référence BVH", str(self.vars["compare_reference_bvh"].get()).strip()),
+                ("Référence FBX", str(self.vars["compare_reference_fbx"].get()).strip()),
+                ("Test C3D", test_c3d),
+                ("Test BVH", str(self.vars["compare_test_bvh"].get()).strip()),
+                ("Test FBX", str(self.vars["compare_test_fbx"].get()).strip()),
+            ]
+            for label, value in explicit_paths:
+                if not value:
+                    continue
+                if not self._resolve(value).exists():
+                    messagebox.showerror("Fichier introuvable", f"{label}: {value}")
+                    return False
+        else:
+            data_root = str(self.vars["compare_data_root"].get()).strip()
+            if not data_root or not self._resolve(data_root).exists():
+                messagebox.showerror("Dossier introuvable", f"Racine: {data_root}")
+                return False
+        landmark_map = str(self.vars["compare_landmark_map"].get()).strip()
+        if landmark_map and not self._resolve(landmark_map).exists():
+            messagebox.showerror("Fichier introuvable", f"Carte repères: {landmark_map}")
+            return False
+        return True
+
+    def _run_comparison(self) -> None:
+        if self.process is not None:
+            messagebox.showinfo("Exécution en cours", "Une commande est déjà lancée.")
+            return
+        if not self._validate_comparison():
+            return
+        args = self._comparison_args()
+        self._set_running(True)
+        self._clear_log()
+        self._append_log("$ " + " ".join(shlex.quote(part) for part in args) + "\n\n")
+        env = os.environ.copy()
+        env.setdefault("MPLCONFIGDIR", "/private/tmp/captury_models_mplconfig")
+
+        def worker() -> None:
+            try:
+                self.process = subprocess.Popen(
+                    args,
+                    cwd=PROJECT_DIR,
+                    env=env,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.STDOUT,
+                    text=True,
+                    bufsize=1,
+                )
+                assert self.process.stdout is not None
+                for line in self.process.stdout:
+                    self.output_queue.put(line)
+                return_code = self.process.wait()
+                self.output_queue.put(("__return_code__", return_code))
+            except Exception as exc:  # pragma: no cover - surfaced to the UI
+                self.output_queue.put(f"\nErreur de lancement: {exc}\n")
+                self.output_queue.put(("__return_code__", 1))
+
+        threading.Thread(target=worker, daemon=True).start()
+
     def _stop_pipeline(self) -> None:
         if self.process is None:
             return
@@ -479,6 +645,8 @@ class CapturyBioBuddyGui(tk.Tk):
 
     def _set_running(self, running: bool) -> None:
         self.run_button.configure(state=tk.DISABLED if running else tk.NORMAL)
+        if hasattr(self, "compare_button"):
+            self.compare_button.configure(state=tk.DISABLED if running else tk.NORMAL)
         self.stop_button.configure(state=tk.NORMAL if running else tk.DISABLED)
         self.status_var.set("Exécution en cours" if running else "Prêt")
 
@@ -514,6 +682,12 @@ class CapturyBioBuddyGui(tk.Tk):
         self.clipboard_clear()
         self.clipboard_append(command)
         self.status_var.set("Commande copiée")
+
+    def _copy_comparison_command(self) -> None:
+        command = " ".join(shlex.quote(part) for part in self._comparison_args())
+        self.clipboard_clear()
+        self.clipboard_append(command)
+        self.status_var.set("Commande comparaison copiée")
 
     def _generated_biomod_path(self, source: str) -> Path:
         filename = {
