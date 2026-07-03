@@ -7,6 +7,7 @@ Small workspace for comparing Captury BVH/FBX skeleton exports with C3D marker d
 - `bvh_c3d_biobuddy_pyorerun_compare.py`: main BVH/FBX to `bioMod` pipeline.
 - `captury_biobuddy_gui.py`: graphical launcher for the pipeline options.
 - `compare_capture_systems.py`: compare Motive marker-based C3D trials against Captury markerless C3D trials.
+- `compare_p6_motive_captury.py`: Captury/Motive model-centre comparison and C3D enrichment workflow for the `captury/` + `squelettes/` trial layout.
 - `model_comparison_metrics.py`: agreement metrics used by the comparison script.
 - `motive_captury_landmark_map.json`: editable Motive/Captury anatomical landmark correspondence map.
 - `plot_bvh_c3d_angle_comparisons.py`: optional plotting helper for BVH q versus C3D angle channels.
@@ -34,13 +35,13 @@ conda activate captury_biobuddy
 The environment installs BioBuddy from:
 
 ```text
-biobuddy @ git+https://github.com/mickaelbegon/biobuddy.git@codex/add-fbx-segment-meshes
+biobuddy @ git+https://github.com/mickaelbegon/biobuddy.git@codex/add-model-editor-gui
 ```
 
 This corresponds to the BioBuddy branch:
 
 ```text
-https://github.com/mickaelbegon/biobuddy/tree/codex/add-fbx-segment-meshes
+https://github.com/mickaelbegon/biobuddy/tree/codex/add-model-editor-gui
 ```
 
 ## C3D Point Classification
@@ -62,11 +63,41 @@ conda activate captury_biobuddy
 python captury_biobuddy_gui.py
 ```
 
-The interface exposes the same options as the command line pipeline: BVH/FBX/C3D paths, output folder, mesh/root-offset settings, Rerun visualization, display filters, inverse kinematics and advanced compatibility flags. It also shows the generated command and streams the pipeline log while it runs.
+For quick P6 debugging, launch the GUI with the local P6 preset already loaded:
 
-The `Modèles` tab can also launch BioBuddy's model explorer/editor. Select a `.bioMod`, `.osim`, `.urdf` or `.bvh` model manually, or use the `BVH généré` / `FBX généré` shortcuts to inspect the generated BioBuddy models.
+```bash
+conda run -n captury_biobuddy python captury_biobuddy_gui.py --p6-debug
+```
 
-The `Comparaison` tab runs the Motive/Captury comparison workflow. It can discover trial pairs from a local data root containing one directory per system, a population folder with one directory per participant, or compare one explicit pair with C3D/BVH/FBX files for both systems.
+Run the lightweight regression tests:
+
+```bash
+python -m unittest discover -s tests -v
+```
+
+The interface is a graphical launcher around the existing command line scripts. The scientific processing remains in the CLI scripts; the GUI builds the equivalent command with `sys.executable`, displays it, copies it to the clipboard, launches it in a background `subprocess.Popen`, streams stdout/stderr into the log panel, and lets the running process be stopped.
+
+The right command panel can target three workflows:
+
+- `Analyse Captury/Motive`: runs `compare_p6_motive_captury.py`.
+- `Pipeline BVH/FBX/C3D`: runs `bvh_c3d_biobuddy_pyorerun_compare.py`.
+- `Comparaison générique`: runs `compare_capture_systems.py`.
+
+The GUI tabs are organized for the Captury/Motive analysis:
+
+- `Données`: choose the flattened `Captury/` + `Motive/` data root, output folder, trials, static trial, model source and model-to-C3D axis conversion. The `Charger P6 debug` button fills a short `Static` run using `local_trials/2026-06-30_P6_flat`.
+- `Occlusions`: analyze missing Motive marker trajectories.
+- `Découpage`: estimate movement start/end and ground contacts from foot-marker kinematics.
+- `Dimensions`: compare model dimensions and generate bar figures.
+- `Centres`: compare model joint-centre positions after alignment.
+- `Marqueurs`: compare reasonable Motive/Captury skin-marker correspondences.
+- `Cinématiques`: compare available model q/angle channels and optionally run batch IK.
+- `Visualisation`: launch the enriched C3D/Rerun visualization or run headless.
+- `Avancé`: inspect the Python executable, script paths and compatibility options.
+
+The right side also contains a `Figures` panel. After a successful analysis, it lists the generated PNG metrics, previews the selected figure and can open it externally.
+
+The model-centre workflow automatically handles the current P6 conventions by default: Captury BVH/FBX is treated as millimetres, Motive BVH/FBX as centimetres, and model coordinates are converted from Y-up to the Motive C3D Z-up frame before writing `CAPJC_*` and `MOTJC_*` channels into enriched C3D copies.
 
 For direct command line use:
 
@@ -170,7 +201,7 @@ The exported `*_q_biorbd_order.npz` files are now populated from BioBuddy's `to_
 
 ## FBX Mesh
 
-The FBX mesh is handled by the BioBuddy branch `codex/add-fbx-segment-meshes`: the skinned visual mesh is split into per-segment `.ply` files for the FBX `bioMod`. The script also converts those generated `.ply` files to per-segment `.vtp` files before animation, because pyorerun accepts `.stl`/`.vtp` mesh files for rendering surfaces while biorbd keeps reading the `.ply` paths from the `bioMod`. Writing raw `mesh x y z` points into a `bioMod` only provides vertices and typically appears as a line/point cloud in the viewer.
+The FBX mesh is handled by the BioBuddy branch `codex/add-model-editor-gui`: the skinned visual mesh is split into per-segment `.ply` files for the FBX `bioMod`. The script also converts those generated `.ply` files to per-segment `.vtp` files before animation, because pyorerun accepts `.stl`/`.vtp` mesh files for rendering surfaces while biorbd keeps reading the `.ply` paths from the `bioMod`. Writing raw `mesh x y z` points into a `bioMod` only provides vertices and typically appears as a line/point cloud in the viewer.
 
 The pyorerun display uses millimetre-scale marker radii by default (`--rerun-marker-radius 15`) and keeps the FBX mesh opaque so the scene is visible immediately in Rerun.
 
@@ -248,6 +279,116 @@ The current numerical comparison derives comparable anatomical landmarks from Mo
 - `out_capture_system_comparison/run_report.json`
 
 For the current sample archive, Motive C3D files contain marker trajectories but no joint-angle POINT channels. Captury C3D files contain markerless `Q_*` points and joint-angle channels listed in `POINT:ANGLES`; therefore the script reports Captury angles in the inventory, but only computes angle agreement when both systems provide matching angle channels.
+
+## Motive/Captury Kinematic Model-Centre Comparison
+
+The original P6 folder can be flattened into a simpler local dataset with only `Captury/` and `Motive/` subfolders:
+
+```bash
+python prepare_kinematic_dataset.py \
+  --source-root /Users/mickaelbegon/Downloads/2026-06-30_P6 \
+  --output-root local_trials/2026-06-30_P6_flat
+```
+
+The flattened folder is ignored by git and has this structure:
+
+```text
+local_trials/2026-06-30_P6_flat/Captury/Static_P6.bvh
+local_trials/2026-06-30_P6_flat/Captury/Static_P6.fbx
+local_trials/2026-06-30_P6_flat/Captury/Static_P6.c3d
+local_trials/2026-06-30_P6_flat/Motive/P6_Static_Skeleton 001.bvh
+local_trials/2026-06-30_P6_flat/Motive/P6_Static.fbx
+local_trials/2026-06-30_P6_flat/Motive/P6_Static.c3d
+```
+
+List the detected trials:
+
+```bash
+python compare_p6_motive_captury.py \
+  --data-root local_trials/2026-06-30_P6_flat \
+  --list-trials
+```
+
+Run the example batch for `Static`, `LKnee` and `Marche_001`:
+
+```bash
+python compare_p6_motive_captury.py \
+  --data-root local_trials/2026-06-30_P6_flat \
+  --trial Static \
+  --trial LKnee \
+  --trial Marche_001 \
+  --joint-filter "Hip|Knee|Ankle|Leg|Foot" \
+  --static-trial Static \
+  --model-source bvh \
+  --no-mesh \
+  --out-dir out_p6_motive_captury_comparison
+```
+
+The script builds BioBuddy/biorbd models for both systems from BVH by default. Use `--model-source fbx` to force FBX, or `--model-source auto` to prefer BVH and fall back to FBX. Captury BVH/FBX is treated as millimetres; Motive BVH/FBX is treated as centimetres unless overridden with `--captury-unit-scale-to-m` or `--motive-unit-scale-to-m`.
+
+The model coordinates are converted from Y-up to the Motive C3D Z-up convention before writing C3D outputs:
+
+```bash
+--model-to-c3d-axis y_up_to_z_up
+```
+
+Main outputs:
+
+- `out_p6_motive_captury_comparison/<trial>/<trial>_motive_with_capjc_motjc.c3d`
+- `out_p6_motive_captury_comparison/<trial>/joint_centre_metrics.csv`
+- `out_p6_motive_captury_comparison/<trial>/kinematics_q_metrics.csv`
+- `out_p6_motive_captury_comparison/<trial>/motive_marker_occlusions.csv`
+- `out_p6_motive_captury_comparison/<trial>/trial_events_contacts.csv`
+- `out_p6_motive_captury_comparison/<trial>/model_dimensions.csv`
+- `out_p6_motive_captury_comparison/<trial>/skin_marker_correspondence_metrics.csv`
+- `out_p6_motive_captury_comparison/all_joint_centre_metrics.csv`
+- `out_p6_motive_captury_comparison/all_kinematics_q_metrics.csv`
+- `out_p6_motive_captury_comparison/all_motive_marker_occlusions.csv`
+- `out_p6_motive_captury_comparison/all_model_dimensions.csv`
+- `out_p6_motive_captury_comparison/all_skin_marker_correspondence_metrics.csv`
+- `out_p6_motive_captury_comparison/figures/joint_centres/*.png`
+- `out_p6_motive_captury_comparison/figures/kinematics_q/*.png`
+- `out_p6_motive_captury_comparison/figures/occlusions/*.png`
+- `out_p6_motive_captury_comparison/figures/model_dimensions/*.png`
+- `out_p6_motive_captury_comparison/figures/skin_markers/*.png`
+- `out_p6_motive_captury_comparison/run_report.json`
+
+By default the batch writes one PNG per available metric column. Joint-centre figures include metrics such as `median_error_mm`, `p95_error_mm`, `mae_x`, `mae_y`, `mae_z`, `mae_euclidean` and `rmse_euclidean`. Kinematic figures include `mae_rad`, `rmse_rad`, `bias_rad`, `nrmse_range`, waveform correlation/CCC and translation-native metrics when present. The same figure panel also shows Motive marker occlusions, model dimensions and reasonable Motive/Captury skin-marker correspondences. Use `--no-figures` to skip PNG generation.
+
+The GUI includes a `Figures` panel next to the command/log area. After running the kinematic analysis, click `Rafraîchir` to list the generated metric PNGs, preview them directly and open a selected figure externally if needed.
+
+The enriched Motive C3D copies contain generated model joint centres:
+
+- `CAPJC_*`: Captury centres after static rigid alignment Captury -> Motive.
+- `MOTJC_*`: Motive model centres in the Motive C3D frame.
+
+Open/validate a visualization for one trial without launching the Rerun viewer:
+
+```bash
+PYORERUN_HEADLESS=1 python compare_p6_motive_captury.py \
+  --data-root local_trials/2026-06-30_P6_flat \
+  --trial Static \
+  --visualize \
+  --visualize-trial Static \
+  --headless \
+  --rerun-wait-seconds 0 \
+  --out-dir out_p6_motive_captury_visual_check
+```
+
+For an interactive Rerun view, remove `PYORERUN_HEADLESS=1` and `--headless`. The current visualization displays the enriched C3D joint-centre channels. FBX meshes are generated when `--model-source fbx` and mesh extraction is enabled, but Motive FBX files may not contain usable geometry; this is reported under each trial's `run_report.json`.
+
+Run Motive inverse kinematics in batch through the existing BioBuddy/biorbd pipeline:
+
+```bash
+python compare_p6_motive_captury.py \
+  --data-root local_trials/2026-06-30_P6_flat \
+  --trial LKnee \
+  --run-ik-batch \
+  --ik-max-frames 50 \
+  --out-dir out_p6_motive_captury_ik_check
+```
+
+Kinematic comparisons in `kinematics_q_metrics.csv` are intentionally conservative: they compare matching generalized-coordinate names from the generated BioBuddy models. Translation channels are useful for gross motion checks. Rotation channels are reported, but Captury and Motive BVH/FBX exports may use different local segment frames, Euler sequences or axis signs, so those angular differences should be interpreted as diagnostic rather than direct biomechanical agreement. Captury C3D angle channels are inventoried when present; the Motive C3D files inspected here do not expose matching C3D angle channels. Captury duplicate C3D labels are inventoried in `run_report.json`; current marker correspondences average duplicate labels until they are renamed more explicitly.
 
 ## Local Marker Test
 
