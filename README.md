@@ -6,6 +6,7 @@ Small workspace for comparing Captury BVH/FBX skeleton exports with C3D marker d
 
 - `bvh_c3d_biobuddy_pyorerun_compare.py`: main BVH/FBX to `bioMod` pipeline.
 - `captury_biobuddy_gui.py`: graphical launcher for the pipeline options.
+- `c3d_trial_viewer.py`: lightweight PySide/QPainter C3D marker viewer used from the trial-cutting tab.
 - `compare_capture_systems.py`: compare Motive marker-based C3D trials against Captury markerless C3D trials.
 - `compare_p6_motive_captury.py`: Captury/Motive model-centre comparison and C3D enrichment workflow for the `captury/` + `squelettes/` trial layout.
 - `model_comparison_metrics.py`: agreement metrics used by the comparison script.
@@ -75,9 +76,9 @@ Run the lightweight regression tests:
 python -m unittest discover -s tests -v
 ```
 
-The interface is a graphical launcher around the existing command line scripts. The scientific processing remains in the CLI scripts; the GUI builds the equivalent command with `sys.executable`, displays it, copies it to the clipboard, launches it in a background `subprocess.Popen`, streams stdout/stderr into the log panel, and lets the running process be stopped.
+The interface is a graphical launcher around the existing command line scripts. The scientific processing remains in the CLI scripts; the GUI builds the equivalent command with `sys.executable`, copies it to the clipboard, launches it in a background `subprocess.Popen`, streams stdout/stderr into a log popup, and lets the running process be stopped.
 
-The right command panel can target three workflows:
+The small `Commande` button in the bottom-left corner opens a compact command popup. It can target three workflows:
 
 - `Analyse Captury/Motive`: runs `compare_p6_motive_captury.py`.
 - `Pipeline BVH/FBX/C3D`: runs `bvh_c3d_biobuddy_pyorerun_compare.py`.
@@ -85,19 +86,25 @@ The right command panel can target three workflows:
 
 The GUI tabs are organized for the Captury/Motive analysis:
 
-- `Données`: choose the flattened `Captury/` + `Motive/` data root, output folder, trials, static trial, model source and model-to-C3D axis conversion. The `Charger P6 debug` button fills a short `Static` run using `local_trials/2026-06-30_P6_flat`.
+- `Données`: choose the flattened `Captury/` + `Motive/` data root, output folder, static trial, model source and model-to-C3D axis conversion. The detected files are inventoried in a table, and the global trial menu in the top-right corner applies to every tab. The `Charger P6 debug` button fills a short `Static` run using `local_trials/2026-06-30_P6_flat`.
 - `Occlusions`: analyze missing Motive marker trajectories.
-- `Découpage`: estimate movement start/end and ground contacts from foot-marker kinematics.
-- `Dimensions`: compare model dimensions and generate bar figures.
+- `Découpage`: estimate movement start/end and ground contacts from foot-marker kinematics, and open the selected trial in the lightweight 3D C3D viewer.
+- `Dimensions`: compare model dimensions with an embedded graph and hierarchical metric/component selectors.
 - `Centres`: compare model joint-centre positions after alignment.
 - `Marqueurs`: compare reasonable Motive/Captury skin-marker correspondences.
 - `Cinématiques`: compare available model q/angle channels and optionally run batch IK.
 - `Visualisation`: launch the enriched C3D/Rerun visualization or run headless.
 - `Avancé`: inspect the Python executable, script paths and compatibility options.
 
-The right side also contains a `Figures` panel. After a successful analysis, it lists the generated PNG metrics, previews the selected figure and can open it externally.
+The metric tabs contain embedded Matplotlib graphs instead of PNG previews. Each graph panel has a hierarchical selector (`trial -> metric -> component`) so a metric can be plotted globally or narrowed to a specific marker, segment, joint, landmark or q component.
 
-The model-centre workflow automatically handles the current P6 conventions by default: Captury BVH/FBX is treated as millimetres, Motive BVH/FBX as centimetres, and model coordinates are converted from Y-up to the Motive C3D Z-up frame before writing `CAPJC_*` and `MOTJC_*` channels into enriched C3D copies.
+The model-centre workflow automatically handles the current P6 conventions by default: Captury BVH/FBX is treated as millimetres, Motive BVH/FBX as centimetres, and `--model-to-c3d-axis auto` currently resolves to the Y-up model -> Motive C3D Z-up conversion before writing `CAPJC_*` and `MOTJC_*` channels into enriched C3D copies. The bottom-left `Log` button opens the live process log when needed.
+
+The C3D viewer is a lightweight PySide/QPainter widget. It uses orthographic projection, drag rotation, wheel zoom, double-click reset, a right-click view menu (`XY`, `YZ`, `ZX`, `Face`, `Dos`, `Côté`), a frame slider, playback, marker-table selection highlighting, a whole-body fit toggle and an RGB triad. Launch it directly with:
+
+```bash
+python c3d_trial_viewer.py local_trials/2026-06-30_P6_flat/Motive/P6_Static.c3d
+```
 
 For direct command line use:
 
@@ -329,7 +336,7 @@ The script builds BioBuddy/biorbd models for both systems from BVH by default. U
 The model coordinates are converted from Y-up to the Motive C3D Z-up convention before writing C3D outputs:
 
 ```bash
---model-to-c3d-axis y_up_to_z_up
+--model-to-c3d-axis auto
 ```
 
 Main outputs:
@@ -346,16 +353,9 @@ Main outputs:
 - `out_p6_motive_captury_comparison/all_motive_marker_occlusions.csv`
 - `out_p6_motive_captury_comparison/all_model_dimensions.csv`
 - `out_p6_motive_captury_comparison/all_skin_marker_correspondence_metrics.csv`
-- `out_p6_motive_captury_comparison/figures/joint_centres/*.png`
-- `out_p6_motive_captury_comparison/figures/kinematics_q/*.png`
-- `out_p6_motive_captury_comparison/figures/occlusions/*.png`
-- `out_p6_motive_captury_comparison/figures/model_dimensions/*.png`
-- `out_p6_motive_captury_comparison/figures/skin_markers/*.png`
 - `out_p6_motive_captury_comparison/run_report.json`
 
-By default the batch writes one PNG per available metric column. Joint-centre figures include metrics such as `median_error_mm`, `p95_error_mm`, `mae_x`, `mae_y`, `mae_z`, `mae_euclidean` and `rmse_euclidean`. Kinematic figures include `mae_rad`, `rmse_rad`, `bias_rad`, `nrmse_range`, waveform correlation/CCC and translation-native metrics when present. The same figure panel also shows Motive marker occlusions, model dimensions and reasonable Motive/Captury skin-marker correspondences. Use `--no-figures` to skip PNG generation.
-
-The GUI includes a `Figures` panel next to the command/log area. After running the kinematic analysis, click `Rafraîchir` to list the generated metric PNGs, preview them directly and open a selected figure externally if needed.
+The GUI reads the CSV outputs directly and renders graphs inside the relevant tabs: occlusions, trial cutting/contact signals, model dimensions, joint centres, skin markers and kinematics. The hierarchical graph menus expose metrics such as `median_error_mm`, `p95_error_mm`, `mae_x`, `mae_y`, `mae_z`, `mae_euclidean`, `rmse_euclidean`, `mae_rad`, `rmse_rad`, waveform correlation/CCC, Motive occlusion percentages and contact-detection signals. Use `Rafraîchir graphes` after an analysis to reload the CSV data.
 
 The enriched Motive C3D copies contain generated model joint centres:
 

@@ -271,6 +271,8 @@ def build_model_run(
 
 
 def model_to_c3d_matrix(axis_mode: str) -> np.ndarray:
+    if axis_mode == "auto":
+        axis_mode = "y_up_to_z_up"
     if axis_mode == "identity":
         return np.eye(3)
     if axis_mode == "y_up_to_z_up":
@@ -1245,8 +1247,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--model-source", choices=["auto", "bvh", "fbx"], default="bvh")
     parser.add_argument(
         "--model-to-c3d-axis",
-        choices=["y_up_to_z_up", "identity"],
-        default="y_up_to_z_up",
+        choices=["auto", "y_up_to_z_up", "identity"],
+        default="auto",
     )
     parser.add_argument("--captury-unit-scale-to-m", type=float, default=None)
     parser.add_argument("--motive-unit-scale-to-m", type=float, default=None)

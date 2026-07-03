@@ -11,6 +11,7 @@ dependencies:
   - biorbd
   - pyorerun
   - rerun-sdk=0.21.0
+  - pyside6
   - pip
   - pip:
       - biobuddy @ git+https://github.com/mickaelbegon/biobuddy.git@codex/add-model-editor-gui

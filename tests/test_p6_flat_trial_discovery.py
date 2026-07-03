@@ -5,14 +5,18 @@ import unittest
 from pathlib import Path
 
 try:
+    import numpy as np
+
     from compare_p6_motive_captury import (
         captury_flat_trial_name,
         discover_flat_trials,
+        model_to_c3d_matrix,
         motive_flat_trial_name,
     )
 except ImportError as exc:  # pragma: no cover - depends on optional scientific env
     captury_flat_trial_name = None
     discover_flat_trials = None
+    model_to_c3d_matrix = None
     motive_flat_trial_name = None
     IMPORT_ERROR = exc
 else:
@@ -68,6 +72,13 @@ class FlatTrialDiscoveryTests(unittest.TestCase):
             self.assertEqual(bundle.motive_c3d.name, "P6_Static.c3d")
             self.assertEqual(bundle.motive_bvh.name, "P6_Static_Skeleton 001.bvh")
             self.assertEqual(bundle.motive_fbx.name, "P6_Static.fbx")
+
+    def test_auto_axis_uses_current_y_up_to_z_up_conversion(self) -> None:
+        assert model_to_c3d_matrix is not None
+
+        np.testing.assert_allclose(
+            model_to_c3d_matrix("auto"), model_to_c3d_matrix("y_up_to_z_up")
+        )
 
 
 if __name__ == "__main__":

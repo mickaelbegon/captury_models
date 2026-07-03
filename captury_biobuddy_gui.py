@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import importlib.util
 import os
 import queue
 import shlex
@@ -12,18 +13,163 @@ import threading
 import tkinter as tk
 from pathlib import Path
 from tkinter import filedialog, messagebox, ttk
+from typing import Iterable
+
+try:
+    import pandas as pd
+    from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
+    from matplotlib.figure import Figure
+
+    EMBEDDED_GRAPHS_AVAILABLE = True
+except Exception:  # pragma: no cover - optional GUI plotting dependency
+    pd = None
+    Figure = None
+    FigureCanvasTkAgg = None
+    EMBEDDED_GRAPHS_AVAILABLE = False
 
 PROJECT_DIR = Path(__file__).resolve().parent
 PIPELINE_SCRIPT = PROJECT_DIR / "bvh_c3d_biobuddy_pyorerun_compare.py"
 MODEL_EDITOR_SCRIPT = PROJECT_DIR / "launch_biobuddy_model_editor.py"
 COMPARISON_SCRIPT = PROJECT_DIR / "compare_capture_systems.py"
 KINEMATIC_COMPARISON_SCRIPT = PROJECT_DIR / "compare_p6_motive_captury.py"
+C3D_VIEWER_SCRIPT = PROJECT_DIR / "c3d_trial_viewer.py"
 
 COMMAND_MODES = {
     "kinematic": "Analyse Captury/Motive",
     "pipeline": "Pipeline BVH/FBX/C3D",
     "comparison": "Comparaison générique",
 }
+ALL_TRIALS_LABEL = "Tous les essais"
+
+GRAPH_CONFIGS = {
+    "occlusions": {
+        "csv": "all_motive_marker_occlusions.csv",
+        "groups": ("marker",),
+        "metrics": ("missing_percent", "missing_frames"),
+        "title": "Occlusions Motive",
+    },
+    "dimensions": {
+        "csv": "all_model_dimensions.csv",
+        "groups": ("system", "dimension"),
+        "metrics": ("median_length_mm", "sd_length_mm"),
+        "title": "Dimensions modèles",
+    },
+    "centres": {
+        "csv": "all_joint_centre_metrics.csv",
+        "groups": ("joint",),
+        "metrics": (
+            "median_error_mm",
+            "p95_error_mm",
+            "max_error_mm",
+            "mae_x",
+            "mae_y",
+            "mae_z",
+            "mae_euclidean",
+            "rmse_euclidean",
+        ),
+        "title": "Centres articulaires",
+    },
+    "skin_markers": {
+        "csv": "all_skin_marker_correspondence_metrics.csv",
+        "groups": ("landmark",),
+        "metrics": ("median_error_mm", "p95_error_mm", "rmse_error_mm"),
+        "title": "Marqueurs cutanés",
+    },
+    "kinematics": {
+        "csv": "all_kinematics_q_metrics.csv",
+        "groups": ("q_name",),
+        "metrics": (
+            "bias_rad",
+            "mae_rad",
+            "rmse_rad",
+            "nrmse_range",
+            "pearson_r_waveform",
+            "lin_ccc_waveform",
+            "bias_native",
+            "mae_native",
+            "rmse_native",
+        ),
+        "title": "Cinématiques",
+    },
+}
+
+EVENT_METRICS = (
+    "movement_speed_mm_s",
+    "left_foot_z_mm",
+    "right_foot_z_mm",
+    "left_foot_speed_mm_s",
+    "right_foot_speed_mm_s",
+    "left_contact",
+    "right_contact",
+)
+
+
+def graph_metric_columns(
+    dataframe: "pd.DataFrame", requested_metrics: Iterable[str]
+) -> list[str]:
+    if pd is None:
+        return []
+    return [
+        metric
+        for metric in requested_metrics
+        if metric in dataframe.columns
+        and pd.api.types.is_numeric_dtype(dataframe[metric])
+    ]
+
+
+def captury_trial_name_from_path(path: Path) -> str:
+    name = path.stem
+    return name[: -len("_P6")] if name.endswith("_P6") else name
+
+
+def motive_trial_name_from_path(path: Path) -> str:
+    name = path.stem
+    if name.startswith("P6_"):
+        name = name[3:]
+    if name.endswith("_Skeleton 001"):
+        name = name[: -len("_Skeleton 001")]
+    return name
+
+
+def inventory_p6_dataset(data_root: Path) -> dict[str, dict[str, dict[str, Path]]]:
+    inventory: dict[str, dict[str, dict[str, Path]]] = {}
+    captury_dir = data_root / "Captury"
+    motive_dir = data_root / "Motive"
+    if captury_dir.is_dir() and motive_dir.is_dir():
+        for path in sorted(captury_dir.glob("*")):
+            if path.suffix.lower() not in {".bvh", ".fbx", ".c3d"}:
+                continue
+            trial = captury_trial_name_from_path(path)
+            kind = path.suffix.lower().lstrip(".")
+            inventory.setdefault(trial, {}).setdefault("Captury", {})[kind] = path
+        for path in sorted(motive_dir.glob("*")):
+            if path.suffix.lower() not in {".bvh", ".fbx", ".c3d"}:
+                continue
+            trial = motive_trial_name_from_path(path)
+            kind = path.suffix.lower().lstrip(".")
+            inventory.setdefault(trial, {}).setdefault("Motive", {})[kind] = path
+        return inventory
+
+    for trial_dir in sorted(path for path in data_root.glob("*") if path.is_dir()):
+        captury = trial_dir / "captury"
+        motive = trial_dir / "squelettes"
+        if captury.is_dir():
+            for path in sorted(captury.glob("P6.*")):
+                if path.suffix.lower() not in {".bvh", ".fbx", ".c3d"}:
+                    continue
+                kind = path.suffix.lower().lstrip(".")
+                inventory.setdefault(trial_dir.name, {}).setdefault("Captury", {})[
+                    kind
+                ] = path
+        if motive.is_dir():
+            for path in sorted(motive.glob("*")):
+                if path.suffix.lower() not in {".bvh", ".fbx", ".c3d"}:
+                    continue
+                kind = path.suffix.lower().lstrip(".")
+                inventory.setdefault(trial_dir.name, {}).setdefault("Motive", {})[
+                    kind
+                ] = path
+    return inventory
 
 
 class CapturyBioBuddyGui(tk.Tk):
@@ -35,9 +181,15 @@ class CapturyBioBuddyGui(tk.Tk):
 
         self.process: subprocess.Popen[str] | None = None
         self.output_queue: queue.Queue[str | tuple[str, int]] = queue.Queue()
-        self.figure_paths: list[Path] = []
-        self.figure_photo: tk.PhotoImage | None = None
         self.analysis_buttons: list[ttk.Button] = []
+        self.trial_inventory: dict[str, dict[str, dict[str, Path]]] = {}
+        self.command_text: tk.Text | None = None
+        self.command_window: tk.Toplevel | None = None
+        self.log_text: tk.Text | None = None
+        self.log_window: tk.Toplevel | None = None
+        self.log_buffer = ""
+        self.graph_panels: dict[str, dict[str, object]] = {}
+        self.graph_payloads: dict[str, dict[str, dict[str, object]]] = {}
 
         self.vars: dict[str, tk.Variable] = {}
         self._create_variables()
@@ -103,11 +255,12 @@ class CapturyBioBuddyGui(tk.Tk):
             "p6_data_root": "local_trials/2026-06-30_P6_flat",
             "p6_out_dir": "out_p6_motive_captury_comparison",
             "p6_trials": "",
+            "selected_trial": ALL_TRIALS_LABEL,
             "p6_static_trial": "Static",
             "p6_joint_filter": "",
-            "p6_no_figures": False,
+            "p6_no_figures": True,
             "p6_model_source": "bvh",
-            "p6_model_to_c3d_axis": "y_up_to_z_up",
+            "p6_model_to_c3d_axis": "auto",
             "p6_no_mesh": False,
             "p6_max_mesh_points": "0",
             "p6_run_ik_batch": False,
@@ -140,10 +293,12 @@ class CapturyBioBuddyGui(tk.Tk):
         root.pack(fill=tk.BOTH, expand=True)
         root.columnconfigure(0, weight=1)
         root.rowconfigure(1, weight=1)
+        root.rowconfigure(2, weight=0)
 
         header = ttk.Frame(root)
         header.grid(row=0, column=0, sticky="ew", pady=(0, 10))
         header.columnconfigure(0, weight=1)
+        header.columnconfigure(1, weight=0)
         ttk.Label(
             header, text="Captury BioBuddy", font=("TkDefaultFont", 18, "bold")
         ).grid(row=0, column=0, sticky="w")
@@ -152,6 +307,20 @@ class CapturyBioBuddyGui(tk.Tk):
             text="Génération bioMod, comparaison C3D, visualisation Rerun et cinématique inverse",
             style="Status.TLabel",
         ).grid(row=1, column=0, sticky="w")
+        trial_selector = ttk.Frame(header)
+        trial_selector.grid(row=0, column=1, rowspan=2, sticky="e")
+        ttk.Label(trial_selector, text="Essai").grid(row=0, column=0, sticky="w")
+        self.trial_combobox = ttk.Combobox(
+            trial_selector,
+            textvariable=self.vars["selected_trial"],
+            values=(ALL_TRIALS_LABEL,),
+            state="readonly",
+            width=24,
+        )
+        self.trial_combobox.grid(row=0, column=1, sticky="ew", padx=(8, 4))
+        ttk.Button(
+            trial_selector, text="Actualiser", command=self._refresh_trial_inventory
+        ).grid(row=0, column=2, sticky="ew")
 
         body = ttk.PanedWindow(root, orient=tk.HORIZONTAL)
         body.grid(row=1, column=0, sticky="nsew")
@@ -177,12 +346,11 @@ class CapturyBioBuddyGui(tk.Tk):
         self._build_visualization_tab(notebook)
         self._build_advanced_tab(notebook)
 
-        right.rowconfigure(1, weight=1)
-        right.rowconfigure(2, weight=1)
         right.columnconfigure(0, weight=1)
         self._build_actions(right)
-        self._build_figure_panel(right)
-        self._build_log_panel(right)
+        self._build_footer_tools(root)
+        self._refresh_trial_inventory()
+        self._refresh_graphs()
 
     def _tab(self, notebook: ttk.Notebook, title: str) -> ttk.Frame:
         frame = ttk.Frame(notebook, padding=12)
@@ -207,7 +375,7 @@ class CapturyBioBuddyGui(tk.Tk):
             row=0, column=1, sticky="ew", padx=6
         )
         ttk.Button(
-            actions, text="Rafraîchir figures", command=self._refresh_figures
+            actions, text="Rafraîchir graphes", command=self._refresh_graphs
         ).grid(row=0, column=2, sticky="ew", padx=(6, 0))
 
     def _build_loading_matching_tab(self, notebook: ttk.Notebook) -> None:
@@ -227,11 +395,33 @@ class CapturyBioBuddyGui(tk.Tk):
             5,
             "Axes modèle -> C3D",
             "p6_model_to_c3d_axis",
-            ("y_up_to_z_up", "identity"),
+            ("auto", "y_up_to_z_up", "identity"),
         )
+        inventory = ttk.LabelFrame(tab, text="Fichiers détectés")
+        inventory.grid(row=1, column=0, sticky="nsew", pady=(12, 0))
+        inventory.rowconfigure(0, weight=1)
+        inventory.columnconfigure(0, weight=1)
+        self.inventory_tree = ttk.Treeview(
+            inventory,
+            columns=("system", "kind", "path"),
+            show="headings",
+            height=8,
+        )
+        self.inventory_tree.heading("system", text="Système")
+        self.inventory_tree.heading("kind", text="Type")
+        self.inventory_tree.heading("path", text="Fichier")
+        self.inventory_tree.column("system", width=90, stretch=False)
+        self.inventory_tree.column("kind", width=60, stretch=False)
+        self.inventory_tree.column("path", width=520, stretch=True)
+        self.inventory_tree.grid(row=0, column=0, sticky="nsew", padx=(8, 0), pady=8)
+        inventory_scrollbar = ttk.Scrollbar(
+            inventory, orient=tk.VERTICAL, command=self.inventory_tree.yview
+        )
+        self.inventory_tree.configure(yscrollcommand=inventory_scrollbar.set)
+        inventory_scrollbar.grid(row=0, column=1, sticky="ns", pady=8)
 
         systems = ttk.LabelFrame(tab, text="Systèmes comparés")
-        systems.grid(row=1, column=0, sticky="ew", pady=(12, 0))
+        systems.grid(row=2, column=0, sticky="ew", pady=(12, 0))
         systems.columnconfigure(1, weight=1)
         self._entry_row(systems, 0, "Référence", "compare_reference_system")
         self._entry_row(systems, 1, "Test", "compare_test_system")
@@ -242,36 +432,42 @@ class CapturyBioBuddyGui(tk.Tk):
             "compare_landmark_map",
             [("JSON", "*.json"), ("Tous les fichiers", "*")],
         )
-        self._analysis_action_row(tab, 2)
+        self._analysis_action_row(tab, 3)
         ttk.Button(
             tab,
             text="Charger P6 debug",
             command=self._load_p6_debug_preset,
-        ).grid(row=3, column=0, sticky="ew", pady=(12, 0))
+        ).grid(row=4, column=0, sticky="ew", pady=(12, 0))
 
     def _build_occlusions_tab(self, notebook: ttk.Notebook) -> None:
         tab = self._tab(notebook, "Occlusions")
+        tab.rowconfigure(2, weight=1)
         panel = ttk.LabelFrame(tab, text="Marqueurs Motive")
         panel.grid(row=0, column=0, sticky="ew")
         panel.columnconfigure(1, weight=1)
-        self._entry_row(panel, 0, "Essais", "p6_trials")
-        self._path_row(panel, 1, "Sortie", "p6_out_dir", directory=True)
-        self._check(panel, 2, "Ne pas générer les figures PNG", "p6_no_figures")
+        self._path_row(panel, 0, "Sortie", "p6_out_dir", directory=True)
+        self._check(panel, 1, "Ne pas générer les PNG", "p6_no_figures")
         self._analysis_action_row(tab, 1)
+        self._build_graph_panel(tab, 2, "occlusions")
 
     def _build_trial_cutting_tab(self, notebook: ttk.Notebook) -> None:
         tab = self._tab(notebook, "Découpage")
+        tab.rowconfigure(2, weight=1)
         panel = ttk.LabelFrame(tab, text="Début, fin et contacts au sol")
         panel.grid(row=0, column=0, sticky="ew")
         panel.columnconfigure(1, weight=1)
-        self._entry_row(panel, 0, "Essais", "p6_trials")
-        self._entry_row(panel, 1, "Essai statique", "p6_static_trial")
-        self._check(panel, 2, "Visualiser un essai enrichi", "p6_visualize")
-        self._entry_row(panel, 3, "Essai visualisé", "p6_visualize_trial")
+        self._entry_row(panel, 0, "Essai statique", "p6_static_trial")
+        self._check(panel, 1, "Visualiser un essai enrichi", "p6_visualize")
+        self._entry_row(panel, 2, "Essai visualisé", "p6_visualize_trial")
+        ttk.Button(
+            panel, text="Ouvrir visu 3D C3D", command=self._open_selected_trial_viewer
+        ).grid(row=3, column=0, columnspan=3, sticky="ew", padx=10, pady=6)
         self._analysis_action_row(tab, 1)
+        self._build_graph_panel(tab, 2, "events")
 
     def _build_dimensions_tab(self, notebook: ttk.Notebook) -> None:
         tab = self._tab(notebook, "Dimensions")
+        tab.rowconfigure(2, weight=1)
         panel = ttk.LabelFrame(tab, text="Dimensions des modèles")
         panel.grid(row=0, column=0, sticky="ew")
         panel.columnconfigure(1, weight=1)
@@ -281,9 +477,11 @@ class CapturyBioBuddyGui(tk.Tk):
         self._check(panel, 1, "Ne pas extraire les meshes FBX", "p6_no_mesh")
         self._entry_row(panel, 2, "Max points mesh", "p6_max_mesh_points")
         self._analysis_action_row(tab, 1)
+        self._build_graph_panel(tab, 2, "dimensions")
 
     def _build_joint_centres_tab(self, notebook: ttk.Notebook) -> None:
         tab = self._tab(notebook, "Centres")
+        tab.rowconfigure(2, weight=1)
         panel = ttk.LabelFrame(tab, text="Centres articulaires")
         panel.grid(row=0, column=0, sticky="ew")
         panel.columnconfigure(1, weight=1)
@@ -297,9 +495,11 @@ class CapturyBioBuddyGui(tk.Tk):
             ("global_rigid", "per_frame_rigid", "none"),
         )
         self._analysis_action_row(tab, 1)
+        self._build_graph_panel(tab, 2, "centres")
 
     def _build_skin_markers_tab(self, notebook: ttk.Notebook) -> None:
         tab = self._tab(notebook, "Marqueurs")
+        tab.rowconfigure(2, weight=1)
         panel = ttk.LabelFrame(tab, text="Marqueurs cutanés correspondants")
         panel.grid(row=0, column=0, sticky="ew")
         panel.columnconfigure(1, weight=1)
@@ -310,11 +510,12 @@ class CapturyBioBuddyGui(tk.Tk):
             "compare_landmark_map",
             [("JSON", "*.json"), ("Tous les fichiers", "*")],
         )
-        self._entry_row(panel, 1, "Filtre essais", "p6_trials")
         self._analysis_action_row(tab, 1)
+        self._build_graph_panel(tab, 2, "skin_markers")
 
     def _build_kinematics_compare_tab(self, notebook: ttk.Notebook) -> None:
         tab = self._tab(notebook, "Cinématiques")
+        tab.rowconfigure(2, weight=1)
         panel = ttk.LabelFrame(tab, text="Angles articulaires et q")
         panel.grid(row=0, column=0, sticky="ew")
         panel.columnconfigure(1, weight=1)
@@ -326,17 +527,18 @@ class CapturyBioBuddyGui(tk.Tk):
         )
         self._entry_row(panel, 4, "Max frames IK batch", "p6_ik_max_frames")
         self._analysis_action_row(tab, 1)
+        self._build_graph_panel(tab, 2, "kinematics")
 
     def _build_visualization_tab(self, notebook: ttk.Notebook) -> None:
         tab = self._tab(notebook, "Visualisation")
-        panel = ttk.LabelFrame(tab, text="Rerun et figures")
+        panel = ttk.LabelFrame(tab, text="Rerun")
         panel.grid(row=0, column=0, sticky="ew")
         panel.columnconfigure(1, weight=1)
         self._check(panel, 0, "Visualiser un essai enrichi", "p6_visualize")
         self._entry_row(panel, 1, "Essai visualisé", "p6_visualize_trial")
         self._check(panel, 2, "Headless", "p6_headless")
         self._entry_row(panel, 3, "Attente Rerun", "p6_rerun_wait_seconds")
-        self._check(panel, 4, "Ne pas générer les figures PNG", "p6_no_figures")
+        self._check(panel, 4, "Ne pas générer les PNG", "p6_no_figures")
         self._analysis_action_row(tab, 1)
 
     def _build_sources_tab(self, notebook: ttk.Notebook) -> None:
@@ -433,7 +635,7 @@ class CapturyBioBuddyGui(tk.Tk):
             1,
             "Axes modèle -> C3D",
             "p6_model_to_c3d_axis",
-            ("y_up_to_z_up", "identity"),
+            ("auto", "y_up_to_z_up", "identity"),
         )
         self._check(chain_compare, 2, "Ne pas extraire les meshes FBX", "p6_no_mesh")
         self._entry_row(chain_compare, 3, "Max points mesh", "p6_max_mesh_points")
@@ -637,7 +839,7 @@ class CapturyBioBuddyGui(tk.Tk):
         centres.grid(row=3, column=0, sticky="ew", pady=(12, 0))
         centres.columnconfigure(1, weight=1)
         self._entry_row(centres, 0, "Filtre centres", "p6_joint_filter")
-        self._check(centres, 1, "Ne pas générer les figures PNG", "p6_no_figures")
+        self._check(centres, 1, "Ne pas générer les PNG", "p6_no_figures")
         ttk.Label(
             centres,
             text=(
@@ -707,25 +909,10 @@ class CapturyBioBuddyGui(tk.Tk):
         )
 
     def _build_actions(self, parent: ttk.Frame) -> None:
-        actions = ttk.LabelFrame(parent, text="Commande")
+        actions = ttk.LabelFrame(parent, text="Exécution")
         actions.grid(row=0, column=0, sticky="ew", pady=(0, 10))
-        actions.columnconfigure(0, weight=1)
-
-        selector = ttk.Frame(actions)
-        selector.grid(row=0, column=0, columnspan=4, sticky="ew", padx=8, pady=(8, 0))
-        selector.columnconfigure(1, weight=1)
-        ttk.Label(selector, text="Commande").grid(row=0, column=0, sticky="w")
-        ttk.Combobox(
-            selector,
-            textvariable=self.vars["command_mode"],
-            values=tuple(COMMAND_MODES.values()),
-            state="readonly",
-        ).grid(row=0, column=1, sticky="ew", padx=(8, 0))
-
-        self.command_text = tk.Text(actions, height=7, wrap=tk.WORD, font=("Menlo", 11))
-        self.command_text.grid(
-            row=1, column=0, columnspan=4, sticky="ew", padx=8, pady=8
-        )
+        for column in range(3):
+            actions.columnconfigure(column, weight=1)
 
         self.run_button = ttk.Button(
             actions,
@@ -733,7 +920,7 @@ class CapturyBioBuddyGui(tk.Tk):
             style="Primary.TButton",
             command=self._run_selected_command,
         )
-        self.run_button.grid(row=2, column=0, sticky="ew", padx=(8, 4), pady=(0, 8))
+        self.run_button.grid(row=0, column=0, sticky="ew", padx=(8, 4), pady=(8, 8))
         self.stop_button = ttk.Button(
             actions,
             text="Arrêter",
@@ -741,17 +928,25 @@ class CapturyBioBuddyGui(tk.Tk):
             command=self._stop_pipeline,
             state=tk.DISABLED,
         )
-        self.stop_button.grid(row=2, column=1, sticky="ew", padx=4, pady=(0, 8))
-        ttk.Button(actions, text="Copier", command=self._copy_command).grid(
-            row=2, column=2, sticky="ew", padx=4, pady=(0, 8)
-        )
+        self.stop_button.grid(row=0, column=1, sticky="ew", padx=4, pady=(8, 8))
         ttk.Button(actions, text="Ouvrir sortie", command=self._open_output_dir).grid(
-            row=2, column=3, sticky="ew", padx=(4, 8), pady=(0, 8)
+            row=0, column=2, sticky="ew", padx=(4, 8), pady=(8, 8)
         )
 
         self.status_var = tk.StringVar(value="Prêt")
         ttk.Label(actions, textvariable=self.status_var, style="Status.TLabel").grid(
-            row=3, column=0, columnspan=4, sticky="w", padx=8, pady=(0, 8)
+            row=1, column=0, columnspan=3, sticky="w", padx=8, pady=(0, 8)
+        )
+
+    def _build_footer_tools(self, parent: ttk.Frame) -> None:
+        footer = ttk.Frame(parent)
+        footer.grid(row=2, column=0, sticky="ew", pady=(10, 0))
+        footer.columnconfigure(2, weight=1)
+        ttk.Button(footer, text="Commande", command=self._open_command_window).grid(
+            row=0, column=0, sticky="w", padx=(0, 6)
+        )
+        ttk.Button(footer, text="Log", command=self._open_log_window).grid(
+            row=0, column=1, sticky="w"
         )
 
     def _build_log_panel(self, parent: ttk.Frame) -> None:
@@ -770,43 +965,400 @@ class CapturyBioBuddyGui(tk.Tk):
         self.log_text.grid(row=0, column=0, sticky="nsew")
         scrollbar.grid(row=0, column=1, sticky="ns")
 
-    def _build_figure_panel(self, parent: ttk.Frame) -> None:
-        panel = ttk.LabelFrame(parent, text="Figures")
-        panel.grid(row=1, column=0, sticky="nsew", pady=(0, 10))
+    def _build_graph_panel(self, parent: ttk.Widget, row: int, graph_kind: str) -> None:
+        title = (
+            "Découpage et contacts"
+            if graph_kind == "events"
+            else str(GRAPH_CONFIGS[graph_kind]["title"])
+        )
+        panel = ttk.LabelFrame(parent, text=f"Graphiques - {title}")
+        panel.grid(row=row, column=0, sticky="nsew", pady=(12, 0))
         panel.rowconfigure(1, weight=1)
         panel.columnconfigure(1, weight=1)
 
         controls = ttk.Frame(panel)
         controls.grid(row=0, column=0, columnspan=2, sticky="ew", padx=8, pady=8)
-        controls.columnconfigure(0, weight=1)
-        ttk.Button(controls, text="Rafraîchir", command=self._refresh_figures).grid(
-            row=0, column=0, sticky="ew", padx=(0, 4)
+        ttk.Button(
+            controls,
+            text="Actualiser",
+            command=lambda kind=graph_kind: self._populate_graph_tree(kind),
+        ).grid(row=0, column=0, sticky="w")
+
+        tree_frame = ttk.Frame(panel)
+        tree_frame.grid(row=1, column=0, sticky="nsew", padx=(8, 4), pady=(0, 8))
+        tree_frame.rowconfigure(0, weight=1)
+        tree_frame.columnconfigure(0, weight=1)
+        tree = ttk.Treeview(tree_frame, show="tree", height=10)
+        tree.grid(row=0, column=0, sticky="nsew")
+        tree_scrollbar = ttk.Scrollbar(
+            tree_frame, orient=tk.VERTICAL, command=tree.yview
         )
-        ttk.Button(controls, text="Ouvrir", command=self._open_selected_figure).grid(
-            row=0, column=1, sticky="ew", padx=(4, 0)
+        tree.configure(yscrollcommand=tree_scrollbar.set)
+        tree_scrollbar.grid(row=0, column=1, sticky="ns")
+        tree.bind(
+            "<<TreeviewSelect>>",
+            lambda _event, kind=graph_kind: self._draw_selected_graph(kind),
         )
 
-        list_frame = ttk.Frame(panel)
-        list_frame.grid(row=1, column=0, sticky="nsew", padx=(8, 4), pady=(0, 8))
-        list_frame.rowconfigure(0, weight=1)
-        list_frame.columnconfigure(0, weight=1)
-        self.figure_listbox = tk.Listbox(list_frame, height=8, exportselection=False)
-        figure_scrollbar = ttk.Scrollbar(
-            list_frame, orient=tk.VERTICAL, command=self.figure_listbox.yview
+        graph_frame = ttk.Frame(panel)
+        graph_frame.grid(row=1, column=1, sticky="nsew", padx=(4, 8), pady=(0, 8))
+        graph_frame.rowconfigure(0, weight=1)
+        graph_frame.columnconfigure(0, weight=1)
+
+        panel_data: dict[str, object] = {"tree": tree}
+        if (
+            EMBEDDED_GRAPHS_AVAILABLE
+            and Figure is not None
+            and FigureCanvasTkAgg is not None
+        ):
+            figure = Figure(figsize=(5.0, 3.2), dpi=100)
+            axes = figure.add_subplot(111)
+            canvas = FigureCanvasTkAgg(figure, master=graph_frame)
+            canvas.get_tk_widget().grid(row=0, column=0, sticky="nsew")
+            panel_data.update({"figure": figure, "axes": axes, "canvas": canvas})
+        else:
+            ttk.Label(
+                graph_frame,
+                text="Matplotlib/pandas indisponibles pour les graphiques intégrés.",
+                style="Status.TLabel",
+            ).grid(row=0, column=0, sticky="nsew")
+        self.graph_panels[graph_kind] = panel_data
+        self.graph_payloads[graph_kind] = {}
+
+    def _refresh_graphs(self) -> None:
+        for graph_kind in self.graph_panels:
+            self._populate_graph_tree(graph_kind)
+
+    def _graph_output_root(self) -> Path:
+        return self._resolve(str(self.vars["p6_out_dir"].get()).strip())
+
+    def _graph_csv_path(self, graph_kind: str) -> Path:
+        return self._graph_output_root() / str(GRAPH_CONFIGS[graph_kind]["csv"])
+
+    def _selected_graph_trials(self, available_trials: Iterable[str]) -> list[str]:
+        trials = sorted(str(trial) for trial in available_trials)
+        selected = str(self.vars["selected_trial"].get()).strip()
+        if selected and selected != ALL_TRIALS_LABEL and selected in trials:
+            return [selected]
+        return trials
+
+    def _populate_graph_tree(self, graph_kind: str) -> None:
+        if pd is None:
+            return
+        panel = self.graph_panels.get(graph_kind)
+        if not panel:
+            return
+        tree = panel["tree"]
+        assert isinstance(tree, ttk.Treeview)
+        tree.delete(*tree.get_children())
+        self.graph_payloads[graph_kind] = {}
+        if graph_kind == "events":
+            self._populate_events_tree(tree, graph_kind)
+        else:
+            self._populate_metric_tree(tree, graph_kind)
+        first_payload_node = self._first_graph_payload_node(tree, graph_kind)
+        if first_payload_node:
+            tree.selection_set(first_payload_node)
+            tree.focus(first_payload_node)
+            self._draw_selected_graph(graph_kind)
+
+    def _first_graph_payload_node(
+        self, tree: ttk.Treeview, graph_kind: str
+    ) -> str | None:
+        stack = list(tree.get_children())
+        payloads = self.graph_payloads.get(graph_kind, {})
+        while stack:
+            node_id = stack.pop(0)
+            if node_id in payloads:
+                return node_id
+            stack[0:0] = list(tree.get_children(node_id))
+        return None
+
+    def _populate_metric_tree(self, tree: ttk.Treeview, graph_kind: str) -> None:
+        config = GRAPH_CONFIGS[graph_kind]
+        path = self._graph_csv_path(graph_kind)
+        if not path.exists():
+            tree.insert("", tk.END, text=f"CSV absent: {path.name}")
+            return
+        dataframe = pd.read_csv(path)
+        metrics = graph_metric_columns(dataframe, config["metrics"])
+        if not metrics:
+            tree.insert("", tk.END, text="Aucune métrique numérique")
+            return
+        trials = self._selected_graph_trials(dataframe["trial"].dropna().unique())
+        group_columns = tuple(str(column) for column in config["groups"])
+        for trial in trials:
+            trial_df = dataframe[dataframe["trial"].astype(str) == trial]
+            if trial_df.empty:
+                continue
+            trial_id = tree.insert("", tk.END, text=trial, open=True)
+            for metric in metrics:
+                metric_id = self._insert_graph_node(
+                    tree,
+                    graph_kind,
+                    trial_id,
+                    metric,
+                    {"trial": trial},
+                    metric=metric,
+                )
+                self._insert_group_nodes(
+                    tree,
+                    graph_kind,
+                    metric_id,
+                    trial_df,
+                    group_columns,
+                    {"trial": trial},
+                    metric,
+                )
+
+    def _insert_group_nodes(
+        self,
+        tree: ttk.Treeview,
+        graph_kind: str,
+        parent_id: str,
+        dataframe: "pd.DataFrame",
+        group_columns: tuple[str, ...],
+        filters: dict[str, str],
+        metric: str,
+    ) -> None:
+        if not group_columns:
+            return
+        column = group_columns[0]
+        if column not in dataframe.columns:
+            return
+        for value in sorted(dataframe[column].dropna().astype(str).unique()):
+            filtered = dataframe[dataframe[column].astype(str) == value]
+            child_filters = {**filters, column: value}
+            child_id = self._insert_graph_node(
+                tree,
+                graph_kind,
+                parent_id,
+                value,
+                child_filters,
+                metric=metric,
+            )
+            self._insert_group_nodes(
+                tree,
+                graph_kind,
+                child_id,
+                filtered,
+                group_columns[1:],
+                child_filters,
+                metric,
+            )
+
+    def _populate_events_tree(self, tree: ttk.Treeview, graph_kind: str) -> None:
+        root = self._graph_output_root()
+        event_files = sorted(root.glob("*/trial_events_contacts.csv"))
+        by_trial = {path.parent.name: path for path in event_files}
+        for trial in self._selected_graph_trials(by_trial):
+            path = by_trial.get(trial)
+            if path is None:
+                continue
+            trial_id = tree.insert("", tk.END, text=trial, open=True)
+            dataframe = pd.read_csv(path)
+            for metric in graph_metric_columns(dataframe, EVENT_METRICS):
+                self._insert_graph_node(
+                    tree,
+                    graph_kind,
+                    trial_id,
+                    metric,
+                    {"trial": trial, "path": str(path)},
+                    metric=metric,
+                )
+        if not by_trial:
+            tree.insert("", tk.END, text="Aucun trial_events_contacts.csv")
+
+    def _insert_graph_node(
+        self,
+        tree: ttk.Treeview,
+        graph_kind: str,
+        parent_id: str,
+        text: str,
+        filters: dict[str, str],
+        *,
+        metric: str,
+    ) -> str:
+        node_id = tree.insert(parent_id, tk.END, text=text, open=False)
+        self.graph_payloads[graph_kind][node_id] = {
+            "filters": filters,
+            "metric": metric,
+        }
+        return node_id
+
+    def _draw_selected_graph(self, graph_kind: str) -> None:
+        panel = self.graph_panels.get(graph_kind)
+        if not panel or "axes" not in panel:
+            return
+        tree = panel["tree"]
+        assert isinstance(tree, ttk.Treeview)
+        selection = tree.selection()
+        if not selection:
+            return
+        payload = self.graph_payloads.get(graph_kind, {}).get(selection[0])
+        if not payload:
+            return
+        if graph_kind == "events":
+            self._draw_events_graph(graph_kind, payload)
+        else:
+            self._draw_metric_graph(graph_kind, payload)
+
+    def _draw_metric_graph(self, graph_kind: str, payload: dict[str, object]) -> None:
+        if pd is None:
+            return
+        panel = self.graph_panels[graph_kind]
+        axes = panel["axes"]
+        canvas = panel["canvas"]
+        config = GRAPH_CONFIGS[graph_kind]
+        dataframe = pd.read_csv(self._graph_csv_path(graph_kind))
+        filters = dict(payload["filters"])
+        metric = str(payload["metric"])
+        for column, value in filters.items():
+            if column in dataframe.columns:
+                dataframe = dataframe[dataframe[column].astype(str) == str(value)]
+        axes.clear()
+        if dataframe.empty or metric not in dataframe.columns:
+            axes.set_title("Aucune donnée")
+            canvas.draw_idle()
+            return
+        group_columns = [
+            column for column in config["groups"] if column in dataframe.columns
+        ]
+        labels = (
+            dataframe[group_columns].astype(str).agg(" / ".join, axis=1)
+            if group_columns
+            else dataframe.index.astype(str)
         )
-        self.figure_listbox.configure(yscrollcommand=figure_scrollbar.set)
-        self.figure_listbox.grid(row=0, column=0, sticky="nsew")
-        figure_scrollbar.grid(row=0, column=1, sticky="ns")
-        self.figure_listbox.bind(
-            "<<ListboxSelect>>", lambda _event: self._show_selected_figure()
+        values = dataframe[metric].astype(float)
+        axes.bar(range(len(values)), values)
+        axes.set_title(f"{config['title']} - {metric}")
+        axes.set_ylabel(metric)
+        axes.set_xticks(range(len(values)))
+        axes.set_xticklabels(labels, rotation=45, ha="right")
+        axes.grid(axis="y", alpha=0.3)
+        panel["figure"].tight_layout()
+        canvas.draw_idle()
+
+    def _draw_events_graph(self, graph_kind: str, payload: dict[str, object]) -> None:
+        if pd is None:
+            return
+        panel = self.graph_panels[graph_kind]
+        axes = panel["axes"]
+        canvas = panel["canvas"]
+        path = Path(str(payload["filters"]["path"]))
+        metric = str(payload["metric"])
+        dataframe = pd.read_csv(path)
+        axes.clear()
+        if "time" not in dataframe.columns or metric not in dataframe.columns:
+            axes.set_title("Aucune donnée")
+            canvas.draw_idle()
+            return
+        values = dataframe[metric]
+        if values.dtype == bool:
+            values = values.astype(int)
+        axes.plot(dataframe["time"], values)
+        axes.set_title(f"{path.parent.name} - {metric}")
+        axes.set_xlabel("Temps (s)")
+        axes.set_ylabel(metric)
+        axes.grid(alpha=0.3)
+        panel["figure"].tight_layout()
+        canvas.draw_idle()
+
+    def _open_command_window(self) -> None:
+        if self.command_window is not None and self.command_window.winfo_exists():
+            self.command_window.lift()
+            return
+
+        window = tk.Toplevel(self)
+        window.title("Commande")
+        window.geometry("900x360")
+        window.minsize(720, 280)
+        window.columnconfigure(0, weight=1)
+        window.rowconfigure(1, weight=1)
+        self.command_window = window
+
+        selector = ttk.Frame(window, padding=(10, 10, 10, 0))
+        selector.grid(row=0, column=0, sticky="ew")
+        selector.columnconfigure(1, weight=1)
+        ttk.Label(selector, text="Commande").grid(row=0, column=0, sticky="w")
+        ttk.Combobox(
+            selector,
+            textvariable=self.vars["command_mode"],
+            values=tuple(COMMAND_MODES.values()),
+            state="readonly",
+        ).grid(row=0, column=1, sticky="ew", padx=(8, 0))
+
+        self.command_text = tk.Text(window, height=8, wrap=tk.WORD, font=("Menlo", 11))
+        self.command_text.grid(row=1, column=0, sticky="nsew", padx=10, pady=10)
+
+        actions = ttk.Frame(window, padding=(10, 0, 10, 10))
+        actions.grid(row=2, column=0, sticky="ew")
+        for column in range(4):
+            actions.columnconfigure(column, weight=1)
+        ttk.Button(
+            actions,
+            text="Lancer",
+            style="Primary.TButton",
+            command=self._run_selected_command,
+        ).grid(row=0, column=0, sticky="ew", padx=(0, 4))
+        ttk.Button(actions, text="Copier", command=self._copy_command).grid(
+            row=0, column=1, sticky="ew", padx=4
+        )
+        ttk.Button(actions, text="Ouvrir sortie", command=self._open_output_dir).grid(
+            row=0, column=2, sticky="ew", padx=4
         )
 
-        preview = ttk.Frame(panel)
-        preview.grid(row=1, column=1, sticky="nsew", padx=(4, 8), pady=(0, 8))
-        preview.rowconfigure(0, weight=1)
-        preview.columnconfigure(0, weight=1)
-        self.figure_preview = ttk.Label(preview, text="Aucune figure", anchor="center")
-        self.figure_preview.grid(row=0, column=0, sticky="nsew")
+        def on_close() -> None:
+            self.command_text = None
+            self.command_window = None
+            window.destroy()
+
+        ttk.Button(actions, text="Fermer", command=on_close).grid(
+            row=0, column=3, sticky="ew", padx=(4, 0)
+        )
+        window.protocol("WM_DELETE_WINDOW", on_close)
+        self._update_command_preview()
+
+    def _open_log_window(self) -> None:
+        if self.log_window is not None and self.log_window.winfo_exists():
+            self.log_window.lift()
+            return
+
+        window = tk.Toplevel(self)
+        window.title("Log")
+        window.geometry("920x520")
+        window.minsize(720, 320)
+        window.rowconfigure(0, weight=1)
+        window.columnconfigure(0, weight=1)
+        self.log_window = window
+
+        self.log_text = tk.Text(
+            window, wrap=tk.WORD, font=("Menlo", 11), state=tk.DISABLED
+        )
+        scrollbar = ttk.Scrollbar(
+            window, orient=tk.VERTICAL, command=self.log_text.yview
+        )
+        self.log_text.configure(yscrollcommand=scrollbar.set)
+        self.log_text.grid(row=0, column=0, sticky="nsew", padx=(10, 0), pady=10)
+        scrollbar.grid(row=0, column=1, sticky="ns", pady=10)
+
+        actions = ttk.Frame(window, padding=(10, 0, 10, 10))
+        actions.grid(row=1, column=0, columnspan=2, sticky="ew")
+        actions.columnconfigure(0, weight=1)
+        ttk.Button(actions, text="Effacer", command=self._clear_log).grid(
+            row=0, column=0, sticky="w"
+        )
+
+        def on_close() -> None:
+            self.log_text = None
+            self.log_window = None
+            window.destroy()
+
+        ttk.Button(actions, text="Fermer", command=on_close).grid(
+            row=0, column=1, sticky="e"
+        )
+        window.protocol("WM_DELETE_WINDOW", on_close)
+        self._sync_log_window()
 
     def _path_row(
         self,
@@ -886,6 +1438,12 @@ class CapturyBioBuddyGui(tk.Tk):
     def _bind_command_preview(self) -> None:
         for var in self.vars.values():
             var.trace_add("write", lambda *_: self._update_command_preview())
+        self.vars["selected_trial"].trace_add(
+            "write", lambda *_: self._sync_selected_trial()
+        )
+        self.vars["p6_data_root"].trace_add(
+            "write", lambda *_: self._refresh_trial_inventory()
+        )
 
     def _command_args(self) -> list[str]:
         args = [sys.executable, str(PIPELINE_SCRIPT)]
@@ -1029,6 +1587,53 @@ class CapturyBioBuddyGui(tk.Tk):
             part.strip() for part in raw.replace("\n", ",").split(",") if part.strip()
         ]
 
+    def _refresh_trial_inventory(self) -> None:
+        if not hasattr(self, "trial_combobox"):
+            return
+        data_root = self._resolve(str(self.vars["p6_data_root"].get()).strip())
+        self.trial_inventory = (
+            inventory_p6_dataset(data_root) if data_root.exists() else {}
+        )
+        values = [ALL_TRIALS_LABEL] + sorted(self.trial_inventory)
+        self.trial_combobox.configure(values=tuple(values))
+        selected = str(self.vars["selected_trial"].get()).strip()
+        if selected not in values:
+            self.vars["selected_trial"].set(ALL_TRIALS_LABEL)
+        else:
+            self._update_inventory_table()
+
+    def _sync_selected_trial(self) -> None:
+        selected = str(self.vars["selected_trial"].get()).strip()
+        if not selected or selected == ALL_TRIALS_LABEL:
+            self.vars["p6_trials"].set("")
+        else:
+            self.vars["p6_trials"].set(selected)
+            if not str(self.vars["p6_visualize_trial"].get()).strip():
+                self.vars["p6_visualize_trial"].set(selected)
+        self._update_inventory_table()
+
+    def _update_inventory_table(self) -> None:
+        if not hasattr(self, "inventory_tree"):
+            return
+        self.inventory_tree.delete(*self.inventory_tree.get_children())
+        selected = str(self.vars["selected_trial"].get()).strip()
+        trials = (
+            sorted(self.trial_inventory)
+            if selected in {"", ALL_TRIALS_LABEL}
+            else [selected]
+        )
+        for trial in trials:
+            systems = self.trial_inventory.get(trial, {})
+            for system in ("Captury", "Motive"):
+                for kind, path in sorted(systems.get(system, {}).items()):
+                    try:
+                        display_path = path.relative_to(PROJECT_DIR).as_posix()
+                    except ValueError:
+                        display_path = str(path)
+                    self.inventory_tree.insert(
+                        "", tk.END, values=(system, kind.upper(), display_path)
+                    )
+
     def _command_mode(self) -> str:
         value = str(self.vars["command_mode"].get())
         for key, label in COMMAND_MODES.items():
@@ -1064,6 +1669,8 @@ class CapturyBioBuddyGui(tk.Tk):
 
     def _update_command_preview(self) -> None:
         command = " ".join(shlex.quote(part) for part in self._current_args())
+        if self.command_text is None:
+            return
         self.command_text.configure(state=tk.NORMAL)
         self.command_text.delete("1.0", tk.END)
         self.command_text.insert(tk.END, command)
@@ -1100,79 +1707,6 @@ class CapturyBioBuddyGui(tk.Tk):
     def _resolve(self, value: str) -> Path:
         path = Path(value).expanduser()
         return path if path.is_absolute() else PROJECT_DIR / path
-
-    def _figure_dir(self) -> Path:
-        return self._resolve(str(self.vars["p6_out_dir"].get()).strip()) / "figures"
-
-    def _refresh_figures(self) -> None:
-        figure_dir = self._figure_dir()
-        self.figure_paths = (
-            sorted(figure_dir.glob("**/*.png")) if figure_dir.exists() else []
-        )
-        self.figure_listbox.delete(0, tk.END)
-        for path in self.figure_paths:
-            try:
-                label = path.relative_to(figure_dir).as_posix()
-            except ValueError:
-                label = path.name
-            self.figure_listbox.insert(tk.END, label)
-        if self.figure_paths:
-            self.figure_listbox.selection_set(0)
-            self._show_selected_figure()
-            self.status_var.set(f"{len(self.figure_paths)} figure(s) trouvée(s)")
-        else:
-            self.figure_photo = None
-            self.figure_preview.configure(image="", text="Aucune figure")
-            self.status_var.set("Aucune figure trouvée")
-
-    def _selected_figure_path(self) -> Path | None:
-        selection = self.figure_listbox.curselection()
-        if not selection:
-            return None
-        index = int(selection[0])
-        if index < 0 or index >= len(self.figure_paths):
-            return None
-        return self.figure_paths[index]
-
-    def _show_selected_figure(self) -> None:
-        path = self._selected_figure_path()
-        if path is None:
-            return
-        try:
-            photo = tk.PhotoImage(file=str(path))
-        except tk.TclError as exc:
-            self.figure_photo = None
-            self.figure_preview.configure(
-                image="", text=f"Impossible d'afficher:\n{exc}"
-            )
-            return
-        target_width = max(240, self.figure_preview.winfo_width() or 360)
-        target_height = max(180, self.figure_preview.winfo_height() or 260)
-        factor = max(
-            1,
-            int(
-                max(
-                    photo.width() / max(1, target_width),
-                    photo.height() / max(1, target_height),
-                )
-            ),
-        )
-        if factor > 1:
-            photo = photo.subsample(factor, factor)
-        self.figure_photo = photo
-        self.figure_preview.configure(image=photo, text="")
-
-    def _open_selected_figure(self) -> None:
-        path = self._selected_figure_path()
-        if path is None:
-            messagebox.showinfo("Figures", "Sélectionne une figure à ouvrir.")
-            return
-        if sys.platform == "darwin":
-            subprocess.Popen(["open", str(path)])
-        elif os.name == "nt":
-            os.startfile(path)  # type: ignore[attr-defined]
-        else:
-            subprocess.Popen(["xdg-open", str(path)])
 
     def _run_pipeline(self) -> None:
         if self.process is not None:
@@ -1268,12 +1802,13 @@ class CapturyBioBuddyGui(tk.Tk):
         self.vars["p6_data_root"].set("local_trials/2026-06-30_P6_flat")
         self.vars["p6_out_dir"].set("out_p6_motive_captury_debug")
         self.vars["p6_trials"].set("Static")
+        self.vars["selected_trial"].set("Static")
         self.vars["p6_static_trial"].set("Static")
         self.vars["p6_joint_filter"].set("Hip|Knee|Ankle|Leg|Foot")
         self.vars["p6_model_source"].set("bvh")
-        self.vars["p6_model_to_c3d_axis"].set("y_up_to_z_up")
+        self.vars["p6_model_to_c3d_axis"].set("auto")
         self.vars["p6_no_mesh"].set(True)
-        self.vars["p6_no_figures"].set(False)
+        self.vars["p6_no_figures"].set(True)
         self.vars["p6_run_ik_batch"].set(False)
         self.vars["p6_ik_max_frames"].set("0")
         self.vars["p6_visualize"].set(False)
@@ -1281,6 +1816,45 @@ class CapturyBioBuddyGui(tk.Tk):
         self.vars["p6_headless"].set(True)
         self.vars["p6_rerun_wait_seconds"].set("0")
         self.status_var.set("Preset P6 debug chargé")
+
+    def _selected_trial_c3d_path(self) -> Path | None:
+        selected = str(self.vars["selected_trial"].get()).strip()
+        if not selected or selected == ALL_TRIALS_LABEL:
+            selected = str(self.vars["p6_static_trial"].get()).strip()
+        if not self.trial_inventory:
+            self._refresh_trial_inventory()
+        files = self.trial_inventory.get(selected, {})
+        for system in ("Motive", "Captury"):
+            c3d_path = files.get(system, {}).get("c3d")
+            if c3d_path is not None and c3d_path.exists():
+                return c3d_path
+        return None
+
+    def _open_selected_trial_viewer(self) -> None:
+        c3d_path = self._selected_trial_c3d_path()
+        if c3d_path is None:
+            messagebox.showerror(
+                "C3D introuvable",
+                "Aucun C3D Motive ou Captury n'a été trouvé pour l'essai sélectionné.",
+            )
+            return
+        if importlib.util.find_spec("PySide6") is None:
+            messagebox.showerror(
+                "PySide6 manquant",
+                "La visualisation 3D intégrée nécessite PySide6. "
+                "Mets l'environnement à jour avec environment_bvh_c3d_biobuddy.yml.",
+            )
+            return
+        command = [sys.executable, str(C3D_VIEWER_SCRIPT), str(c3d_path)]
+        env = os.environ.copy()
+        env.setdefault("MPLCONFIGDIR", "/private/tmp/captury_models_mplconfig")
+        try:
+            subprocess.Popen(command, cwd=PROJECT_DIR, env=env)
+        except Exception as exc:
+            messagebox.showerror("Visu 3D C3D", f"Impossible de lancer la visu:\n{exc}")
+            return
+        self._append_log("$ " + " ".join(shlex.quote(part) for part in command) + "\n")
+        self.status_var.set(f"Visu 3D lancée: {c3d_path.name}")
 
     def _run_selected_command(self) -> None:
         if self.process is not None:
@@ -1367,7 +1941,7 @@ class CapturyBioBuddyGui(tk.Tk):
                         f"\nProcessus terminé avec le code {return_code}.\n"
                     )
                     if return_code == 0:
-                        self._refresh_figures()
+                        self._refresh_graphs()
                 else:
                     self._append_log(str(item))
         except queue.Empty:
@@ -1375,14 +1949,32 @@ class CapturyBioBuddyGui(tk.Tk):
         self.after(100, self._drain_output_queue)
 
     def _append_log(self, text: str) -> None:
+        self.log_buffer += text
+        self._append_log_to_window(text)
+
+    def _clear_log(self) -> None:
+        self.log_buffer = ""
+        if self.log_text is None:
+            return
+        self.log_text.configure(state=tk.NORMAL)
+        self.log_text.delete("1.0", tk.END)
+        self.log_text.configure(state=tk.DISABLED)
+
+    def _append_log_to_window(self, text: str) -> None:
+        if self.log_text is None:
+            return
         self.log_text.configure(state=tk.NORMAL)
         self.log_text.insert(tk.END, text)
         self.log_text.see(tk.END)
         self.log_text.configure(state=tk.DISABLED)
 
-    def _clear_log(self) -> None:
+    def _sync_log_window(self) -> None:
+        if self.log_text is None:
+            return
         self.log_text.configure(state=tk.NORMAL)
         self.log_text.delete("1.0", tk.END)
+        self.log_text.insert(tk.END, self.log_buffer)
+        self.log_text.see(tk.END)
         self.log_text.configure(state=tk.DISABLED)
 
     def _copy_command(self) -> None:
