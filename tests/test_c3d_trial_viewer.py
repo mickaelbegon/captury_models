@@ -9,12 +9,18 @@ from c3d_trial_viewer import (
     camera_matrix_for_subject_view,
     default_camera_matrix,
     fit_center_and_scale,
+    point_unit_scale_to_mm,
     project_points,
     rotation_matrix_from_drag,
 )
 
 
 class C3DTrialViewerCoreTests(unittest.TestCase):
+    def test_point_unit_scale_to_mm_handles_common_c3d_units(self) -> None:
+        self.assertEqual(point_unit_scale_to_mm("mm"), 1.0)
+        self.assertEqual(point_unit_scale_to_mm("cm"), 10.0)
+        self.assertEqual(point_unit_scale_to_mm("m"), 1000.0)
+
     def test_projection_maps_center_to_widget_center(self) -> None:
         points = np.asarray([[10.0], [20.0], [30.0]])
         screen, _depth = project_points(
@@ -43,7 +49,23 @@ class C3DTrialViewerCoreTests(unittest.TestCase):
         )
 
         self.assertEqual(camera_matrix_for_plane("XY").shape, (3, 3))
+        self.assertEqual(camera_matrix_for_plane("XZ").shape, (3, 3))
         self.assertEqual(camera_matrix_for_subject_view("face", points).shape, (3, 3))
+
+    def test_subject_view_pca_has_deterministic_axis_sign(self) -> None:
+        points = np.asarray(
+            [
+                [-200.0, 200.0, -200.0, 200.0],
+                [-50.0, -50.0, 50.0, 50.0],
+                [0.0, 0.0, 100.0, 100.0],
+            ]
+        )
+
+        forward = camera_matrix_for_subject_view("face", points)
+        reversed_points = points[:, ::-1]
+        reversed_forward = camera_matrix_for_subject_view("face", reversed_points)
+
+        np.testing.assert_allclose(forward, reversed_forward)
 
     def test_fit_scale_uses_finite_points_only(self) -> None:
         points = np.asarray([[0.0, 100.0, np.nan], [0.0, 0.0, 0.0], [0.0, 0.0, 0.0]])

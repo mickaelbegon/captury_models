@@ -5,13 +5,26 @@ import unittest
 import tempfile
 from pathlib import Path
 
+import numpy as np
 import pandas as pd
 
 from captury_biobuddy_gui import (
     COMMAND_MODES,
     CapturyBioBuddyGui,
+    C3DMarkerData,
+    TkC3DTrialCanvas,
+    available_cor_layers,
+    captury_marker_transform_from_c3d_layers,
+    captury_marker_transform_from_report,
+    data_source_color,
+    data_source_marker_color,
+    display_marker_name,
     graph_metric_columns,
     inventory_p6_dataset,
+    joint_chain_edges,
+    load_joint_centre_chain_data,
+    transformed_marker_data,
+    vertical_axis_label,
 )
 
 
@@ -36,10 +49,17 @@ class P6DebugGuiTests(unittest.TestCase):
             "p6_trials",
             "selected_trial",
             "p6_static_trial",
+            "p6_cut_mode",
+            "p6_time_start",
+            "p6_time_end",
             "p6_joint_filter",
+            "p6_auto_analyze",
             "p6_model_source",
             "p6_model_to_c3d_axis",
+            "root_offset_mode",
+            "c3d_angle_unit",
             "p6_no_figures",
+            "p6_no_cache",
             "p6_no_mesh",
             "p6_max_mesh_points",
             "p6_run_ik_batch",
@@ -48,13 +68,23 @@ class P6DebugGuiTests(unittest.TestCase):
             "p6_visualize_trial",
             "p6_headless",
             "p6_rerun_wait_seconds",
+            "biobuddy_c3d_mapping_json",
         ]
         gui.vars = {key: FakeVar("") for key in keys}
         gui.vars["p6_no_figures"].set(False)
+        gui.vars["root_offset_mode"].set("auto")
+        gui.vars["c3d_angle_unit"].set("deg")
+        gui.vars["p6_auto_analyze"].set(True)
+        gui.vars["p6_no_cache"].set(False)
         gui.vars["p6_no_mesh"].set(False)
         gui.vars["p6_run_ik_batch"].set(False)
         gui.vars["p6_visualize"].set(False)
         gui.vars["p6_headless"].set(False)
+        gui.vars["biobuddy_c3d_mapping_json"].set("")
+        gui.occlusion_sort_column = "marker_order"
+        gui.occlusion_sort_descending = False
+        gui.process = None
+        gui.trial_inventory = {}
         gui.status_var = FakeVar()
         return gui
 
@@ -70,7 +100,11 @@ class P6DebugGuiTests(unittest.TestCase):
         self.assertEqual(gui.vars["p6_out_dir"].get(), "out_p6_motive_captury_debug")
         self.assertEqual(gui.vars["p6_trials"].get(), "Static")
         self.assertEqual(gui.vars["selected_trial"].get(), "Static")
+        self.assertEqual(gui.vars["p6_cut_mode"].get(), "manual")
+        self.assertEqual(gui.vars["p6_time_start"].get(), "")
+        self.assertEqual(gui.vars["p6_time_end"].get(), "")
         self.assertEqual(gui.vars["p6_joint_filter"].get(), "Hip|Knee|Ankle|Leg|Foot")
+        self.assertIs(gui.vars["p6_auto_analyze"].get(), True)
         self.assertEqual(gui.vars["p6_model_source"].get(), "bvh")
         self.assertEqual(gui.vars["p6_model_to_c3d_axis"].get(), "auto")
         self.assertIs(gui.vars["p6_no_mesh"].get(), True)
@@ -87,10 +121,147 @@ class P6DebugGuiTests(unittest.TestCase):
         self.assertTrue(args[1].endswith("compare_p6_motive_captury.py"))
         self.assertIn("--trial", args)
         self.assertIn("Static", args)
+        self.assertIn("--cut-mode", args)
+        self.assertIn("manual", args)
         self.assertIn("--no-mesh", args)
         self.assertIn("--headless", args)
+        self.assertNotIn("--no-cache", args)
         self.assertNotIn("--run-ik-batch", args)
         self.assertNotIn("--visualize", args)
+
+    def test_manual_phase_bounds_are_sorted_and_set_manual_cut_mode(self) -> None:
+        gui = self.make_gui_stub()
+
+        CapturyBioBuddyGui._set_manual_phase_bounds(gui, 4.25, 1.5)
+
+        self.assertEqual(gui.vars["p6_cut_mode"].get(), "manual")
+        self.assertEqual(gui.vars["p6_time_start"].get(), "1.5")
+        self.assertEqual(gui.vars["p6_time_end"].get(), "4.25")
+        self.assertEqual(gui.status_var.get(), "Phase sélectionnée: 1.5-4.25 s")
+
+    def test_manual_phase_bounds_parse_existing_entries(self) -> None:
+        gui = self.make_gui_stub()
+        gui.vars["p6_time_start"].set("0.500000")
+        gui.vars["p6_time_end"].set("2")
+
+        self.assertEqual(CapturyBioBuddyGui._manual_phase_bounds(gui), (0.5, 2.0))
+
+    def test_p6_command_can_force_recompute_without_cache(self) -> None:
+        gui = self.make_gui_stub()
+        CapturyBioBuddyGui._load_p6_debug_preset(gui)
+        gui.vars["p6_no_cache"].set(True)
+
+        args = CapturyBioBuddyGui._p6_args(gui)
+
+        self.assertIn("--no-cache", args)
+
+    def test_p6_command_includes_manual_time_window_when_set(self) -> None:
+        gui = self.make_gui_stub()
+        CapturyBioBuddyGui._load_p6_debug_preset(gui)
+        gui.vars["p6_time_start"].set("0.5")
+        gui.vars["p6_time_end"].set("2.0")
+
+        args = CapturyBioBuddyGui._p6_args(gui)
+
+        self.assertIn("--time-start", args)
+        self.assertIn("0.5", args)
+        self.assertIn("--time-end", args)
+        self.assertIn("2.0", args)
+
+    def test_p6_occlusions_command_targets_selected_trial_only(self) -> None:
+        gui = self.make_gui_stub()
+        gui.vars["p6_data_root"].set("local_trials/2026-06-30_P6_flat")
+        gui.vars["p6_out_dir"].set("out_p6_motive_captury_debug")
+
+        args = CapturyBioBuddyGui._p6_occlusions_args(gui, "Marche_001")
+
+        self.assertIn("--occlusions-only", args)
+        self.assertIn("--no-figures", args)
+        self.assertIn("--trial", args)
+        self.assertIn("Marche_001", args)
+
+    def test_p6_auto_analysis_command_is_lightweight_for_selected_trial(self) -> None:
+        gui = self.make_gui_stub()
+        gui.vars["p6_data_root"].set("local_trials/2026-06-30_P6_flat")
+        gui.vars["p6_out_dir"].set("out_p6_motive_captury_debug")
+        gui.vars["p6_static_trial"].set("Static")
+        gui.vars["p6_cut_mode"].set("manual")
+        gui.vars["p6_model_source"].set("bvh")
+        gui.vars["p6_model_to_c3d_axis"].set("auto")
+
+        args = CapturyBioBuddyGui._p6_auto_analysis_args(gui, "Marche_001")
+
+        self.assertIn("--trial", args)
+        self.assertIn("Marche_001", args)
+        self.assertIn("--no-figures", args)
+        self.assertIn("--no-mesh", args)
+        self.assertIn("--max-mesh-points", args)
+        self.assertNotIn("--run-ik-batch", args)
+        self.assertNotIn("--visualize", args)
+        self.assertNotIn("--occlusions-only", args)
+
+    def test_selected_trial_runs_auto_analysis_when_idle(self) -> None:
+        gui = self.make_gui_stub()
+        gui.vars["p6_data_root"].set("local_trials/2026-06-30_P6_flat")
+        gui.vars["p6_out_dir"].set("out_p6_motive_captury_debug")
+        gui.vars["selected_trial"].set("Static")
+        gui.trial_inventory = {"Static": {"Motive": {}}}
+        calls = []
+        gui._resolve = lambda value: Path(".")  # type: ignore[method-assign]
+        gui._run_args = lambda args: calls.append(args)  # type: ignore[method-assign]
+
+        CapturyBioBuddyGui._run_selected_trial_auto_analysis(gui)
+
+        self.assertEqual(len(calls), 1)
+        self.assertIn("--no-figures", calls[0])
+        self.assertNotIn("--occlusions-only", calls[0])
+
+    def test_selected_trial_does_not_run_auto_analysis_while_busy(self) -> None:
+        gui = self.make_gui_stub()
+        gui.process = object()
+        gui.vars["selected_trial"].set("Static")
+        gui.trial_inventory = {"Static": {"Motive": {}}}
+        calls = []
+        gui._run_args = lambda args: calls.append(args)  # type: ignore[method-assign]
+
+        CapturyBioBuddyGui._run_selected_trial_auto_analysis(gui)
+
+        self.assertEqual(calls, [])
+
+    def test_selected_trial_can_disable_auto_analysis(self) -> None:
+        gui = self.make_gui_stub()
+        gui.vars["p6_auto_analyze"].set(False)
+        gui.vars["p6_data_root"].set("local_trials/2026-06-30_P6_flat")
+        gui.vars["selected_trial"].set("Static")
+        gui.trial_inventory = {"Static": {"Motive": {}}}
+        calls = []
+        gui._resolve = lambda value: Path(".")  # type: ignore[method-assign]
+        gui._run_args = lambda args: calls.append(args)  # type: ignore[method-assign]
+
+        CapturyBioBuddyGui._run_selected_trial_auto_analysis(gui)
+
+        self.assertEqual(calls, [])
+
+    def test_model_source_change_runs_auto_analysis_for_selected_trial(self) -> None:
+        gui = self.make_gui_stub()
+        gui.vars["p6_data_root"].set("local_trials/2026-06-30_P6_flat")
+        gui.vars["p6_out_dir"].set("out_p6_motive_captury_debug")
+        gui.vars["selected_trial"].set("Static")
+        gui.vars["p6_static_trial"].set("Static")
+        gui.vars["p6_model_source"].set("fbx")
+        gui.vars["p6_model_to_c3d_axis"].set("auto")
+        gui.trial_inventory = {"Static": {"Motive": {}, "Captury": {}}}
+        calls = []
+        gui._resolve = lambda value: Path(".")  # type: ignore[method-assign]
+        gui._run_args = lambda args: calls.append(args)  # type: ignore[method-assign]
+
+        CapturyBioBuddyGui._on_p6_model_source_changed(gui)
+
+        self.assertEqual(len(calls), 1)
+        self.assertIn("--model-source", calls[0])
+        self.assertIn("fbx", calls[0])
+        self.assertIn("--trial", calls[0])
+        self.assertIn("Static", calls[0])
 
     def test_inventory_p6_dataset_collects_flat_files_for_trial_dropdown(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -133,6 +304,14 @@ class P6DebugGuiTests(unittest.TestCase):
             self.assertEqual(
                 CapturyBioBuddyGui._selected_trial_c3d_path(gui), motive_c3d
             )
+            self.assertEqual(
+                CapturyBioBuddyGui._selected_trial_c3d_path_and_source(gui),
+                (motive_c3d, "Motive"),
+            )
+            self.assertEqual(
+                CapturyBioBuddyGui._selected_trial_c3d_paths(gui),
+                {"Motive": motive_c3d, "Captury": captury_c3d},
+            )
 
     def test_graph_metric_columns_keeps_only_numeric_requested_columns(self) -> None:
         dataframe = pd.DataFrame(
@@ -148,6 +327,283 @@ class P6DebugGuiTests(unittest.TestCase):
             graph_metric_columns(dataframe, ("median_error_mm", "comment", "missing")),
             ["median_error_mm"],
         )
+
+    def test_metric_series_keeps_multiple_selected_metrics(self) -> None:
+        gui = self.make_gui_stub()
+        dataframe = pd.DataFrame(
+            {
+                "trial": ["Static", "Static"],
+                "joint": ["Hip", "Knee"],
+                "median_error_mm": [10.0, 20.0],
+                "p95_error_mm": [15.0, 25.0],
+            }
+        )
+        payloads = [
+            {"filters": {"trial": "Static"}, "metric": "median_error_mm"},
+            {"filters": {"trial": "Static"}, "metric": "p95_error_mm"},
+        ]
+
+        series = CapturyBioBuddyGui._metric_series_from_payloads(
+            gui, dataframe, payloads, {"groups": ("joint",)}
+        )
+
+        self.assertEqual(
+            [item["metric"] for item in series],
+            ["median_error_mm", "p95_error_mm"],
+        )
+        self.assertEqual([len(item["values"]) for item in series], [2, 2])
+
+    def test_kinematic_rad_values_are_displayed_in_degrees(self) -> None:
+        values = pd.Series([np.pi, np.pi / 2.0])
+
+        converted = CapturyBioBuddyGui._values_for_display(values, "bias_rad")
+
+        np.testing.assert_allclose(converted.to_numpy(), [180.0, 90.0])
+        self.assertEqual(
+            CapturyBioBuddyGui._metric_display_name("bias_rad"), "bias_deg"
+        )
+
+    def test_kinematic_timeseries_rotations_are_displayed_in_degrees(self) -> None:
+        values = pd.Series([np.pi, np.pi / 2.0])
+
+        converted = CapturyBioBuddyGui._values_for_display(
+            values, "captury", q_name="Head_rotX"
+        )
+
+        np.testing.assert_allclose(converted.to_numpy(), [180.0, 90.0])
+        self.assertEqual(
+            CapturyBioBuddyGui._metric_display_name("captury", q_name="Head_rotX"),
+            "captury (deg)",
+        )
+
+    def test_captury_marker_transform_composes_static_and_model_marker_alignment(
+        self,
+    ) -> None:
+        static_rotation = np.asarray(
+            [[0.0, -1.0, 0.0], [1.0, 0.0, 0.0], [0.0, 0.0, 1.0]]
+        )
+        static_translation = np.asarray([10.0, 20.0, 30.0])
+        yaw_rotation = np.asarray([[0.0, 1.0, 0.0], [-1.0, 0.0, 0.0], [0.0, 0.0, 1.0]])
+        yaw_translation = np.asarray([-5.0, 2.0, 1.0])
+        report = {
+            "alignment": {
+                "rotation": static_rotation.tolist(),
+                "translation_mm": static_translation.tolist(),
+                "motive_model_to_c3d_markers": {
+                    "rotation": yaw_rotation.tolist(),
+                    "translation_mm": yaw_translation.tolist(),
+                },
+            }
+        }
+
+        rotation, translation = captury_marker_transform_from_report(report)
+
+        np.testing.assert_allclose(rotation, static_rotation @ yaw_rotation)
+        np.testing.assert_allclose(
+            translation, static_translation @ yaw_rotation + yaw_translation
+        )
+
+    def test_transformed_marker_data_keeps_metadata_and_transforms_all_frames(
+        self,
+    ) -> None:
+        points = np.asarray(
+            [
+                [[1.0, 2.0], [3.0, 4.0]],
+                [[10.0, 20.0], [30.0, 40.0]],
+                [[100.0, 200.0], [300.0, 400.0]],
+            ]
+        )
+        data = C3DMarkerData(labels=["A", "B"], points=points, rate=120.0, unit="mm")
+
+        transformed = transformed_marker_data(
+            data, np.eye(3), np.asarray([1.0, 2.0, 3.0])
+        )
+
+        self.assertEqual(transformed.labels, ["A", "B"])
+        self.assertEqual(transformed.rate, 120.0)
+        self.assertEqual(transformed.unit, "mm")
+        np.testing.assert_allclose(
+            transformed.points, points + np.asarray([1.0, 2.0, 3.0])[:, None, None]
+        )
+
+    def test_captury_marker_transform_can_use_c3d_landmark_map(self) -> None:
+        translation = np.asarray([10.0, -20.0, 30.0])
+        motive_labels = [
+            "Skeleton_001_LIAS",
+            "Skeleton_001_RIAS",
+            "Skeleton_001_LIPS",
+            "Skeleton_001_RIPS",
+            "Skeleton_001_LFTC",
+            "Skeleton_001_RFTC",
+            "Skeleton_001_LFLE",
+            "Skeleton_001_LFME",
+        ]
+        motive_points = np.asarray(
+            [
+                [[0.0], [0.0], [0.0], [0.0], [100.0], [0.0], [0.0], [0.0]],
+                [[0.0], [0.0], [0.0], [0.0], [0.0], [100.0], [0.0], [0.0]],
+                [[0.0], [0.0], [0.0], [0.0], [0.0], [0.0], [100.0], [100.0]],
+            ]
+        )
+        captury_labels = ["Q_Wa", "Q_LT", "Q_RT", "Q_LK"]
+        captury_reference_points = np.asarray(
+            [
+                [[0.0], [100.0], [0.0], [0.0]],
+                [[0.0], [0.0], [100.0], [0.0]],
+                [[0.0], [0.0], [0.0], [100.0]],
+            ]
+        )
+        captury_points = captury_reference_points - translation[:, None, None]
+        motive = C3DMarkerData(
+            labels=motive_labels, points=motive_points, rate=100.0, unit="mm"
+        )
+        captury = C3DMarkerData(
+            labels=captury_labels, points=captury_points, rate=100.0, unit="mm"
+        )
+
+        rotation, offset = captury_marker_transform_from_c3d_layers(captury, motive)
+
+        np.testing.assert_allclose(rotation, np.eye(3), atol=1e-12)
+        np.testing.assert_allclose(offset, translation, atol=1e-12)
+
+    def test_display_marker_name_removes_motive_skeleton_prefix(self) -> None:
+        self.assertEqual(display_marker_name("Skeleton_001_LIAS"), "LIAS")
+
+    def test_occlusion_sort_can_rank_by_missing_percent_descending(self) -> None:
+        gui = self.make_gui_stub()
+        gui.occlusion_sort_column = "missing_percent"
+        gui.occlusion_sort_descending = True
+        dataframe = pd.DataFrame(
+            {
+                "marker_order": [0, 1, 2],
+                "marker": ["Skeleton_001_A", "Skeleton_001_B", "Skeleton_001_C"],
+                "missing_percent": [0.0, 25.0, 10.0],
+            }
+        )
+
+        sorted_df = CapturyBioBuddyGui._sorted_occlusion_dataframe(gui, dataframe)
+
+        self.assertEqual(sorted_df["display_marker"].tolist(), ["B", "C", "A"])
+
+    def test_occlusion_sort_can_keep_model_order_for_marker_column(self) -> None:
+        gui = self.make_gui_stub()
+        gui.occlusion_sort_column = "marker_order"
+        gui.occlusion_sort_descending = False
+        dataframe = pd.DataFrame(
+            {
+                "marker_order": [2, 0, 1],
+                "marker": ["Skeleton_001_C", "Skeleton_001_A", "Skeleton_001_B"],
+                "missing_percent": [0.0, 25.0, 10.0],
+            }
+        )
+
+        sorted_df = CapturyBioBuddyGui._sorted_occlusion_dataframe(gui, dataframe)
+
+        self.assertEqual(sorted_df["display_marker"].tolist(), ["A", "B", "C"])
+
+    def test_cor_layers_are_detected_from_joint_centre_columns(self) -> None:
+        layers = available_cor_layers(
+            (
+                "trial",
+                "time",
+                "joint",
+                "captury_x_mm",
+                "captury_y_mm",
+                "captury_z_mm",
+                "motive_x_mm",
+                "motive_y_mm",
+                "motive_z_mm",
+                "biobuddy_x_mm",
+                "biobuddy_y_mm",
+                "biobuddy_z_mm",
+            )
+        )
+
+        self.assertEqual(layers, ["captury", "motive", "biobuddy"])
+
+    def test_data_source_colors_are_stable_for_three_sources(self) -> None:
+        self.assertEqual(data_source_color("Captury"), "#f97316")
+        self.assertEqual(data_source_color("Motive"), "#0ea5e9")
+        self.assertEqual(data_source_color("BioBuddy"), "#22c55e")
+
+    def test_data_source_marker_colors_use_lighter_source_nuances(self) -> None:
+        self.assertEqual(data_source_marker_color("Captury"), "#fb923c")
+        self.assertEqual(data_source_marker_color("Motive"), "#38bdf8")
+        self.assertEqual(data_source_marker_color("BioBuddy"), "#86efac")
+
+    def test_vertical_axis_labels_match_p6_file_conventions(self) -> None:
+        self.assertEqual(vertical_axis_label("bvh"), "+Y modèle")
+        self.assertEqual(vertical_axis_label("fbx"), "+Y modèle")
+        self.assertEqual(vertical_axis_label("c3d"), "+Z labo")
+
+    def test_viewer_anatomical_axis_uses_motive_left_right_markers(self) -> None:
+        viewer = object.__new__(TkC3DTrialCanvas)
+        viewer.frame = 0
+        viewer.visible_marker_sources = {"motive"}
+        data = C3DMarkerData(
+            labels=["Skeleton_001_RIAS", "Skeleton_001_LIAS"],
+            points=np.asarray(
+                [[[0.0], [100.0]], [[0.0], [0.0]], [[900.0], [900.0]]],
+                dtype=float,
+            ),
+            rate=120.0,
+        )
+        viewer.marker_layers = {"motive": data}
+
+        axis = TkC3DTrialCanvas._anatomical_left_axis(viewer)
+
+        np.testing.assert_allclose(axis, [1.0, 0.0, 0.0])
+
+    def test_joint_chain_edges_keep_known_available_segments(self) -> None:
+        edges = joint_chain_edges(["Hips", "Spine", "LeftUpLeg", "LeftLeg"])
+
+        self.assertIn(("Hips", "Spine"), edges)
+        self.assertIn(("Hips", "LeftUpLeg"), edges)
+        self.assertIn(("LeftUpLeg", "LeftLeg"), edges)
+
+    def test_load_joint_centre_chain_data_reads_layers_and_edges(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "joint_centre_timeseries.npz"
+            columns = np.asarray(
+                [
+                    "trial",
+                    "time",
+                    "joint",
+                    "captury_x_mm",
+                    "captury_y_mm",
+                    "captury_z_mm",
+                    "motive_x_mm",
+                    "motive_y_mm",
+                    "motive_z_mm",
+                ]
+            )
+            values = {
+                "trial": np.asarray(["Static", "Static", "Static", "Static"]),
+                "time": np.asarray([0.0, 0.0, 1.0, 1.0]),
+                "joint": np.asarray(["Hips", "Spine", "Hips", "Spine"]),
+                "captury_x_mm": np.asarray([0.0, 0.0, 0.0, 0.0]),
+                "captury_y_mm": np.asarray([0.0, 0.0, 1.0, 1.0]),
+                "captury_z_mm": np.asarray([0.0, 10.0, 0.0, 10.0]),
+                "motive_x_mm": np.asarray([1.0, 1.0, 1.0, 1.0]),
+                "motive_y_mm": np.asarray([0.0, 0.0, 1.0, 1.0]),
+                "motive_z_mm": np.asarray([0.0, 10.0, 0.0, 10.0]),
+            }
+            np.savez_compressed(
+                path,
+                columns=columns,
+                **{
+                    f"col_{index}": values[column]
+                    for index, column in enumerate(columns)
+                },
+            )
+
+            chain = load_joint_centre_chain_data(path)
+
+        self.assertIsNotNone(chain)
+        assert chain is not None
+        self.assertEqual(sorted(chain.layers), ["captury", "motive"])
+        self.assertEqual(chain.layers["captury"]["Hips"].shape, (2, 3))
+        self.assertIn(("Hips", "Spine"), chain.edges)
 
 
 if __name__ == "__main__":

@@ -1,11 +1,28 @@
-"""Graphical launcher for the Captury/BioBuddy BVH/FBX/C3D pipeline."""
+"""Tkinter GUI launcher for the Captury/BioBuddy comparison pipelines.
+
+This module deliberately keeps the scientific work in the existing command line
+scripts. The GUI owns only interaction concerns:
+
+* collecting file paths and options;
+* building the equivalent CLI command with ``sys.executable``;
+* launching long tasks in a background subprocess;
+* streaming stdout/stderr into a log popup;
+* reading generated CSV outputs for tables, plots and the lightweight 3D view.
+
+That separation is important for reproducibility: every GUI action can be copied
+as a CLI command and rerun outside Tkinter. New analysis logic should therefore
+go in ``compare_p6_motive_captury.py`` or the lower-level helpers, not in this
+file.
+"""
 
 from __future__ import annotations
 
 import argparse
 import importlib.util
+import json
 import os
 import queue
+import re
 import shlex
 import subprocess
 import sys
@@ -14,6 +31,66 @@ import tkinter as tk
 from pathlib import Path
 from tkinter import filedialog, messagebox, ttk
 from typing import Iterable
+
+import numpy as np
+
+from c3d_trial_viewer import load_c3d_marker_data
+from gui_commands import (
+    C3D_VIEWER_SCRIPT,
+    COMMAND_MODES,
+    MODEL_EDITOR_SCRIPT,
+    PIPELINE_SCRIPT,
+    PROJECT_DIR,
+    build_biobuddy_c3d_model_args,
+    build_comparison_args,
+    build_p6_args,
+    build_p6_auto_analysis_args,
+    build_p6_occlusions_args,
+    build_pipeline_args,
+    split_extra_labels,
+    split_lines,
+)
+from gui_graphs import (
+    EVENT_METRICS,
+    GRAPH_CONFIGS,
+    KINEMATIC_TIMESERIES_COLUMNS,
+    draw_dimension_metric_graph,
+    joint_centre_error_boxplot_series,
+    draw_joint_centre_error_timeseries,
+    draw_metric_boxplot,
+    graph_metric_columns,
+    is_rotation_q_name,
+    metric_display_name,
+    read_table_npz,
+    values_for_display,
+)
+from gui_trial_viewer import (
+    COR_LAYER_LABELS,
+    DATA_SOURCE_COLORS,
+    C3DMarkerData,
+    JointCentreChainData,
+    TkC3DTrialCanvas,
+    available_cor_layers,
+    captury_marker_transform_from_c3d_layers,
+    captury_marker_transform_from_report,
+    data_source_color,
+    data_source_marker_color,
+    display_marker_name,
+    joint_chain_edges,
+    load_joint_centre_chain_data,
+    transformed_marker_data,
+    vertical_axis_label,
+)
+from motive57_c3d_mapping import (
+    MOTIVE_57_C3D_ROLES,
+    assignments_from_payload,
+    discover_c3d_files,
+    infer_motive57_role_assignments,
+    load_motive57_mapping,
+    motive57_mapping_path,
+    motive57_mapping_payload,
+    save_motive57_mapping,
+)
 
 try:
     import pandas as pd
@@ -27,94 +104,96 @@ except Exception:  # pragma: no cover - optional GUI plotting dependency
     FigureCanvasTkAgg = None
     EMBEDDED_GRAPHS_AVAILABLE = False
 
-PROJECT_DIR = Path(__file__).resolve().parent
-PIPELINE_SCRIPT = PROJECT_DIR / "bvh_c3d_biobuddy_pyorerun_compare.py"
-MODEL_EDITOR_SCRIPT = PROJECT_DIR / "launch_biobuddy_model_editor.py"
-COMPARISON_SCRIPT = PROJECT_DIR / "compare_capture_systems.py"
-KINEMATIC_COMPARISON_SCRIPT = PROJECT_DIR / "compare_p6_motive_captury.py"
-C3D_VIEWER_SCRIPT = PROJECT_DIR / "c3d_trial_viewer.py"
-
-COMMAND_MODES = {
-    "kinematic": "Analyse Captury/Motive",
-    "pipeline": "Pipeline BVH/FBX/C3D",
-    "comparison": "Comparaison générique",
-}
 ALL_TRIALS_LABEL = "Tous les essais"
-
-GRAPH_CONFIGS = {
-    "occlusions": {
-        "csv": "all_motive_marker_occlusions.csv",
-        "groups": ("marker",),
-        "metrics": ("missing_percent", "missing_frames"),
-        "title": "Occlusions Motive",
-    },
-    "dimensions": {
-        "csv": "all_model_dimensions.csv",
-        "groups": ("system", "dimension"),
-        "metrics": ("median_length_mm", "sd_length_mm"),
-        "title": "Dimensions modèles",
-    },
-    "centres": {
-        "csv": "all_joint_centre_metrics.csv",
-        "groups": ("joint",),
-        "metrics": (
-            "median_error_mm",
-            "p95_error_mm",
-            "max_error_mm",
-            "mae_x",
-            "mae_y",
-            "mae_z",
-            "mae_euclidean",
-            "rmse_euclidean",
+CRITICAL_METHOD_NOTES = (
+    {
+        "title": "Recalage FBX/BVH -> C3D",
+        "algorithm": (
+            "Pour chaque modèle BVH/FBX, les deux conventions de translation racine "
+            "sont générées: conserver q tel qu'exporté ou soustraire l'offset statique "
+            "de la racine. Le mode auto convertit ensuite les centres en repère C3D, "
+            "score les deux superpositions contre le nuage de marqueurs, puis garde "
+            "la meilleure avant les recalages Captury -> Motive et yaw/translation."
         ),
-        "title": "Centres articulaires",
-    },
-    "skin_markers": {
-        "csv": "all_skin_marker_correspondence_metrics.csv",
-        "groups": ("landmark",),
-        "metrics": ("median_error_mm", "p95_error_mm", "rmse_error_mm"),
-        "title": "Marqueurs cutanés",
-    },
-    "kinematics": {
-        "csv": "all_kinematics_q_metrics.csv",
-        "groups": ("q_name",),
-        "metrics": (
-            "bias_rad",
-            "mae_rad",
-            "rmse_rad",
-            "nrmse_range",
-            "pearson_r_waveform",
-            "lin_ccc_waveform",
-            "bias_native",
-            "mae_native",
-            "rmse_native",
+        "risk": (
+            "Si le meilleur score reste élevé, l'offset racine n'explique pas tout: "
+            "la pose statique, les correspondances anatomiques, les unités ou le choix "
+            "yaw-only peuvent encore masquer un mauvais placement segmentaire."
         ),
-        "title": "Cinématiques",
+        "check": (
+            "Inspecter les fichiers *_root_translation_policy.json, la visu 3D, les "
+            "distances CAPJC/MOTJC, la cohérence verticale sur Z et les repères XYZ "
+            "locaux avant d'interpréter les erreurs."
+        ),
     },
-}
-
-EVENT_METRICS = (
-    "movement_speed_mm_s",
-    "left_foot_z_mm",
-    "right_foot_z_mm",
-    "left_foot_speed_mm_s",
-    "right_foot_speed_mm_s",
-    "left_contact",
-    "right_contact",
+    {
+        "title": "Cohérence des modèles",
+        "algorithm": (
+            "Les modèles Captury, Motive et BioBuddy sont construits séparément depuis "
+            "les sources disponibles. Les comparaisons de q se font par noms de DoF "
+            "communs et les dimensions par segments ou centres disponibles."
+        ),
+        "risk": (
+            "Deux segments portant le même nom peuvent avoir des repères locaux, "
+            "longueurs, offsets ou conventions Euler différents."
+        ),
+        "check": (
+            "Comparer les dimensions, afficher les trois chaînes CoR et éviter de "
+            "traiter une différence angulaire comme un écart biomécanique direct."
+        ),
+    },
+    {
+        "title": "Orientation des données",
+        "algorithm": (
+            "Le mode auto suppose FBX/BVH en +Y vertical et C3D Motive en +Z vertical. "
+            "Les vues face/dos/côté utilisent des estimations géométriques/PCA quand "
+            "la caméra doit être orientée automatiquement."
+        ),
+        "risk": (
+            "Une mauvaise hypothèse d'axe vertical, une inversion gauche-droite ou "
+            "une ambiguïté de signe PCA peut faire paraître les chaînes incohérentes."
+        ),
+        "check": (
+            "Vérifier l'axe vertical dans l'onglet Données, utiliser les vues XY/YZ/XZ "
+            "et confirmer que les marqueurs et chaînes suivent le même mouvement."
+        ),
+    },
+    {
+        "title": "Mise à l'échelle",
+        "algorithm": (
+            "Les C3D sont normalisés à partir de POINT:UNITS. Pour P6, Captury BVH/FBX "
+            "est traité en millimètres et Motive BVH/FBX en centimètres par défaut."
+        ),
+        "risk": (
+            "Un metadata C3D erroné ou une unité modèle mal déclarée crée des erreurs "
+            "d'un facteur 10 ou 100 qui ressemblent à un problème de recalage."
+        ),
+        "check": (
+            "Lire les dimensions de modèles, vérifier les amplitudes verticales et "
+            "confirmer les échelles avant de comparer les distances en millimètres."
+        ),
+    },
+    {
+        "title": "Angles articulaires et q",
+        "algorithm": (
+            "Les rotations BioBuddy sont sauvegardées en radians dans les CSV, puis "
+            "affichées en degrés dans le GUI. Les DoF suivent l'ordre q_names/bioMod; "
+            "les segments FBX générés indiquent typiquement rotations zyx."
+        ),
+        "risk": (
+            "Les exports Captury/Motive peuvent utiliser des frames locaux, axes de "
+            "rotation, offsets et séquences Euler non équivalents."
+        ),
+        "check": (
+            "Comparer d'abord les formes temporelles DoF par DoF, puis documenter les "
+            "conventions avant toute conclusion quantitative sur les angles."
+        ),
+    },
 )
 
 
-def graph_metric_columns(
-    dataframe: "pd.DataFrame", requested_metrics: Iterable[str]
-) -> list[str]:
-    if pd is None:
-        return []
-    return [
-        metric
-        for metric in requested_metrics
-        if metric in dataframe.columns
-        and pd.api.types.is_numeric_dtype(dataframe[metric])
-    ]
+def safe_trial_dir_name(value: str) -> str:
+    return re.sub(r"[^0-9A-Za-z_.-]+", "_", value).strip("_") or "trial"
 
 
 def captury_trial_name_from_path(path: Path) -> str:
@@ -173,6 +252,25 @@ def inventory_p6_dataset(data_root: Path) -> dict[str, dict[str, dict[str, Path]
 
 
 class CapturyBioBuddyGui(tk.Tk):
+    """Main Captury/Motive analysis window.
+
+    The class is intentionally a GUI coordinator rather than a numerical
+    analysis engine. Its responsibilities are split into five local regions:
+
+    * Tk variable creation and command preview synchronization;
+    * tab construction for data loading, occlusions, cutting, dimensions,
+      centres, markers, kinematics, visualization and advanced settings;
+    * non-blocking subprocess execution and log/status updates;
+    * lightweight CSV exploration through sortable tables and Matplotlib
+      canvases;
+    * synchronized right-hand 3D trial preview for C3D markers and CoR chains.
+
+    The generated command is the source of truth for computation. GUI plotting
+    code only reads existing CSV files from the selected output directory. This
+    keeps batch behavior testable from the CLI and makes the GUI safe to use as
+    an exploratory layer over cached results.
+    """
+
     def __init__(self) -> None:
         super().__init__(baseName="captury_biobuddy", className="CapturyBioBuddy")
         self.title("Captury BioBuddy")
@@ -190,6 +288,17 @@ class CapturyBioBuddyGui(tk.Tk):
         self.log_buffer = ""
         self.graph_panels: dict[str, dict[str, object]] = {}
         self.graph_payloads: dict[str, dict[str, dict[str, object]]] = {}
+        self.graph_drag_selection: dict[str, object] = {}
+        self.c3d_marker_cache: dict[tuple[str, int, int, str], C3DMarkerData] = {}
+        self.joint_chain_cache: dict[
+            tuple[str, int, int], JointCentreChainData | None
+        ] = {}
+        self.viewer_play_after_id: str | None = None
+        self.occlusion_sort_column = "marker_order"
+        self.occlusion_sort_descending = False
+        self.motive57_c3d_files: list[str] = []
+        self.motive57_role_combos: dict[str, ttk.Combobox] = {}
+        self.motive57_inventory_tree: ttk.Treeview | None = None
 
         self.vars: dict[str, tk.Variable] = {}
         self._create_variables()
@@ -197,6 +306,7 @@ class CapturyBioBuddyGui(tk.Tk):
         self._build_layout()
         self._bind_command_preview()
         self._update_command_preview()
+        self._update_embedded_trial_viewer()
         self.after(100, self._drain_output_queue)
 
     def _create_variables(self) -> None:
@@ -257,8 +367,13 @@ class CapturyBioBuddyGui(tk.Tk):
             "p6_trials": "",
             "selected_trial": ALL_TRIALS_LABEL,
             "p6_static_trial": "Static",
+            "p6_cut_mode": "manual",
+            "p6_time_start": "",
+            "p6_time_end": "",
             "p6_joint_filter": "",
+            "p6_auto_analyze": True,
             "p6_no_figures": True,
+            "p6_no_cache": False,
             "p6_model_source": "bvh",
             "p6_model_to_c3d_axis": "auto",
             "p6_no_mesh": False,
@@ -269,8 +384,16 @@ class CapturyBioBuddyGui(tk.Tk):
             "p6_visualize_trial": "",
             "p6_headless": False,
             "p6_rerun_wait_seconds": "1",
+            "biobuddy_c3d_folder": "/Users/mickaelbegon/Downloads/data/Motive",
+            "biobuddy_c3d_preset": "motive_57",
+            "biobuddy_c3d_output": "/tmp/motive_57.bioMod",
+            "biobuddy_c3d_mapping_json": "",
+            "biobuddy_c3d_with_mesh": False,
+            "biobuddy_c3d_no_default_virtual_points": False,
             "command_mode": COMMAND_MODES["kinematic"],
         }
+        for role in MOTIVE_57_C3D_ROLES:
+            defaults[f"motive57_role_{role.key}"] = ""
         for name, value in defaults.items():
             var_cls = tk.BooleanVar if isinstance(value, bool) else tk.StringVar
             self.vars[name] = var_cls(value=value)
@@ -287,6 +410,12 @@ class CapturyBioBuddyGui(tk.Tk):
         style.configure("Primary.TButton", padding=(12, 7))
         style.configure("Danger.TButton", padding=(12, 7))
         style.configure("Status.TLabel", foreground="#475569")
+        for source, color in DATA_SOURCE_COLORS.items():
+            style.configure(
+                f"{source.title()}.TCheckbutton",
+                background="#f6f7f8",
+                foreground=color,
+            )
 
     def _build_layout(self) -> None:
         root = ttk.Frame(self, padding=12)
@@ -317,10 +446,7 @@ class CapturyBioBuddyGui(tk.Tk):
             state="readonly",
             width=24,
         )
-        self.trial_combobox.grid(row=0, column=1, sticky="ew", padx=(8, 4))
-        ttk.Button(
-            trial_selector, text="Actualiser", command=self._refresh_trial_inventory
-        ).grid(row=0, column=2, sticky="ew")
+        self.trial_combobox.grid(row=0, column=1, sticky="ew", padx=(8, 0))
 
         body = ttk.PanedWindow(root, orient=tk.HORIZONTAL)
         body.grid(row=1, column=0, sticky="nsew")
@@ -337,6 +463,7 @@ class CapturyBioBuddyGui(tk.Tk):
         notebook.grid(row=0, column=0, sticky="nsew")
 
         self._build_loading_matching_tab(notebook)
+        self._build_biobuddy_c3d_model_tab(notebook)
         self._build_occlusions_tab(notebook)
         self._build_trial_cutting_tab(notebook)
         self._build_dimensions_tab(notebook)
@@ -344,13 +471,16 @@ class CapturyBioBuddyGui(tk.Tk):
         self._build_skin_markers_tab(notebook)
         self._build_kinematics_compare_tab(notebook)
         self._build_visualization_tab(notebook)
+        self._build_critical_methods_tab(notebook)
         self._build_advanced_tab(notebook)
 
+        right.rowconfigure(1, weight=1)
         right.columnconfigure(0, weight=1)
         self._build_actions(right)
+        self._build_embedded_trial_viewer(right)
         self._build_footer_tools(root)
         self._refresh_trial_inventory()
-        self._refresh_graphs()
+        self._refresh_results()
 
     def _tab(self, notebook: ttk.Notebook, title: str) -> ttk.Frame:
         frame = ttk.Frame(notebook, padding=12)
@@ -361,7 +491,7 @@ class CapturyBioBuddyGui(tk.Tk):
     def _analysis_action_row(self, parent: ttk.Widget, row: int) -> None:
         actions = ttk.Frame(parent)
         actions.grid(row=row, column=0, sticky="ew", pady=(12, 0))
-        for column in range(3):
+        for column in range(2):
             actions.columnconfigure(column, weight=1)
         run_button = ttk.Button(
             actions,
@@ -372,11 +502,8 @@ class CapturyBioBuddyGui(tk.Tk):
         run_button.grid(row=0, column=0, sticky="ew", padx=(0, 6))
         self.analysis_buttons.append(run_button)
         ttk.Button(actions, text="Copier commande", command=self._copy_p6_command).grid(
-            row=0, column=1, sticky="ew", padx=6
+            row=0, column=1, sticky="ew", padx=(6, 0)
         )
-        ttk.Button(
-            actions, text="Rafraîchir graphes", command=self._refresh_graphs
-        ).grid(row=0, column=2, sticky="ew", padx=(6, 0))
 
     def _build_loading_matching_tab(self, notebook: ttk.Notebook) -> None:
         tab = self._tab(notebook, "Données")
@@ -397,28 +524,50 @@ class CapturyBioBuddyGui(tk.Tk):
             "p6_model_to_c3d_axis",
             ("auto", "y_up_to_z_up", "identity"),
         )
+        self._combo_row(
+            data,
+            6,
+            "Root offset",
+            "root_offset_mode",
+            ("auto", "subtract", "keep"),
+        )
         inventory = ttk.LabelFrame(tab, text="Fichiers détectés")
         inventory.grid(row=1, column=0, sticky="nsew", pady=(12, 0))
         inventory.rowconfigure(0, weight=1)
         inventory.columnconfigure(0, weight=1)
-        self.inventory_tree = ttk.Treeview(
-            inventory,
-            columns=("system", "kind", "path"),
-            show="headings",
-            height=8,
-        )
-        self.inventory_tree.heading("system", text="Système")
-        self.inventory_tree.heading("kind", text="Type")
-        self.inventory_tree.heading("path", text="Fichier")
-        self.inventory_tree.column("system", width=90, stretch=False)
-        self.inventory_tree.column("kind", width=60, stretch=False)
-        self.inventory_tree.column("path", width=520, stretch=True)
-        self.inventory_tree.grid(row=0, column=0, sticky="nsew", padx=(8, 0), pady=8)
-        inventory_scrollbar = ttk.Scrollbar(
-            inventory, orient=tk.VERTICAL, command=self.inventory_tree.yview
-        )
-        self.inventory_tree.configure(yscrollcommand=inventory_scrollbar.set)
-        inventory_scrollbar.grid(row=0, column=1, sticky="ns", pady=8)
+        inventory.columnconfigure(1, weight=1)
+        self.inventory_trees: dict[str, ttk.Treeview] = {}
+        for column, system in enumerate(("Captury", "Motive")):
+            system_frame = ttk.LabelFrame(inventory, text=system)
+            system_frame.grid(
+                row=0,
+                column=column,
+                sticky="nsew",
+                padx=(8, 4) if column == 0 else (4, 8),
+                pady=8,
+            )
+            system_frame.rowconfigure(0, weight=1)
+            system_frame.columnconfigure(0, weight=1)
+            tree = ttk.Treeview(
+                system_frame,
+                columns=("kind", "vertical_axis", "path"),
+                show="headings",
+                height=6,
+                selectmode="browse",
+            )
+            tree.heading("kind", text="Type")
+            tree.heading("vertical_axis", text="Axe vertical")
+            tree.heading("path", text="Fichier")
+            tree.column("kind", width=60, stretch=False)
+            tree.column("vertical_axis", width=110, stretch=False)
+            tree.column("path", width=360, stretch=True)
+            tree.grid(row=0, column=0, sticky="nsew", padx=(8, 0), pady=8)
+            scrollbar = ttk.Scrollbar(
+                system_frame, orient=tk.VERTICAL, command=tree.yview
+            )
+            tree.configure(yscrollcommand=scrollbar.set)
+            scrollbar.grid(row=0, column=1, sticky="ns", pady=8)
+            self.inventory_trees[system] = tree
 
         systems = ttk.LabelFrame(tab, text="Systèmes comparés")
         systems.grid(row=2, column=0, sticky="ew", pady=(12, 0))
@@ -433,11 +582,171 @@ class CapturyBioBuddyGui(tk.Tk):
             [("JSON", "*.json"), ("Tous les fichiers", "*")],
         )
         self._analysis_action_row(tab, 3)
+
+    def _build_biobuddy_c3d_model_tab(self, notebook: ttk.Notebook) -> None:
+        tab = self._tab(notebook, "BioBuddy")
+        tab.rowconfigure(1, weight=1)
+        creation = ttk.LabelFrame(tab, text="Création modèle depuis C3D")
+        creation.grid(row=0, column=0, sticky="ew")
+        creation.columnconfigure(1, weight=1)
+        self._path_row(
+            creation,
+            0,
+            "Dossier C3D",
+            "biobuddy_c3d_folder",
+            directory=True,
+        )
+        self._combo_row(
+            creation,
+            1,
+            "Preset",
+            "biobuddy_c3d_preset",
+            (
+                "motive_57",
+                "full_body",
+                "lower_limbs",
+                "lower_limbs_anatomical",
+                "upper_limb",
+                "from_scratch",
+            ),
+        )
+        self._save_path_row(
+            creation,
+            2,
+            "Sortie bioMod",
+            "biobuddy_c3d_output",
+            [("bioMod", "*.bioMod"), ("Tous les fichiers", "*")],
+        )
+        self._path_row(
+            creation,
+            3,
+            "JSON rôles Motive 57",
+            "biobuddy_c3d_mapping_json",
+            [("JSON", "*.json"), ("Tous les fichiers", "*")],
+        )
+        self._check(creation, 4, "Écrire les meshes", "biobuddy_c3d_with_mesh")
+        self._check(
+            creation,
+            5,
+            "Ne pas ajouter les points virtuels par défaut",
+            "biobuddy_c3d_no_default_virtual_points",
+        )
+
+        mapping = ttk.LabelFrame(tab, text="Fichiers Motive 57")
+        mapping.grid(row=1, column=0, sticky="nsew", pady=(12, 0))
+        mapping.rowconfigure(1, weight=1)
+        mapping.columnconfigure(0, weight=1)
+        mapping.columnconfigure(1, weight=2)
+
+        mapping_actions = ttk.Frame(mapping)
+        mapping_actions.grid(
+            row=0, column=0, columnspan=2, sticky="ew", padx=10, pady=6
+        )
+        for column in range(4):
+            mapping_actions.columnconfigure(column, weight=1)
         ttk.Button(
-            tab,
-            text="Charger P6 debug",
-            command=self._load_p6_debug_preset,
-        ).grid(row=4, column=0, sticky="ew", pady=(12, 0))
+            mapping_actions,
+            text="Inventorier",
+            command=self._refresh_motive57_c3d_mapping,
+        ).grid(row=0, column=0, sticky="ew", padx=(0, 4))
+        ttk.Button(
+            mapping_actions,
+            text="Charger JSON",
+            command=self._load_motive57_mapping_json,
+        ).grid(row=0, column=1, sticky="ew", padx=4)
+        ttk.Button(
+            mapping_actions,
+            text="Sauver JSON",
+            command=self._save_motive57_mapping_json,
+        ).grid(row=0, column=2, sticky="ew", padx=4)
+        ttk.Button(
+            mapping_actions,
+            text="Inférer",
+            command=self._infer_motive57_mapping_from_files,
+        ).grid(row=0, column=3, sticky="ew", padx=(4, 0))
+
+        inventory_frame = ttk.Frame(mapping)
+        inventory_frame.grid(row=1, column=0, sticky="nsew", padx=(10, 6), pady=(0, 10))
+        inventory_frame.rowconfigure(0, weight=1)
+        inventory_frame.columnconfigure(0, weight=1)
+        self.motive57_inventory_tree = ttk.Treeview(
+            inventory_frame,
+            columns=("file",),
+            show="headings",
+            height=8,
+            selectmode="browse",
+        )
+        self.motive57_inventory_tree.heading("file", text="C3D Motive détectés")
+        self.motive57_inventory_tree.column("file", width=280, anchor="w")
+        inventory_scroll = ttk.Scrollbar(
+            inventory_frame,
+            orient=tk.VERTICAL,
+            command=self.motive57_inventory_tree.yview,
+        )
+        self.motive57_inventory_tree.configure(yscrollcommand=inventory_scroll.set)
+        self.motive57_inventory_tree.grid(row=0, column=0, sticky="nsew")
+        inventory_scroll.grid(row=0, column=1, sticky="ns")
+
+        roles_frame = ttk.Frame(mapping)
+        roles_frame.grid(row=1, column=1, sticky="nsew", padx=(6, 10), pady=(0, 10))
+        roles_frame.columnconfigure(1, weight=1)
+        for row, role in enumerate(MOTIVE_57_C3D_ROLES):
+            ttk.Label(roles_frame, text=role.label).grid(
+                row=row, column=0, sticky="w", padx=(0, 8), pady=3
+            )
+            combo = ttk.Combobox(
+                roles_frame,
+                textvariable=self.vars[f"motive57_role_{role.key}"],
+                values=("",),
+                state="readonly",
+            )
+            combo.grid(row=row, column=1, sticky="ew", pady=3)
+            self.motive57_role_combos[role.key] = combo
+            ttk.Label(roles_frame, text=role.method, style="Status.TLabel").grid(
+                row=row, column=2, sticky="w", padx=(8, 0), pady=3
+            )
+
+        actions = ttk.Frame(tab)
+        actions.grid(row=2, column=0, sticky="ew", pady=(12, 0))
+        for column in range(4):
+            actions.columnconfigure(column, weight=1)
+        run_button = ttk.Button(
+            actions,
+            text="Créer modèle",
+            style="Primary.TButton",
+            command=self._run_biobuddy_c3d_model_creation,
+        )
+        run_button.grid(row=0, column=0, sticky="ew", padx=(0, 6))
+        self.analysis_buttons.append(run_button)
+        ttk.Button(
+            actions,
+            text="Dossier Motive",
+            command=self._use_selected_motive_folder_for_biobuddy,
+        ).grid(row=0, column=1, sticky="ew", padx=6)
+        ttk.Button(
+            actions,
+            text="Copier commande",
+            command=self._copy_biobuddy_c3d_model_command,
+        ).grid(row=0, column=2, sticky="ew", padx=6)
+        ttk.Button(
+            actions,
+            text="Ouvrir dans BioBuddy",
+            command=self._open_biobuddy_c3d_model_in_explorer,
+        ).grid(row=0, column=3, sticky="ew", padx=(6, 0))
+
+        notes = ttk.LabelFrame(tab, text="Notes")
+        notes.grid(row=3, column=0, sticky="ew", pady=(12, 0))
+        ttk.Label(
+            notes,
+            text=(
+                "Ce panneau lance create_model_from_c3d_folder dans un subprocess. "
+                "La commande équivalente reste disponible dans le bouton Commande. "
+                "Le JSON Motive 57 mémorise la statique et les essais fonctionnels "
+                "SCoRE/SARA à réutiliser quand le même dossier est rechargé."
+            ),
+            style="Status.TLabel",
+            wraplength=760,
+        ).grid(row=0, column=0, sticky="w", padx=10, pady=8)
 
     def _build_occlusions_tab(self, notebook: ttk.Notebook) -> None:
         tab = self._tab(notebook, "Occlusions")
@@ -445,10 +754,9 @@ class CapturyBioBuddyGui(tk.Tk):
         panel = ttk.LabelFrame(tab, text="Marqueurs Motive")
         panel.grid(row=0, column=0, sticky="ew")
         panel.columnconfigure(1, weight=1)
-        self._path_row(panel, 0, "Sortie", "p6_out_dir", directory=True)
-        self._check(panel, 1, "Ne pas générer les PNG", "p6_no_figures")
+        self._check(panel, 0, "Ne pas générer les PNG", "p6_no_figures")
         self._analysis_action_row(tab, 1)
-        self._build_graph_panel(tab, 2, "occlusions")
+        self._build_occlusion_table_panel(tab, 2)
 
     def _build_trial_cutting_tab(self, notebook: ttk.Notebook) -> None:
         tab = self._tab(notebook, "Découpage")
@@ -457,11 +765,20 @@ class CapturyBioBuddyGui(tk.Tk):
         panel.grid(row=0, column=0, sticky="ew")
         panel.columnconfigure(1, weight=1)
         self._entry_row(panel, 0, "Essai statique", "p6_static_trial")
-        self._check(panel, 1, "Visualiser un essai enrichi", "p6_visualize")
-        self._entry_row(panel, 2, "Essai visualisé", "p6_visualize_trial")
+        self._combo_row(
+            panel,
+            1,
+            "Mode découpage",
+            "p6_cut_mode",
+            ("manual", "movement", "full"),
+        )
+        self._entry_row(panel, 2, "Début manuel (s)", "p6_time_start")
+        self._entry_row(panel, 3, "Fin manuelle (s)", "p6_time_end")
+        self._check(panel, 4, "Visualiser un essai enrichi", "p6_visualize")
+        self._entry_row(panel, 5, "Essai visualisé", "p6_visualize_trial")
         ttk.Button(
             panel, text="Ouvrir visu 3D C3D", command=self._open_selected_trial_viewer
-        ).grid(row=3, column=0, columnspan=3, sticky="ew", padx=10, pady=6)
+        ).grid(row=6, column=0, columnspan=3, sticky="ew", padx=10, pady=6)
         self._analysis_action_row(tab, 1)
         self._build_graph_panel(tab, 2, "events")
 
@@ -541,6 +858,43 @@ class CapturyBioBuddyGui(tk.Tk):
         self._check(panel, 4, "Ne pas générer les PNG", "p6_no_figures")
         self._analysis_action_row(tab, 1)
 
+    def _build_critical_methods_tab(self, notebook: ttk.Notebook) -> None:
+        tab = self._tab(notebook, "Critique")
+        tab.rowconfigure(0, weight=1)
+
+        panel = ttk.LabelFrame(tab, text="Algorithmes sensibles et contrôles")
+        panel.grid(row=0, column=0, sticky="nsew")
+        panel.rowconfigure(0, weight=1)
+        panel.columnconfigure(0, weight=1)
+
+        text = tk.Text(
+            panel,
+            wrap=tk.WORD,
+            height=20,
+            font=("TkDefaultFont", 10),
+            relief=tk.FLAT,
+            background="#ffffff",
+            foreground="#1f2933",
+        )
+        scrollbar = ttk.Scrollbar(panel, orient=tk.VERTICAL, command=text.yview)
+        text.configure(yscrollcommand=scrollbar.set)
+        text.grid(row=0, column=0, sticky="nsew", padx=(10, 0), pady=10)
+        scrollbar.grid(row=0, column=1, sticky="ns", pady=10)
+        text.tag_configure("title", font=("TkDefaultFont", 11, "bold"))
+        text.tag_configure("label", font=("TkDefaultFont", 10, "bold"))
+
+        for index, note in enumerate(CRITICAL_METHOD_NOTES, start=1):
+            if index > 1:
+                text.insert(tk.END, "\n")
+            text.insert(tk.END, f"{index}. {note['title']}\n", "title")
+            text.insert(tk.END, "Algorithme: ", "label")
+            text.insert(tk.END, f"{note['algorithm']}\n")
+            text.insert(tk.END, "Risque: ", "label")
+            text.insert(tk.END, f"{note['risk']}\n")
+            text.insert(tk.END, "À vérifier: ", "label")
+            text.insert(tk.END, f"{note['check']}\n")
+        text.configure(state=tk.DISABLED)
+
     def _build_sources_tab(self, notebook: ttk.Notebook) -> None:
         tab = self._tab(notebook, "Sources")
         card = ttk.LabelFrame(tab, text="Fichiers")
@@ -573,9 +927,8 @@ class CapturyBioBuddyGui(tk.Tk):
         kinematic.grid(row=2, column=0, sticky="ew", pady=(12, 0))
         kinematic.columnconfigure(1, weight=1)
         self._path_row(kinematic, 0, "Dossier racine", "p6_data_root", directory=True)
-        self._path_row(kinematic, 1, "Sortie", "p6_out_dir", directory=True)
-        self._entry_row(kinematic, 2, "Essais", "p6_trials")
-        self._entry_row(kinematic, 3, "Essai statique", "p6_static_trial")
+        self._entry_row(kinematic, 1, "Essais", "p6_trials")
+        self._entry_row(kinematic, 2, "Essai statique", "p6_static_trial")
 
     def _build_model_tab(self, notebook: ttk.Notebook) -> None:
         tab = self._tab(notebook, "Modèles")
@@ -637,17 +990,25 @@ class CapturyBioBuddyGui(tk.Tk):
             "p6_model_to_c3d_axis",
             ("auto", "y_up_to_z_up", "identity"),
         )
-        self._check(chain_compare, 2, "Ne pas extraire les meshes FBX", "p6_no_mesh")
-        self._entry_row(chain_compare, 3, "Max points mesh", "p6_max_mesh_points")
+        self._combo_row(
+            chain_compare,
+            2,
+            "Root offset",
+            "root_offset_mode",
+            ("auto", "subtract", "keep"),
+        )
+        self._check(chain_compare, 3, "Ne pas extraire les meshes FBX", "p6_no_mesh")
+        self._entry_row(chain_compare, 4, "Max points mesh", "p6_max_mesh_points")
         ttk.Label(
             chain_compare,
             text=(
                 "Utilise BVH/FBX pour construire les modèles BioBuddy/biorbd des deux systèmes. "
-                "Le mode y_up_to_z_up place la hauteur modèle sur Z avant écriture dans le C3D cible."
+                "Le mode y_up_to_z_up place la hauteur modèle sur Z avant écriture dans le C3D cible. "
+                "Root offset auto compare keep/subtract avec le C3D et retient la meilleure superposition."
             ),
             style="Status.TLabel",
             wraplength=760,
-        ).grid(row=4, column=0, columnspan=3, sticky="w", padx=10, pady=(4, 10))
+        ).grid(row=5, column=0, columnspan=3, sticky="w", padx=10, pady=(4, 10))
 
         explorer = ttk.LabelFrame(tab, text="Explorateur BioBuddy")
         explorer.grid(row=3, column=0, sticky="ew", pady=(12, 0))
@@ -907,6 +1268,8 @@ class CapturyBioBuddyGui(tk.Tk):
         ttk.Label(environment, text=f"Script: {PIPELINE_SCRIPT}", wraplength=760).grid(
             row=1, column=0, sticky="w", padx=10, pady=(0, 8)
         )
+        self._check(environment, 2, "Ignorer le cache", "p6_no_cache")
+        self._check(environment, 3, "Analyse auto au choix d'essai", "p6_auto_analyze")
 
     def _build_actions(self, parent: ttk.Frame) -> None:
         actions = ttk.LabelFrame(parent, text="Exécution")
@@ -938,6 +1301,102 @@ class CapturyBioBuddyGui(tk.Tk):
             row=1, column=0, columnspan=3, sticky="w", padx=8, pady=(0, 8)
         )
 
+    def _build_embedded_trial_viewer(self, parent: ttk.Frame) -> None:
+        panel = ttk.LabelFrame(parent, text="Visu 3D essai")
+        panel.grid(row=1, column=0, sticky="nsew")
+        panel.rowconfigure(3, weight=1)
+        panel.columnconfigure(0, weight=1)
+
+        header = ttk.Frame(panel)
+        header.grid(row=0, column=0, sticky="ew", padx=8, pady=(8, 4))
+        header.columnconfigure(0, weight=1)
+        self.viewer_path_var = tk.StringVar(value="Aucun C3D")
+        ttk.Label(
+            header, textvariable=self.viewer_path_var, style="Status.TLabel"
+        ).grid(row=0, column=0, sticky="w")
+        ttk.Button(
+            header, text="Grande fenêtre", command=self._open_selected_trial_viewer
+        ).grid(row=0, column=1, sticky="e", padx=(8, 0))
+
+        view_bar = ttk.Frame(panel)
+        view_bar.grid(row=1, column=0, sticky="ew", padx=8, pady=(0, 4))
+        view_bar.columnconfigure(1, weight=1)
+        ttk.Label(view_bar, text="Vue").grid(row=0, column=0, sticky="w")
+        self.viewer_view_var = tk.StringVar(value="Face")
+        self.viewer_view_combo = ttk.Combobox(
+            view_bar,
+            textvariable=self.viewer_view_var,
+            values=("Face", "Dos", "Côté", "XY", "YZ", "XZ"),
+            state="readonly",
+            width=16,
+        )
+        self.viewer_view_combo.grid(row=0, column=1, sticky="ew", padx=(8, 0))
+        self.viewer_view_combo.bind(
+            "<<ComboboxSelected>>", lambda _event: self._apply_embedded_view()
+        )
+        layer_controls = ttk.Frame(panel)
+        layer_controls.grid(row=2, column=0, sticky="ew", padx=8, pady=(0, 4))
+        ttk.Label(layer_controls, text="Marqueurs").grid(row=0, column=0, sticky="w")
+        self.viewer_marker_layer_vars: dict[str, tk.BooleanVar] = {}
+        for column, layer in enumerate(("captury", "motive"), start=1):
+            var = tk.BooleanVar(value=True)
+            self.viewer_marker_layer_vars[layer] = var
+            ttk.Checkbutton(
+                layer_controls,
+                text=COR_LAYER_LABELS[layer],
+                variable=var,
+                command=self._update_visible_marker_layers,
+                style=f"{layer.title()}.TCheckbutton",
+            ).grid(row=0, column=column, sticky="w", padx=(8, 0))
+
+        ttk.Label(layer_controls, text="Chaîne CoR").grid(
+            row=1, column=0, sticky="w", pady=(4, 0)
+        )
+        self.viewer_cor_layer_vars: dict[str, tk.BooleanVar] = {}
+        for column, layer in enumerate(("captury", "motive", "biobuddy"), start=1):
+            var = tk.BooleanVar(value=layer in {"captury", "motive"})
+            self.viewer_cor_layer_vars[layer] = var
+            ttk.Checkbutton(
+                layer_controls,
+                text=COR_LAYER_LABELS[layer],
+                variable=var,
+                command=self._update_visible_cor_layers,
+                style=f"{layer.title()}.TCheckbutton",
+            ).grid(row=1, column=column, sticky="w", padx=(8, 0), pady=(4, 0))
+        self.viewer_chain_axes_var = tk.BooleanVar(value=False)
+        ttk.Checkbutton(
+            layer_controls,
+            text="Repères XYZ",
+            variable=self.viewer_chain_axes_var,
+            command=self._update_visible_cor_layers,
+        ).grid(row=1, column=4, sticky="w", padx=(8, 0), pady=(4, 0))
+
+        self.embedded_viewer = TkC3DTrialCanvas(panel)
+        self.embedded_viewer.grid(row=3, column=0, sticky="nsew", padx=8, pady=4)
+
+        controls = ttk.Frame(panel)
+        controls.grid(row=4, column=0, sticky="ew", padx=8, pady=(4, 8))
+        controls.columnconfigure(1, weight=1)
+        self.viewer_playing = tk.BooleanVar(value=False)
+        self.viewer_play_button = ttk.Button(
+            controls, text="▶", width=3, command=self._toggle_embedded_viewer_play
+        )
+        self.viewer_play_button.grid(row=0, column=0, sticky="w", padx=(0, 6))
+        self.viewer_frame_var = tk.IntVar(value=0)
+        self.viewer_frame_slider = ttk.Scale(
+            controls,
+            from_=0,
+            to=0,
+            orient=tk.HORIZONTAL,
+            variable=self.viewer_frame_var,
+            command=self._on_embedded_viewer_slider,
+        )
+        self.viewer_frame_slider.grid(row=0, column=1, sticky="ew")
+        self.viewer_frame_label_var = tk.StringVar(value="0 / 0")
+        ttk.Label(controls, textvariable=self.viewer_frame_label_var, width=12).grid(
+            row=0, column=2, sticky="e", padx=(8, 0)
+        )
+
     def _build_footer_tools(self, parent: ttk.Frame) -> None:
         footer = ttk.Frame(parent)
         footer.grid(row=2, column=0, sticky="ew", pady=(10, 0))
@@ -965,6 +1424,34 @@ class CapturyBioBuddyGui(tk.Tk):
         self.log_text.grid(row=0, column=0, sticky="nsew")
         scrollbar.grid(row=0, column=1, sticky="ns")
 
+    def _build_occlusion_table_panel(self, parent: ttk.Widget, row: int) -> None:
+        panel = ttk.LabelFrame(parent, text="Tableau des occlusions")
+        panel.grid(row=row, column=0, sticky="nsew", pady=(12, 0))
+        panel.rowconfigure(0, weight=1)
+        panel.columnconfigure(0, weight=1)
+
+        table_frame = ttk.Frame(panel)
+        table_frame.grid(row=0, column=0, sticky="nsew", padx=8, pady=8)
+        table_frame.rowconfigure(0, weight=1)
+        table_frame.columnconfigure(0, weight=1)
+        self.occlusion_table = ttk.Treeview(
+            table_frame,
+            columns=("marker", "missing_percent", "missing_frames", "total_frames"),
+            show="headings",
+            height=14,
+        )
+        self._set_occlusion_table_headings()
+        self.occlusion_table.column("marker", width=180, stretch=True)
+        self.occlusion_table.column("missing_percent", width=110, anchor=tk.E)
+        self.occlusion_table.column("missing_frames", width=140, anchor=tk.E)
+        self.occlusion_table.column("total_frames", width=120, anchor=tk.E)
+        self.occlusion_table.grid(row=0, column=0, sticky="nsew")
+        scrollbar = ttk.Scrollbar(
+            table_frame, orient=tk.VERTICAL, command=self.occlusion_table.yview
+        )
+        self.occlusion_table.configure(yscrollcommand=scrollbar.set)
+        scrollbar.grid(row=0, column=1, sticky="ns")
+
     def _build_graph_panel(self, parent: ttk.Widget, row: int, graph_kind: str) -> None:
         title = (
             "Découpage et contacts"
@@ -973,22 +1460,14 @@ class CapturyBioBuddyGui(tk.Tk):
         )
         panel = ttk.LabelFrame(parent, text=f"Graphiques - {title}")
         panel.grid(row=row, column=0, sticky="nsew", pady=(12, 0))
-        panel.rowconfigure(1, weight=1)
+        panel.rowconfigure(0, weight=1)
         panel.columnconfigure(1, weight=1)
 
-        controls = ttk.Frame(panel)
-        controls.grid(row=0, column=0, columnspan=2, sticky="ew", padx=8, pady=8)
-        ttk.Button(
-            controls,
-            text="Actualiser",
-            command=lambda kind=graph_kind: self._populate_graph_tree(kind),
-        ).grid(row=0, column=0, sticky="w")
-
         tree_frame = ttk.Frame(panel)
-        tree_frame.grid(row=1, column=0, sticky="nsew", padx=(8, 4), pady=(0, 8))
+        tree_frame.grid(row=0, column=0, sticky="nsew", padx=(8, 4), pady=8)
         tree_frame.rowconfigure(0, weight=1)
         tree_frame.columnconfigure(0, weight=1)
-        tree = ttk.Treeview(tree_frame, show="tree", height=10)
+        tree = ttk.Treeview(tree_frame, show="tree", height=10, selectmode="extended")
         tree.grid(row=0, column=0, sticky="nsew")
         tree_scrollbar = ttk.Scrollbar(
             tree_frame, orient=tk.VERTICAL, command=tree.yview
@@ -999,9 +1478,15 @@ class CapturyBioBuddyGui(tk.Tk):
             "<<TreeviewSelect>>",
             lambda _event, kind=graph_kind: self._draw_selected_graph(kind),
         )
+        tree.bind(
+            "<Button-1>",
+            lambda event, kind=graph_kind: self._toggle_graph_tree_selection(
+                event, kind
+            ),
+        )
 
         graph_frame = ttk.Frame(panel)
-        graph_frame.grid(row=1, column=1, sticky="nsew", padx=(4, 8), pady=(0, 8))
+        graph_frame.grid(row=0, column=1, sticky="nsew", padx=(4, 8), pady=8)
         graph_frame.rowconfigure(0, weight=1)
         graph_frame.columnconfigure(0, weight=1)
 
@@ -1016,6 +1501,10 @@ class CapturyBioBuddyGui(tk.Tk):
             canvas = FigureCanvasTkAgg(figure, master=graph_frame)
             canvas.get_tk_widget().grid(row=0, column=0, sticky="nsew")
             panel_data.update({"figure": figure, "axes": axes, "canvas": canvas})
+            if graph_kind == "events":
+                canvas.mpl_connect("button_press_event", self._on_phase_drag_press)
+                canvas.mpl_connect("motion_notify_event", self._on_phase_drag_motion)
+                canvas.mpl_connect("button_release_event", self._on_phase_drag_release)
         else:
             ttk.Label(
                 graph_frame,
@@ -1029,11 +1518,330 @@ class CapturyBioBuddyGui(tk.Tk):
         for graph_kind in self.graph_panels:
             self._populate_graph_tree(graph_kind)
 
+    def _refresh_results(self) -> None:
+        self._populate_occlusion_table()
+        self._refresh_graphs()
+        self._update_embedded_joint_chain()
+
+    def _c3d_cache_key(self, path: Path) -> tuple[str, int, int, str]:
+        resolved = path.expanduser().resolve()
+        stat = resolved.stat()
+        return (
+            str(resolved),
+            stat.st_size,
+            stat.st_mtime_ns,
+            str(self.vars["angle_label_regex"].get()),
+        )
+
+    def _load_cached_c3d_marker_data(self, path: Path) -> C3DMarkerData:
+        key = self._c3d_cache_key(path)
+        if key not in self.c3d_marker_cache:
+            self.c3d_marker_cache[key] = load_c3d_marker_data(
+                path, angle_label_regex=str(self.vars["angle_label_regex"].get())
+            )
+        return self.c3d_marker_cache[key]
+
+    def _selected_trial_report_path(self) -> Path | None:
+        selected = str(self.vars["selected_trial"].get()).strip()
+        if not selected or selected == ALL_TRIALS_LABEL:
+            return None
+        path = (
+            self._graph_output_root()
+            / safe_trial_dir_name(selected)
+            / "run_report.json"
+        )
+        return path if path.exists() else None
+
+    def _captury_marker_display_transform(self) -> tuple[np.ndarray, np.ndarray] | None:
+        report_path = self._selected_trial_report_path()
+        if report_path is None:
+            return None
+        try:
+            report = json.loads(report_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as exc:
+            self._append_log(
+                f"\nAlignement marqueurs Captury indisponible pour {report_path}: {exc}\n"
+            )
+            return None
+        return captury_marker_transform_from_report(report)
+
+    def _load_cached_joint_chain_data(self, path: Path) -> JointCentreChainData | None:
+        key = self._c3d_cache_key(path)
+        if key not in self.joint_chain_cache:
+            self.joint_chain_cache[key] = load_joint_centre_chain_data(path)
+        return self.joint_chain_cache[key]
+
+    def _selected_trial_joint_chain_path(self) -> Path | None:
+        selected = str(self.vars["selected_trial"].get()).strip()
+        if not selected or selected == ALL_TRIALS_LABEL:
+            return None
+        npz_path = (
+            self._graph_output_root()
+            / safe_trial_dir_name(selected)
+            / "joint_centre_timeseries.npz"
+        )
+        if npz_path.exists():
+            return npz_path
+        csv_path = (
+            self._graph_output_root()
+            / safe_trial_dir_name(selected)
+            / "joint_centre_timeseries.csv"
+        )
+        return csv_path if csv_path.exists() else None
+
+    def _update_embedded_trial_viewer(self) -> None:
+        if not hasattr(self, "embedded_viewer"):
+            return
+        c3d_paths = self._selected_trial_c3d_paths()
+        if not c3d_paths:
+            self._stop_embedded_viewer_play()
+            self.viewer_path_var.set("Aucun C3D pour l'essai sélectionné")
+            self.embedded_viewer.set_marker_layers({})
+            self.embedded_viewer.set_joint_centre_chains(None)
+            self.viewer_frame_slider.configure(from_=0, to=0)
+            self.viewer_frame_var.set(0)
+            self.viewer_frame_label_var.set("0 / 0")
+            return
+        layers: dict[str, C3DMarkerData] = {}
+        failed: list[str] = []
+        for source, c3d_path in c3d_paths.items():
+            try:
+                data = self._load_cached_c3d_marker_data(c3d_path)
+                layers[source.lower()] = data
+            except Exception as exc:
+                failed.append(source)
+                self._append_log(f"\nVisu 3D C3D impossible pour {c3d_path}: {exc}\n")
+        captury_transform = None
+        if "captury" in layers and "motive" in layers:
+            captury_transform = captury_marker_transform_from_c3d_layers(
+                layers["captury"], layers["motive"]
+            )
+        if captury_transform is None:
+            captury_transform = self._captury_marker_display_transform()
+        if "captury" in layers and captury_transform is not None:
+            layers["captury"] = transformed_marker_data(
+                layers["captury"], *captury_transform
+            )
+        if not layers:
+            self._stop_embedded_viewer_play()
+            self.viewer_path_var.set("Lecture C3D impossible")
+            self.embedded_viewer.set_marker_layers({})
+            self.embedded_viewer.set_joint_centre_chains(None)
+            self.viewer_frame_label_var.set("0 / 0")
+            return
+        self.embedded_viewer.set_marker_layers(layers)
+        self._update_visible_marker_layers()
+        self._update_embedded_joint_chain()
+        max_frame = max(0, self.embedded_viewer.n_frames - 1)
+        self.viewer_frame_slider.configure(from_=0, to=max_frame)
+        self.viewer_frame_var.set(0)
+        self.viewer_frame_label_var.set(f"1 / {self.embedded_viewer.n_frames}")
+        display_parts: list[str] = []
+        for source in ("Motive", "Captury"):
+            path = c3d_paths.get(source)
+            if path is None or source.lower() not in layers:
+                continue
+            try:
+                display_path = path.relative_to(PROJECT_DIR).as_posix()
+            except ValueError:
+                display_path = str(path)
+            display_parts.append(f"{source}: {display_path}")
+        if failed:
+            display_parts.append(f"Échec: {', '.join(failed)}")
+        self.viewer_path_var.set(" | ".join(display_parts))
+        self._apply_embedded_view()
+
+    def _update_embedded_joint_chain(self) -> None:
+        if not hasattr(self, "embedded_viewer"):
+            return
+        chain_path = self._selected_trial_joint_chain_path()
+        if chain_path is None:
+            self.embedded_viewer.set_joint_centre_chains(None)
+            return
+        try:
+            chain_data = self._load_cached_joint_chain_data(chain_path)
+        except Exception as exc:
+            self.embedded_viewer.set_joint_centre_chains(None)
+            self._append_log(f"\nChaîne CoR impossible pour {chain_path}: {exc}\n")
+            return
+        self.embedded_viewer.set_joint_centre_chains(chain_data)
+        self._update_visible_cor_layers()
+
+    def _update_visible_cor_layers(self) -> None:
+        if not hasattr(self, "embedded_viewer") or not hasattr(
+            self, "viewer_cor_layer_vars"
+        ):
+            return
+        layers = [
+            layer
+            for layer, var in self.viewer_cor_layer_vars.items()
+            if bool(var.get())
+        ]
+        self.embedded_viewer.set_visible_cor_layers(layers)
+        if hasattr(self, "viewer_chain_axes_var"):
+            self.embedded_viewer.set_show_chain_axes(
+                bool(self.viewer_chain_axes_var.get())
+            )
+
+    def _update_visible_marker_layers(self) -> None:
+        if not hasattr(self, "embedded_viewer") or not hasattr(
+            self, "viewer_marker_layer_vars"
+        ):
+            return
+        sources = [
+            source
+            for source, var in self.viewer_marker_layer_vars.items()
+            if bool(var.get())
+        ]
+        self.embedded_viewer.set_visible_marker_sources(sources)
+
+    def _apply_embedded_view(self) -> None:
+        if not hasattr(self, "embedded_viewer"):
+            return
+        selected = str(self.viewer_view_var.get()).strip()
+        if selected in {"XY", "YZ", "XZ", "ZX"}:
+            self.embedded_viewer.set_camera_plane(selected)
+            return
+        subject_views = {"Face": "face", "Dos": "dos", "Côté": "cote"}
+        self.embedded_viewer.set_subject_view(subject_views.get(selected, "face"))
+
+    def _on_embedded_viewer_slider(self, value: str) -> None:
+        if not hasattr(self, "embedded_viewer"):
+            return
+        frame = int(float(value))
+        self.embedded_viewer.set_frame(frame)
+        n_frames = self.embedded_viewer.n_frames
+        if n_frames <= 0:
+            self.viewer_frame_label_var.set("0 / 0")
+        else:
+            self.viewer_frame_label_var.set(f"{frame + 1} / {n_frames}")
+
+    def _toggle_embedded_viewer_play(self) -> None:
+        if self.viewer_playing.get():
+            self._stop_embedded_viewer_play()
+            return
+        n_frames = (
+            self.embedded_viewer.n_frames if hasattr(self, "embedded_viewer") else 0
+        )
+        if n_frames <= 0:
+            return
+        self.viewer_playing.set(True)
+        self.viewer_play_button.configure(text="⏸")
+        self._advance_embedded_viewer_frame()
+
+    def _stop_embedded_viewer_play(self) -> None:
+        if self.viewer_play_after_id is not None:
+            self.after_cancel(self.viewer_play_after_id)
+            self.viewer_play_after_id = None
+        if hasattr(self, "viewer_playing"):
+            self.viewer_playing.set(False)
+        if hasattr(self, "viewer_play_button"):
+            self.viewer_play_button.configure(text="▶")
+
+    def _advance_embedded_viewer_frame(self) -> None:
+        if not self.viewer_playing.get():
+            return
+        n_frames = self.embedded_viewer.n_frames
+        if n_frames <= 0:
+            self._stop_embedded_viewer_play()
+            return
+        next_frame = (int(self.viewer_frame_var.get()) + 1) % max(1, n_frames)
+        self.viewer_frame_var.set(next_frame)
+        self.embedded_viewer.set_frame(next_frame)
+        self.viewer_frame_label_var.set(f"{next_frame + 1} / {n_frames}")
+        data = self.embedded_viewer.data
+        rate = data.rate if data is not None else 60.0
+        interval = max(15, int(1000.0 / min(max(rate, 1.0), 60.0)))
+        self.viewer_play_after_id = self.after(
+            interval, self._advance_embedded_viewer_frame
+        )
+
     def _graph_output_root(self) -> Path:
         return self._resolve(str(self.vars["p6_out_dir"].get()).strip())
 
     def _graph_csv_path(self, graph_kind: str) -> Path:
         return self._graph_output_root() / str(GRAPH_CONFIGS[graph_kind]["csv"])
+
+    def _occlusion_csv_path(self) -> Path:
+        return self._graph_output_root() / "all_motive_marker_occlusions.csv"
+
+    def _set_occlusion_table_headings(self) -> None:
+        labels = {
+            "marker": "Marqueur",
+            "missing_percent": "Occlusion (%)",
+            "missing_frames": "Frames manquantes",
+            "total_frames": "Frames totales",
+        }
+        for column, label in labels.items():
+            indicator = ""
+            if column == self._display_occlusion_sort_column():
+                indicator = " ↓" if self.occlusion_sort_descending else " ↑"
+            self.occlusion_table.heading(
+                column,
+                text=f"{label}{indicator}",
+                command=lambda column=column: self._sort_occlusions_by_column(column),
+            )
+
+    def _display_occlusion_sort_column(self) -> str:
+        return (
+            "marker"
+            if self.occlusion_sort_column in {"marker", "marker_order"}
+            else self.occlusion_sort_column
+        )
+
+    def _sort_occlusions_by_column(self, column: str) -> None:
+        sort_column = "marker_order" if column == "marker" else column
+        if sort_column == self.occlusion_sort_column:
+            self.occlusion_sort_descending = not self.occlusion_sort_descending
+        else:
+            self.occlusion_sort_column = sort_column
+            self.occlusion_sort_descending = column != "marker"
+        self._set_occlusion_table_headings()
+        self._populate_occlusion_table()
+
+    def _sorted_occlusion_dataframe(self, dataframe: "pd.DataFrame") -> "pd.DataFrame":
+        values = dataframe.copy()
+        if "marker" not in values.columns:
+            return values
+        values["display_marker"] = values["marker"].map(display_marker_name)
+        if "marker_order" not in values.columns:
+            values["marker_order"] = list(range(len(values)))
+        sort_column = self.occlusion_sort_column
+        if sort_column not in values.columns:
+            sort_column = "marker_order"
+        if sort_column in {"marker", "raw_marker"}:
+            primary = "display_marker"
+        else:
+            primary = sort_column
+        return values.sort_values(
+            [primary, "display_marker"],
+            ascending=[not self.occlusion_sort_descending, True],
+        )
+
+    def _populate_occlusion_table(self) -> None:
+        if pd is None or not hasattr(self, "occlusion_table"):
+            return
+        table = self.occlusion_table
+        table.delete(*table.get_children())
+        path = self._occlusion_csv_path()
+        if not path.exists() or path.stat().st_size == 0:
+            return
+        dataframe = pd.read_csv(path)
+        selected = str(self.vars["selected_trial"].get()).strip()
+        if selected and selected != ALL_TRIALS_LABEL and "trial" in dataframe.columns:
+            dataframe = dataframe[dataframe["trial"].astype(str) == selected]
+        dataframe = self._sorted_occlusion_dataframe(dataframe)
+        for _index, row in dataframe.iterrows():
+            table.insert(
+                "",
+                tk.END,
+                values=(
+                    display_marker_name(row.get("marker", "")),
+                    f"{float(row.get('missing_percent', 0.0)):.2f}",
+                    int(row.get("missing_frames", 0)),
+                    int(row.get("total_frames", 0)),
+                ),
+            )
 
     def _selected_graph_trials(self, available_trials: Iterable[str]) -> list[str]:
         trials = sorted(str(trial) for trial in available_trials)
@@ -1186,6 +1994,27 @@ class CapturyBioBuddyGui(tk.Tk):
         }
         return node_id
 
+    def _toggle_graph_tree_selection(
+        self, event: tk.Event, graph_kind: str
+    ) -> str | None:
+        tree = event.widget
+        if not isinstance(tree, ttk.Treeview):
+            return None
+        node_id = tree.identify_row(event.y)
+        if not node_id or node_id not in self.graph_payloads.get(graph_kind, {}):
+            return None
+        if node_id in tree.selection():
+            tree.selection_remove(node_id)
+            self.after_idle(lambda kind=graph_kind: self._draw_selected_graph(kind))
+            return "break"
+        return None
+
+    def _selected_graph_payloads(
+        self, graph_kind: str, selection: tuple[str, ...]
+    ) -> list[dict[str, object]]:
+        payloads = self.graph_payloads.get(graph_kind, {})
+        return [payloads[node_id] for node_id in selection if node_id in payloads]
+
     def _draw_selected_graph(self, graph_kind: str) -> None:
         panel = self.graph_panels.get(graph_kind)
         if not panel or "axes" not in panel:
@@ -1195,15 +2024,17 @@ class CapturyBioBuddyGui(tk.Tk):
         selection = tree.selection()
         if not selection:
             return
-        payload = self.graph_payloads.get(graph_kind, {}).get(selection[0])
-        if not payload:
+        payloads = self._selected_graph_payloads(graph_kind, selection)
+        if not payloads:
             return
         if graph_kind == "events":
-            self._draw_events_graph(graph_kind, payload)
+            self._draw_events_graph(graph_kind, payloads[0])
         else:
-            self._draw_metric_graph(graph_kind, payload)
+            self._draw_metric_graph(graph_kind, payloads)
 
-    def _draw_metric_graph(self, graph_kind: str, payload: dict[str, object]) -> None:
+    def _draw_metric_graph(
+        self, graph_kind: str, payloads: list[dict[str, object]]
+    ) -> None:
         if pd is None:
             return
         panel = self.graph_panels[graph_kind]
@@ -1211,14 +2042,38 @@ class CapturyBioBuddyGui(tk.Tk):
         canvas = panel["canvas"]
         config = GRAPH_CONFIGS[graph_kind]
         dataframe = pd.read_csv(self._graph_csv_path(graph_kind))
-        filters = dict(payload["filters"])
-        metric = str(payload["metric"])
-        for column, value in filters.items():
-            if column in dataframe.columns:
-                dataframe = dataframe[dataframe[column].astype(str) == str(value)]
+        if graph_kind == "kinematics":
+            self._draw_kinematics_graph(payloads, dataframe)
+            return
+        if graph_kind == "centres" and self._draw_joint_centre_graph(payloads):
+            return
+        series = self._metric_series_from_payloads(dataframe, payloads, config)
         axes.clear()
-        if dataframe.empty or metric not in dataframe.columns:
+        if not series:
             axes.set_title("Aucune donnée")
+            canvas.draw_idle()
+            return
+        selected_metrics = sorted({item["metric"] for item in series})
+        metric = selected_metrics[0]
+        dataframe = pd.concat(
+            [item["dataframe"] for item in series if item["metric"] == metric],
+            ignore_index=True,
+        ).drop_duplicates()
+        if graph_kind == "dimensions":
+            if len(selected_metrics) == 1:
+                self._draw_dimension_metric_graph(axes, dataframe, metric)
+            else:
+                self._draw_metric_boxplot(
+                    axes, series, f"{config['title']} - métriques sélectionnées"
+                )
+            panel["figure"].tight_layout()
+            canvas.draw_idle()
+            return
+        if len(series) > 1 or len(dataframe) > 8:
+            self._draw_metric_boxplot(
+                axes, series, f"{config['title']} - métriques sélectionnées"
+            )
+            panel["figure"].tight_layout()
             canvas.draw_idle()
             return
         group_columns = [
@@ -1238,6 +2093,370 @@ class CapturyBioBuddyGui(tk.Tk):
         axes.grid(axis="y", alpha=0.3)
         panel["figure"].tight_layout()
         canvas.draw_idle()
+
+    @staticmethod
+    def _is_rotation_q_name(q_name: str) -> bool:
+        return is_rotation_q_name(q_name)
+
+    @staticmethod
+    def _metric_display_name(metric: str, *, q_name: str | None = None) -> str:
+        return metric_display_name(metric, q_name=q_name)
+
+    @staticmethod
+    def _values_for_display(
+        values: "pd.Series | np.ndarray", metric: str, *, q_name: str | None = None
+    ) -> "pd.Series | np.ndarray":
+        return values_for_display(values, metric, q_name=q_name)
+
+    def _kinematics_timeseries_path(self, trial: str) -> Path:
+        return (
+            self._graph_output_root()
+            / safe_trial_dir_name(trial)
+            / "kinematics_q_timeseries.npz"
+        )
+
+    def _joint_centre_timeseries_path(self, trial: str) -> Path:
+        return (
+            self._graph_output_root()
+            / safe_trial_dir_name(trial)
+            / "joint_centre_timeseries.npz"
+        )
+
+    def _legacy_kinematics_timeseries_csv_path(self, trial: str) -> Path:
+        return (
+            self._graph_output_root()
+            / safe_trial_dir_name(trial)
+            / "kinematics_q_timeseries.csv"
+        )
+
+    def _legacy_joint_centre_timeseries_csv_path(self, trial: str) -> Path:
+        return (
+            self._graph_output_root()
+            / safe_trial_dir_name(trial)
+            / "joint_centre_timeseries.csv"
+        )
+
+    def _read_timeseries_table(
+        self, path: Path, legacy_csv_path: Path
+    ) -> "pd.DataFrame | None":
+        if path.exists() and path.stat().st_size:
+            return read_table_npz(path)
+        if legacy_csv_path.exists() and legacy_csv_path.stat().st_size:
+            return pd.read_csv(legacy_csv_path)
+        return None
+
+    def _draw_joint_centre_graph(self, payloads: list[dict[str, object]]) -> bool:
+        if not payloads:
+            return False
+        metrics = {str(payload["metric"]) for payload in payloads}
+        if len(metrics) != 1:
+            return False
+        metric = next(iter(metrics))
+        filters = dict(payloads[0]["filters"])
+        trial = str(filters.get("trial", ""))
+        if not trial:
+            return False
+        panel = self.graph_panels["centres"]
+        axes = panel["axes"]
+        canvas = panel["canvas"]
+        axes.clear()
+        path = self._joint_centre_timeseries_path(trial)
+        dataframe = self._read_timeseries_table(
+            path, self._legacy_joint_centre_timeseries_csv_path(trial)
+        )
+        if dataframe is None:
+            axes.set_title(f"Série temporelle absente: {path.name}")
+        else:
+            selected_joints = [
+                str(dict(payload["filters"]).get("joint", ""))
+                for payload in payloads
+                if str(dict(payload["filters"]).get("joint", ""))
+            ]
+            if len(payloads) == 1 and selected_joints:
+                draw_joint_centre_error_timeseries(
+                    axes, dataframe, trial, selected_joints[0]
+                )
+            else:
+                series = joint_centre_error_boxplot_series(
+                    dataframe, metric, trial=trial, joints=selected_joints
+                )
+                if series:
+                    self._draw_metric_boxplot(
+                        axes, series, f"Centres articulaires - {metric}"
+                    )
+                    axes.set_ylabel("Erreur (mm)")
+                else:
+                    axes.set_title("Aucune erreur temporelle")
+        panel["figure"].tight_layout()
+        canvas.draw_idle()
+        return True
+
+    def _draw_kinematics_graph(
+        self, payloads: list[dict[str, object]], metrics_dataframe: "pd.DataFrame"
+    ) -> None:
+        """Draw q/angle comparisons from the kinematics tab selection.
+
+        A single selected DoF is treated as a waveform exploration request and
+        reads ``<trial>/kinematics_q_timeseries.npz``. Broader selections, such
+        as ``trial -> bias_rad`` or several DoFs at once, are summarized with
+        boxplots so every selected DoF remains visible. Rotation quantities are
+        converted from radians to degrees at display time; the output files keep
+        their original numerical units.
+        """
+
+        panel = self.graph_panels["kinematics"]
+        axes = panel["axes"]
+        canvas = panel["canvas"]
+        axes.clear()
+        if len(payloads) == 1:
+            filters = dict(payloads[0]["filters"])
+            q_name = str(filters.get("q_name", ""))
+            trial = str(filters.get("trial", ""))
+            if q_name and trial:
+                self._draw_kinematics_timeseries(axes, trial, q_name)
+                panel["figure"].tight_layout()
+                canvas.draw_idle()
+                return
+        self._draw_kinematics_metric_boxplots(axes, payloads, metrics_dataframe)
+        panel["figure"].tight_layout()
+        canvas.draw_idle()
+
+    def _draw_kinematics_timeseries(
+        self, axes: object, trial: str, q_name: str
+    ) -> None:
+        path = self._kinematics_timeseries_path(trial)
+        dataframe = self._read_timeseries_table(
+            path, self._legacy_kinematics_timeseries_csv_path(trial)
+        )
+        if dataframe is None:
+            axes.set_title(f"Série temporelle absente: {path.name}")
+            return
+        if "q_name" not in dataframe.columns or "time" not in dataframe.columns:
+            axes.set_title("Aucune cinématique temporelle")
+            return
+        values = dataframe[dataframe["q_name"].astype(str) == q_name].copy()
+        if values.empty:
+            axes.set_title(f"Aucune donnée temporelle: {q_name}")
+            return
+        for column in KINEMATIC_TIMESERIES_COLUMNS:
+            if column not in values.columns:
+                continue
+            y = values[column].astype(float)
+            if not y.notna().any():
+                continue
+            y = self._values_for_display(y, column, q_name=q_name)
+            color = (
+                data_source_color(column)
+                if column in {"captury", "motive", "captury_c3d"}
+                else "#64748b"
+            )
+            axes.plot(values["time"], y, label=column, color=color)
+        has_c3d_angles = (
+            "captury_c3d" in values.columns
+            and values["captury_c3d"].astype(float).notna().any()
+        )
+        unit = "deg" if self._is_rotation_q_name(q_name) or has_c3d_angles else "native"
+        axes.set_title(f"{trial} - {q_name}")
+        axes.set_xlabel("Temps (s)")
+        axes.set_ylabel(unit)
+        axes.legend()
+        axes.grid(alpha=0.3)
+
+    def _draw_kinematics_metric_boxplots(
+        self,
+        axes: object,
+        payloads: list[dict[str, object]],
+        dataframe: "pd.DataFrame",
+    ) -> None:
+        series: list[dict[str, object]] = []
+        for payload in payloads:
+            metric = str(payload["metric"])
+            if metric not in dataframe.columns:
+                continue
+            filters = {
+                str(column): str(value)
+                for column, value in dict(payload["filters"]).items()
+            }
+            filtered = dataframe
+            for column, value in filters.items():
+                if column in filtered.columns:
+                    filtered = filtered[filtered[column].astype(str) == value]
+            if filtered.empty:
+                continue
+            if "q_name" in filters:
+                values = filtered[metric].astype(float).dropna()
+                values = self._values_for_display(
+                    values, metric, q_name=filters["q_name"]
+                )
+                series.append(
+                    {
+                        "metric": metric,
+                        "label": filters["q_name"],
+                        "values": values.to_numpy(),
+                    }
+                )
+            elif "q_name" in filtered.columns:
+                for q_name, q_rows in filtered.groupby("q_name", sort=True):
+                    values = q_rows[metric].astype(float).dropna()
+                    values = self._values_for_display(
+                        values, metric, q_name=str(q_name)
+                    )
+                    if len(values):
+                        series.append(
+                            {
+                                "metric": metric,
+                                "label": str(q_name),
+                                "values": values.to_numpy(),
+                            }
+                        )
+        series = [item for item in series if len(item["values"]) > 0]
+        if not series:
+            axes.set_title("Aucune donnée cinématique")
+            return
+        metric = str(series[0]["metric"])
+        title = f"Cinématiques - {self._metric_display_name(metric)}"
+        self._draw_metric_boxplot(axes, series, title)
+        axes.set_ylabel(self._metric_display_name(metric))
+
+    def _metric_series_from_payloads(
+        self,
+        dataframe: "pd.DataFrame",
+        payloads: list[dict[str, object]],
+        config: dict[str, object],
+    ) -> list[dict[str, object]]:
+        group_columns = [
+            column for column in config["groups"] if column in dataframe.columns
+        ]
+        series: list[dict[str, object]] = []
+        seen: set[tuple[str, tuple[tuple[str, str], ...]]] = set()
+        for payload in payloads:
+            metric = str(payload["metric"])
+            if metric not in dataframe.columns:
+                continue
+            filters = {
+                str(column): str(value)
+                for column, value in dict(payload["filters"]).items()
+            }
+            key = (metric, tuple(sorted(filters.items())))
+            if key in seen:
+                continue
+            seen.add(key)
+            filtered = dataframe
+            for column, value in filters.items():
+                if column in filtered.columns:
+                    filtered = filtered[filtered[column].astype(str) == value]
+            if filtered.empty:
+                continue
+            label_parts = [metric]
+            for column in group_columns:
+                if column in filters:
+                    label_parts.append(filters[column])
+            label = " / ".join(label_parts)
+            series.append(
+                {
+                    "metric": metric,
+                    "label": label,
+                    "dataframe": filtered,
+                    "values": filtered[metric].astype(float).dropna().to_numpy(),
+                }
+            )
+        return [item for item in series if len(item["values"]) > 0]
+
+    def _draw_metric_boxplot(
+        self, axes: object, series: list[dict[str, object]], title: str
+    ) -> None:
+        draw_metric_boxplot(axes, series, title)
+
+    def _draw_dimension_metric_graph(
+        self, axes: object, dataframe: "pd.DataFrame", metric: str
+    ) -> None:
+        draw_dimension_metric_graph(axes, dataframe, metric)
+
+    def _manual_phase_bounds(self) -> tuple[float, float] | None:
+        try:
+            start = float(str(self.vars["p6_time_start"].get()).strip())
+            end = float(str(self.vars["p6_time_end"].get()).strip())
+        except (KeyError, TypeError, ValueError):
+            return None
+        if not np.isfinite(start) or not np.isfinite(end) or start == end:
+            return None
+        return (min(start, end), max(start, end))
+
+    @staticmethod
+    def _format_phase_time(value: float) -> str:
+        return f"{float(value):.6f}".rstrip("0").rstrip(".")
+
+    def _set_manual_phase_bounds(self, start: float, end: float) -> None:
+        lower, upper = sorted((float(start), float(end)))
+        self.vars["p6_cut_mode"].set("manual")
+        self.vars["p6_time_start"].set(self._format_phase_time(lower))
+        self.vars["p6_time_end"].set(self._format_phase_time(upper))
+        self.status_var.set(
+            f"Phase sélectionnée: {self._format_phase_time(lower)}-"
+            f"{self._format_phase_time(upper)} s"
+        )
+
+    def _draw_phase_span(
+        self,
+        axes: object,
+        start: float,
+        end: float,
+        *,
+        alpha: float = 0.18,
+    ) -> object:
+        return axes.axvspan(
+            min(start, end),
+            max(start, end),
+            color=data_source_color("captury"),
+            alpha=alpha,
+            zorder=0,
+        )
+
+    def _draw_manual_phase_span(self, axes: object) -> None:
+        bounds = self._manual_phase_bounds()
+        if bounds is None:
+            return
+        self._draw_phase_span(axes, bounds[0], bounds[1], alpha=0.16)
+
+    def _on_phase_drag_press(self, event: object) -> None:
+        panel = self.graph_panels.get("events")
+        if not panel or event.inaxes is not panel.get("axes") or event.xdata is None:
+            return
+        if getattr(event, "button", 1) != 1:
+            return
+        self.graph_drag_selection = {
+            "start": float(event.xdata),
+            "patch": None,
+        }
+
+    def _on_phase_drag_motion(self, event: object) -> None:
+        if "start" not in self.graph_drag_selection:
+            return
+        panel = self.graph_panels.get("events")
+        if not panel or event.inaxes is not panel.get("axes") or event.xdata is None:
+            return
+        axes = panel["axes"]
+        canvas = panel["canvas"]
+        patch = self.graph_drag_selection.get("patch")
+        if patch is not None:
+            patch.remove()
+        start = float(self.graph_drag_selection["start"])
+        self.graph_drag_selection["patch"] = self._draw_phase_span(
+            axes, start, float(event.xdata), alpha=0.24
+        )
+        canvas.draw_idle()
+
+    def _on_phase_drag_release(self, event: object) -> None:
+        if "start" not in self.graph_drag_selection:
+            return
+        start = float(self.graph_drag_selection["start"])
+        end = float(event.xdata) if event.xdata is not None else start
+        self.graph_drag_selection = {}
+        if abs(end - start) < 1e-6:
+            self._draw_selected_graph("events")
+            return
+        self._set_manual_phase_bounds(start, end)
+        self._draw_selected_graph("events")
 
     def _draw_events_graph(self, graph_kind: str, payload: dict[str, object]) -> None:
         if pd is None:
@@ -1261,6 +2480,7 @@ class CapturyBioBuddyGui(tk.Tk):
         axes.set_xlabel("Temps (s)")
         axes.set_ylabel(metric)
         axes.grid(alpha=0.3)
+        self._draw_manual_phase_span(axes)
         panel["figure"].tight_layout()
         canvas.draw_idle()
 
@@ -1383,6 +2603,26 @@ class CapturyBioBuddyGui(tk.Tk):
             ),
         ).grid(row=row, column=2, sticky="ew", padx=10, pady=6)
 
+    def _save_path_row(
+        self,
+        parent: ttk.Widget,
+        row: int,
+        label: str,
+        var_name: str,
+        filetypes: list[tuple[str, str]] | None = None,
+    ) -> None:
+        ttk.Label(parent, text=label).grid(
+            row=row, column=0, sticky="w", padx=10, pady=6
+        )
+        ttk.Entry(parent, textvariable=self.vars[var_name]).grid(
+            row=row, column=1, sticky="ew", padx=6, pady=6
+        )
+        ttk.Button(
+            parent,
+            text="Parcourir",
+            command=lambda: self._browse_save_path(var_name, filetypes=filetypes),
+        ).grid(row=row, column=2, sticky="ew", padx=10, pady=6)
+
     def _entry_row(
         self, parent: ttk.Widget, row: int, label: str, var_name: str
     ) -> None:
@@ -1435,6 +2675,26 @@ class CapturyBioBuddyGui(tk.Tk):
                 else selected
             )
 
+    def _browse_save_path(
+        self,
+        var_name: str,
+        filetypes: list[tuple[str, str]] | None = None,
+    ) -> None:
+        current = Path(str(self.vars[var_name].get()))
+        initial_dir = current.parent if current.parent.exists() else PROJECT_DIR
+        selected = filedialog.asksaveasfilename(
+            initialdir=initial_dir,
+            initialfile=current.name if current.name else "model.bioMod",
+            defaultextension=".bioMod",
+            filetypes=filetypes or [("Tous les fichiers", "*")],
+        )
+        if selected:
+            self.vars[var_name].set(
+                os.path.relpath(selected, PROJECT_DIR)
+                if str(selected).startswith(str(PROJECT_DIR))
+                else selected
+            )
+
     def _bind_command_preview(self) -> None:
         for var in self.vars.values():
             var.trace_add("write", lambda *_: self._update_command_preview())
@@ -1444,148 +2704,39 @@ class CapturyBioBuddyGui(tk.Tk):
         self.vars["p6_data_root"].trace_add(
             "write", lambda *_: self._refresh_trial_inventory()
         )
+        self.vars["p6_model_source"].trace_add(
+            "write", lambda *_: self._on_p6_model_source_changed()
+        )
+        self.vars["biobuddy_c3d_folder"].trace_add(
+            "write", lambda *_: self._refresh_motive57_c3d_mapping()
+        )
 
     def _command_args(self) -> list[str]:
-        args = [sys.executable, str(PIPELINE_SCRIPT)]
-        self._append_path(args, "--bvh", "bvh", required=True)
-        self._append_path(args, "--fbx", "fbx")
-        self._append_path(args, "--c3d", "c3d", required=True)
-        self._append_path(args, "--out-dir", "out_dir", required=True)
+        return build_pipeline_args(self._var_values())
 
-        self._append_value(args, "--bvh-unit-scale-to-m", "bvh_unit_scale_to_m")
-        self._append_value(args, "--fbx-unit-scale-to-m", "fbx_unit_scale_to_m")
-        self._append_value(args, "--c3d-angle-unit", "c3d_angle_unit")
-        self._append_value(args, "--angle-label-regex", "angle_label_regex")
-        for label in self._split_extra_labels():
-            args.extend(["--extra-angle-label", label])
-        self._append_path(args, "--comparison-map", "comparison_map")
-
-        self._append_flag(
-            args, "--no-biomod-joint-centre-markers", "no_biomod_joint_centre_markers"
-        )
-        self._append_flag(
-            args, "--no-root-offset-correction", "no_root_offset_correction"
-        )
-        self._append_value(args, "--root-offset-mode", "root_offset_mode")
-        self._append_flag(args, "--no-fbx-mesh", "no_fbx_mesh")
-        self._append_value(args, "--max-fbx-mesh-points", "max_fbx_mesh_points")
-
-        self._append_flag(args, "--animate", "animate")
-        self._append_flag(args, "--animate-superposed", "animate_superposed")
-        self._append_flag(args, "--display-q-in-rerun", "display_q_in_rerun")
-        self._append_value(args, "--rerun-marker-radius", "rerun_marker_radius")
-        self._append_value(args, "--rerun-wait-seconds", "rerun_wait_seconds")
-        self._append_value(args, "--rerun-up-axis", "rerun_up_axis")
-        self._append_flag(args, "--hide-hands-in-rerun", "hide_hands_in_rerun")
-        self._append_flag(args, "--hide-feet-in-rerun", "hide_feet_in_rerun")
-        self._append_flag(
-            args, "--hide-extremities-in-rerun", "hide_extremities_in_rerun"
-        )
-        self._append_flag(args, "--headless", "headless")
-
-        self._append_flag(args, "--inverse-kinematics", "inverse_kinematics")
-        self._append_value(
-            args, "--inverse-kinematics-solver", "inverse_kinematics_solver"
-        )
-        self._append_value(
-            args, "--inverse-kinematics-method", "inverse_kinematics_method"
-        )
-        self._append_value(
-            args, "--inverse-kinematics-max-frames", "inverse_kinematics_max_frames"
-        )
-        self._append_value(args, "--kalman-noise-factor", "kalman_noise_factor")
-        self._append_value(args, "--kalman-error-factor", "kalman_error_factor")
-
-        self._append_flag(args, "--inverse-dynamics", "inverse_dynamics")
-        self._append_value(args, "--inverse-dynamics-method", "inverse_dynamics_method")
-        self._append_value(
-            args, "--inverse-dynamics-max-frames", "inverse_dynamics_max_frames"
-        )
-        return args
-
-    def _append_path(
-        self, args: list[str], option: str, var_name: str, required: bool = False
-    ) -> None:
-        value = str(self.vars[var_name].get()).strip()
-        if value or required:
-            args.extend([option, value])
-
-    def _append_value(self, args: list[str], option: str, var_name: str) -> None:
-        value = str(self.vars[var_name].get()).strip()
-        if value:
-            args.extend([option, value])
-
-    def _append_flag(self, args: list[str], option: str, var_name: str) -> None:
-        if bool(self.vars[var_name].get()):
-            args.append(option)
+    def _var_values(self) -> dict[str, object]:
+        return {name: variable.get() for name, variable in self.vars.items()}
 
     def _split_extra_labels(self) -> list[str]:
-        raw = str(self.vars["extra_angle_labels"].get())
-        return [
-            part.strip() for part in raw.replace("\n", ",").split(",") if part.strip()
-        ]
+        return split_extra_labels(self._var_values())
 
     def _comparison_args(self) -> list[str]:
-        args = [sys.executable, str(COMPARISON_SCRIPT)]
-        reference_c3d = str(self.vars["compare_reference_c3d"].get()).strip()
-        test_c3d = str(self.vars["compare_test_c3d"].get()).strip()
-        self._append_value_to(args, "--reference-system", "compare_reference_system")
-        self._append_value_to(args, "--test-system", "compare_test_system")
-        if reference_c3d or test_c3d:
-            args.extend(["--reference-c3d", reference_c3d, "--test-c3d", test_c3d])
-            self._append_value_to(args, "--reference-bvh", "compare_reference_bvh")
-            self._append_value_to(args, "--reference-fbx", "compare_reference_fbx")
-            self._append_value_to(args, "--test-bvh", "compare_test_bvh")
-            self._append_value_to(args, "--test-fbx", "compare_test_fbx")
-            trial_name = str(self.vars["compare_trial_name"].get()).strip()
-            if trial_name:
-                args.extend(["--trial-name", trial_name])
-        else:
-            args.extend(
-                ["--data-root", str(self.vars["compare_data_root"].get()).strip()]
-            )
-            for pattern in self._split_var_lines("compare_participant_filter"):
-                args.extend(["--participant-filter", pattern])
-            for pattern in self._split_var_lines("compare_trial_filter"):
-                args.extend(["--trial-filter", pattern])
-        self._append_value_to(args, "--out-dir", "compare_out_dir")
-        self._append_value_to(args, "--landmark-map", "compare_landmark_map")
-        self._append_value_to(args, "--resample-points", "compare_resample_points")
-        self._append_value_to(args, "--alignment", "compare_alignment")
-        return args
+        return build_comparison_args(self._var_values())
 
     def _p6_args(self) -> list[str]:
-        args = [sys.executable, str(KINEMATIC_COMPARISON_SCRIPT)]
-        self._append_value_to(args, "--data-root", "p6_data_root")
-        self._append_value_to(args, "--out-dir", "p6_out_dir")
-        for trial in self._split_var_lines("p6_trials"):
-            args.extend(["--trial", trial])
-        for pattern in self._split_var_lines("p6_joint_filter"):
-            args.extend(["--joint-filter", pattern])
-        self._append_value_to(args, "--static-trial", "p6_static_trial")
-        self._append_value_to(args, "--model-source", "p6_model_source")
-        self._append_value_to(args, "--model-to-c3d-axis", "p6_model_to_c3d_axis")
-        self._append_flag(args, "--no-figures", "p6_no_figures")
-        self._append_flag(args, "--no-mesh", "p6_no_mesh")
-        self._append_value_to(args, "--max-mesh-points", "p6_max_mesh_points")
-        self._append_flag(args, "--run-ik-batch", "p6_run_ik_batch")
-        self._append_value_to(args, "--ik-max-frames", "p6_ik_max_frames")
-        self._append_flag(args, "--visualize", "p6_visualize")
-        self._append_value_to(args, "--visualize-trial", "p6_visualize_trial")
-        self._append_flag(args, "--headless", "p6_headless")
-        self._append_value_to(args, "--rerun-wait-seconds", "p6_rerun_wait_seconds")
-        return args
+        return build_p6_args(self._var_values())
 
-    def _append_value_to(self, args: list[str], option: str, var_name: str) -> None:
-        value = str(self.vars[var_name].get()).strip()
-        if value:
-            args.extend([option, value])
+    def _p6_occlusions_args(self, trial: str) -> list[str]:
+        return build_p6_occlusions_args(self._var_values(), trial)
+
+    def _p6_auto_analysis_args(self, trial: str) -> list[str]:
+        return build_p6_auto_analysis_args(self._var_values(), trial)
+
+    def _biobuddy_c3d_model_args(self) -> list[str]:
+        return build_biobuddy_c3d_model_args(self._var_values())
 
     def _split_var_lines(self, var_name: str) -> list[str]:
-        raw = str(self.vars[var_name].get())
-        return [
-            part.strip() for part in raw.replace("\n", ",").split(",") if part.strip()
-        ]
+        return split_lines(self.vars[var_name].get())
 
     def _refresh_trial_inventory(self) -> None:
         if not hasattr(self, "trial_combobox"):
@@ -1601,6 +2752,7 @@ class CapturyBioBuddyGui(tk.Tk):
             self.vars["selected_trial"].set(ALL_TRIALS_LABEL)
         else:
             self._update_inventory_table()
+            self._update_embedded_trial_viewer()
 
     def _sync_selected_trial(self) -> None:
         selected = str(self.vars["selected_trial"].get()).strip()
@@ -1611,11 +2763,15 @@ class CapturyBioBuddyGui(tk.Tk):
             if not str(self.vars["p6_visualize_trial"].get()).strip():
                 self.vars["p6_visualize_trial"].set(selected)
         self._update_inventory_table()
+        self._populate_occlusion_table()
+        self._update_embedded_trial_viewer()
+        self._run_selected_trial_auto_analysis()
 
     def _update_inventory_table(self) -> None:
-        if not hasattr(self, "inventory_tree"):
+        if not hasattr(self, "inventory_trees"):
             return
-        self.inventory_tree.delete(*self.inventory_tree.get_children())
+        for tree in self.inventory_trees.values():
+            tree.delete(*tree.get_children())
         selected = str(self.vars["selected_trial"].get()).strip()
         trials = (
             sorted(self.trial_inventory)
@@ -1625,13 +2781,18 @@ class CapturyBioBuddyGui(tk.Tk):
         for trial in trials:
             systems = self.trial_inventory.get(trial, {})
             for system in ("Captury", "Motive"):
+                tree = self.inventory_trees.get(system)
+                if tree is None:
+                    continue
                 for kind, path in sorted(systems.get(system, {}).items()):
                     try:
                         display_path = path.relative_to(PROJECT_DIR).as_posix()
                     except ValueError:
                         display_path = str(path)
-                    self.inventory_tree.insert(
-                        "", tk.END, values=(system, kind.upper(), display_path)
+                    tree.insert(
+                        "",
+                        tk.END,
+                        values=(kind.upper(), vertical_axis_label(kind), display_path),
                     )
 
     def _command_mode(self) -> str:
@@ -1643,6 +2804,8 @@ class CapturyBioBuddyGui(tk.Tk):
 
     def _current_args(self) -> list[str]:
         mode = self._command_mode()
+        if mode == "biobuddy_c3d_model":
+            return self._biobuddy_c3d_model_args()
         if mode == "pipeline":
             return self._command_args()
         if mode == "comparison":
@@ -1651,6 +2814,9 @@ class CapturyBioBuddyGui(tk.Tk):
 
     def _current_output_dir(self) -> Path:
         mode = self._command_mode()
+        if mode == "biobuddy_c3d_model":
+            value = str(self.vars["biobuddy_c3d_output"].get()).strip()
+            return self._resolve(value).parent
         if mode == "pipeline":
             value = str(self.vars["out_dir"].get()).strip()
         elif mode == "comparison":
@@ -1661,6 +2827,8 @@ class CapturyBioBuddyGui(tk.Tk):
 
     def _validate_current_command(self) -> bool:
         mode = self._command_mode()
+        if mode == "biobuddy_c3d_model":
+            return self._validate_biobuddy_c3d_model()
         if mode == "pipeline":
             return self._validate()
         if mode == "comparison":
@@ -1788,6 +2956,33 @@ class CapturyBioBuddyGui(tk.Tk):
             return False
         return True
 
+    def _validate_biobuddy_c3d_model(self) -> bool:
+        c3d_folder = str(self.vars["biobuddy_c3d_folder"].get()).strip()
+        if not c3d_folder:
+            messagebox.showerror("Champ manquant", "Le dossier C3D est requis.")
+            return False
+        c3d_path = self._resolve(c3d_folder)
+        if not c3d_path.exists() or not c3d_path.is_dir():
+            messagebox.showerror("Dossier C3D introuvable", str(c3d_path))
+            return False
+
+        output = str(self.vars["biobuddy_c3d_output"].get()).strip()
+        if not output:
+            messagebox.showerror(
+                "Champ manquant", "Le fichier bioMod de sortie est requis."
+            )
+            return False
+        output_path = self._resolve(output)
+        if output_path.suffix != ".bioMod":
+            messagebox.showerror(
+                "Sortie invalide", "La sortie doit être un fichier .bioMod."
+            )
+            return False
+        if not output_path.parent.exists():
+            messagebox.showerror("Dossier sortie introuvable", str(output_path.parent))
+            return False
+        return True
+
     def _validate_p6_analysis(self) -> bool:
         data_root = str(self.vars["p6_data_root"].get()).strip()
         if not data_root or not self._resolve(data_root).exists():
@@ -1797,6 +2992,24 @@ class CapturyBioBuddyGui(tk.Tk):
             return False
         return True
 
+    def _run_selected_trial_auto_analysis(self) -> None:
+        if self.process is not None:
+            return
+        if not bool(self.vars["p6_auto_analyze"].get()):
+            return
+        selected = str(self.vars["selected_trial"].get()).strip()
+        if not selected or selected == ALL_TRIALS_LABEL:
+            return
+        data_root = str(self.vars["p6_data_root"].get()).strip()
+        if not data_root or not self._resolve(data_root).exists():
+            return
+        if selected not in self.trial_inventory:
+            return
+        self._run_args(self._p6_auto_analysis_args(selected))
+
+    def _on_p6_model_source_changed(self) -> None:
+        self._run_selected_trial_auto_analysis()
+
     def _load_p6_debug_preset(self) -> None:
         self.vars["command_mode"].set(COMMAND_MODES["kinematic"])
         self.vars["p6_data_root"].set("local_trials/2026-06-30_P6_flat")
@@ -1804,11 +3017,16 @@ class CapturyBioBuddyGui(tk.Tk):
         self.vars["p6_trials"].set("Static")
         self.vars["selected_trial"].set("Static")
         self.vars["p6_static_trial"].set("Static")
+        self.vars["p6_cut_mode"].set("manual")
+        self.vars["p6_time_start"].set("")
+        self.vars["p6_time_end"].set("")
         self.vars["p6_joint_filter"].set("Hip|Knee|Ankle|Leg|Foot")
+        self.vars["p6_auto_analyze"].set(True)
         self.vars["p6_model_source"].set("bvh")
         self.vars["p6_model_to_c3d_axis"].set("auto")
         self.vars["p6_no_mesh"].set(True)
         self.vars["p6_no_figures"].set(True)
+        self.vars["p6_no_cache"].set(False)
         self.vars["p6_run_ik_batch"].set(False)
         self.vars["p6_ik_max_frames"].set("0")
         self.vars["p6_visualize"].set(False)
@@ -1818,17 +3036,30 @@ class CapturyBioBuddyGui(tk.Tk):
         self.status_var.set("Preset P6 debug chargé")
 
     def _selected_trial_c3d_path(self) -> Path | None:
+        path, _source = self._selected_trial_c3d_path_and_source()
+        return path
+
+    def _selected_trial_c3d_path_and_source(self) -> tuple[Path | None, str | None]:
+        c3d_paths = self._selected_trial_c3d_paths()
+        for system in ("Motive", "Captury"):
+            c3d_path = c3d_paths.get(system)
+            if c3d_path is not None:
+                return c3d_path, system
+        return None, None
+
+    def _selected_trial_c3d_paths(self) -> dict[str, Path]:
         selected = str(self.vars["selected_trial"].get()).strip()
         if not selected or selected == ALL_TRIALS_LABEL:
             selected = str(self.vars["p6_static_trial"].get()).strip()
         if not self.trial_inventory:
             self._refresh_trial_inventory()
         files = self.trial_inventory.get(selected, {})
+        paths: dict[str, Path] = {}
         for system in ("Motive", "Captury"):
             c3d_path = files.get(system, {}).get("c3d")
             if c3d_path is not None and c3d_path.exists():
-                return c3d_path
-        return None
+                paths[system] = c3d_path
+        return paths
 
     def _open_selected_trial_viewer(self) -> None:
         c3d_path = self._selected_trial_c3d_path()
@@ -1909,6 +3140,16 @@ class CapturyBioBuddyGui(tk.Tk):
             return
         self._run_args(self._p6_args())
 
+    def _run_biobuddy_c3d_model_creation(self) -> None:
+        if self.process is not None:
+            messagebox.showinfo("Exécution en cours", "Une commande est déjà lancée.")
+            return
+        if not self._validate_biobuddy_c3d_model():
+            return
+        self._save_motive57_mapping_json()
+        self.vars["command_mode"].set(COMMAND_MODES["biobuddy_c3d_model"])
+        self._run_args(self._biobuddy_c3d_model_args())
+
     def _stop_pipeline(self) -> None:
         if self.process is None:
             return
@@ -1941,7 +3182,7 @@ class CapturyBioBuddyGui(tk.Tk):
                         f"\nProcessus terminé avec le code {return_code}.\n"
                     )
                     if return_code == 0:
-                        self._refresh_graphs()
+                        self._refresh_results()
                 else:
                     self._append_log(str(item))
         except queue.Empty:
@@ -1994,6 +3235,121 @@ class CapturyBioBuddyGui(tk.Tk):
         self.clipboard_clear()
         self.clipboard_append(command)
         self.status_var.set("Commande cinématique copiée")
+
+    def _copy_biobuddy_c3d_model_command(self) -> None:
+        if self._validate_biobuddy_c3d_model():
+            self._save_motive57_mapping_json()
+        command = " ".join(
+            shlex.quote(part) for part in self._biobuddy_c3d_model_args()
+        )
+        self.clipboard_clear()
+        self.clipboard_append(command)
+        self.status_var.set("Commande BioBuddy copiée")
+
+    def _biobuddy_c3d_folder_path(self) -> Path:
+        return self._resolve(str(self.vars["biobuddy_c3d_folder"].get()).strip())
+
+    def _motive57_mapping_json_path(self) -> Path:
+        raw_path = str(self.vars["biobuddy_c3d_mapping_json"].get()).strip()
+        if raw_path:
+            return self._resolve(raw_path)
+        return motive57_mapping_path(self._biobuddy_c3d_folder_path())
+
+    def _motive57_role_assignments_from_vars(self) -> dict[str, str]:
+        assignments: dict[str, str] = {}
+        for role in MOTIVE_57_C3D_ROLES:
+            filename = str(self.vars[f"motive57_role_{role.key}"].get()).strip()
+            if filename:
+                assignments[role.key] = filename
+        return assignments
+
+    def _set_motive57_role_assignments(self, assignments: dict[str, str]) -> None:
+        available = set(self.motive57_c3d_files)
+        for role in MOTIVE_57_C3D_ROLES:
+            filename = assignments.get(role.key, "")
+            self.vars[f"motive57_role_{role.key}"].set(
+                filename if filename in available else ""
+            )
+
+    def _update_motive57_file_widgets(self) -> None:
+        values = ("", *self.motive57_c3d_files)
+        for combo in self.motive57_role_combos.values():
+            combo.configure(values=values)
+        if self.motive57_inventory_tree is not None:
+            self.motive57_inventory_tree.delete(
+                *self.motive57_inventory_tree.get_children()
+            )
+            for filename in self.motive57_c3d_files:
+                self.motive57_inventory_tree.insert("", tk.END, values=(filename,))
+
+    def _refresh_motive57_c3d_mapping(self) -> None:
+        folder = self._biobuddy_c3d_folder_path()
+        default_mapping_path = motive57_mapping_path(folder)
+        raw_mapping_path = str(self.vars["biobuddy_c3d_mapping_json"].get()).strip()
+        if (
+            not raw_mapping_path
+            or Path(raw_mapping_path).name == default_mapping_path.name
+        ):
+            self.vars["biobuddy_c3d_mapping_json"].set(str(default_mapping_path))
+        mapping_path = self._motive57_mapping_json_path()
+        self.motive57_c3d_files = discover_c3d_files(folder)
+        self._update_motive57_file_widgets()
+        if not self.motive57_c3d_files:
+            self.status_var.set("Aucun C3D Motive trouvé")
+            return
+        payload = load_motive57_mapping(mapping_path)
+        if payload is None:
+            assignments = infer_motive57_role_assignments(self.motive57_c3d_files)
+            save_motive57_mapping(folder, assignments, mapping_path)
+            self.status_var.set(f"Mapping Motive 57 créé: {mapping_path.name}")
+        else:
+            assignments = assignments_from_payload(payload)
+            self.status_var.set(f"Mapping Motive 57 chargé: {mapping_path.name}")
+        self._set_motive57_role_assignments(assignments)
+
+    def _infer_motive57_mapping_from_files(self) -> None:
+        if not self.motive57_c3d_files:
+            self._refresh_motive57_c3d_mapping()
+        assignments = infer_motive57_role_assignments(self.motive57_c3d_files)
+        self._set_motive57_role_assignments(assignments)
+        self.status_var.set("Rôles Motive 57 inférés")
+
+    def _save_motive57_mapping_json(self) -> None:
+        folder = self._biobuddy_c3d_folder_path()
+        mapping_path = self._motive57_mapping_json_path()
+        output_path = save_motive57_mapping(
+            folder, self._motive57_role_assignments_from_vars(), mapping_path
+        )
+        self.vars["biobuddy_c3d_mapping_json"].set(str(output_path))
+        self.status_var.set(f"Mapping Motive 57 sauvé: {output_path.name}")
+
+    def _load_motive57_mapping_json(self) -> None:
+        mapping_path = self._motive57_mapping_json_path()
+        payload = load_motive57_mapping(mapping_path)
+        if payload is None:
+            messagebox.showerror("JSON introuvable", str(mapping_path))
+            return
+        self.motive57_c3d_files = discover_c3d_files(self._biobuddy_c3d_folder_path())
+        self._update_motive57_file_widgets()
+        self._set_motive57_role_assignments(assignments_from_payload(payload))
+        self.status_var.set(f"Mapping Motive 57 chargé: {mapping_path.name}")
+
+    def _use_selected_motive_folder_for_biobuddy(self) -> None:
+        data_root = self._resolve(str(self.vars["p6_data_root"].get()).strip())
+        motive_dir = data_root / "Motive"
+        if not motive_dir.exists():
+            messagebox.showerror("Dossier Motive introuvable", str(motive_dir))
+            return
+        self.vars["biobuddy_c3d_folder"].set(str(motive_dir))
+        self.vars["biobuddy_c3d_preset"].set("motive_57")
+        self._refresh_motive57_c3d_mapping()
+        self.status_var.set("Dossier Motive sélectionné pour BioBuddy")
+
+    def _open_biobuddy_c3d_model_in_explorer(self) -> None:
+        self.vars["model_explorer_path"].set(
+            str(self.vars["biobuddy_c3d_output"].get()).strip()
+        )
+        self._launch_biobuddy_model_explorer()
 
     def _generated_biomod_path(self, source: str) -> Path:
         filename = {

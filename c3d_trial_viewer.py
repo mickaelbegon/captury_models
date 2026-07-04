@@ -12,6 +12,8 @@ from typing import Iterable
 
 import numpy as np
 
+ANGLE_LABEL_REGEX = r"(?i)(^.*angles?$|^.*_angle[s]?$|angle)"
+
 AXIS_COLORS = {"x": "#ef4444", "y": "#22c55e", "z": "#3b82f6"}
 SEGMENT_COLORS = (
     "#2563eb",
@@ -30,6 +32,7 @@ class C3DMarkerData:
     labels: list[str]
     points: np.ndarray
     rate: float
+    unit: str = "mm"
 
     @property
     def n_frames(self) -> int:
@@ -45,18 +48,56 @@ class MarkerVisualState:
     selected_label: str | None = None
 
 
-def load_c3d_marker_data(path: Path) -> C3DMarkerData:
+def point_unit_scale_to_mm(unit: str) -> float:
+    normalized_unit = str(unit).strip().lower()
+    if normalized_unit in {
+        "mm",
+        "millimeter",
+        "millimeters",
+        "millimetre",
+        "millimetres",
+    }:
+        return 1.0
+    if normalized_unit in {
+        "cm",
+        "centimeter",
+        "centimeters",
+        "centimetre",
+        "centimetres",
+    }:
+        return 10.0
+    if normalized_unit in {"m", "meter", "meters", "metre", "metres"}:
+        return 1000.0
+    return 1.0
+
+
+def load_c3d_marker_data(
+    path: Path, *, angle_label_regex: str = ANGLE_LABEL_REGEX
+) -> C3DMarkerData:
     import ezc3d
+    from compare_capture_systems import detect_angle_indices
 
     c3d = ezc3d.c3d(str(path))
     labels = [
         str(label).strip() for label in c3d["parameters"]["POINT"]["LABELS"]["value"]
     ]
-    points = np.asarray(c3d["data"]["points"][:3], dtype=float)
-    residuals = np.asarray(c3d["data"]["points"][3], dtype=float)
+    angle_indices = set(detect_angle_indices(c3d, labels, angle_label_regex).values())
+    marker_indices = [
+        index for index in range(len(labels)) if index not in angle_indices
+    ]
+    units = c3d["parameters"]["POINT"].get("UNITS", {}).get("value", ["mm"])
+    unit = units[0] if units else "mm"
+    points = np.asarray(c3d["data"]["points"][:3, marker_indices, :], dtype=float)
+    points *= point_unit_scale_to_mm(str(unit))
+    residuals = np.asarray(c3d["data"]["points"][3, marker_indices, :], dtype=float)
     points[:, residuals < 0] = np.nan
     rate = float(c3d["parameters"]["POINT"]["RATE"]["value"][0])
-    return C3DMarkerData(labels=labels, points=points, rate=rate)
+    return C3DMarkerData(
+        labels=[labels[index] for index in marker_indices],
+        points=points,
+        rate=rate,
+        unit="mm",
+    )
 
 
 def normalized(vector: np.ndarray) -> np.ndarray:
@@ -109,6 +150,7 @@ def camera_matrix_for_plane(plane: str) -> np.ndarray:
     matrices = {
         "XY": ((1.0, 0.0, 0.0), (0.0, 1.0, 0.0), (0.0, 0.0, 1.0)),
         "YZ": ((0.0, 1.0, 0.0), (0.0, 0.0, 1.0), (1.0, 0.0, 0.0)),
+        "XZ": ((0.0, 0.0, 1.0), (1.0, 0.0, 0.0), (0.0, 1.0, 0.0)),
         "ZX": ((0.0, 0.0, 1.0), (1.0, 0.0, 0.0), (0.0, 1.0, 0.0)),
     }
     return normalized_camera_matrix(np.asarray(matrices[plane.upper()], dtype=float))
@@ -126,6 +168,9 @@ def subject_horizontal_axis_from_pca(
     for axis in vectors.T[::-1]:
         horizontal = axis - np.dot(axis, vertical) * vertical
         if np.linalg.norm(horizontal) > 1e-9:
+            dominant = int(np.argmax(np.abs(horizontal)))
+            if horizontal[dominant] < 0:
+                horizontal = -horizontal
             return normalized(horizontal)
     return np.asarray((1.0, 0.0, 0.0), dtype=float)
 
@@ -446,7 +491,7 @@ if PYSIDE_AVAILABLE:
 
         def contextMenuEvent(self, event) -> None:  # noqa: N802
             menu = QMenu(self)
-            for plane in ("XY", "YZ", "ZX"):
+            for plane in ("XY", "YZ", "XZ"):
                 action = QAction(plane, self)
                 action.triggered.connect(
                     lambda _checked=False, p=plane: self.set_camera_plane(p)
@@ -486,7 +531,7 @@ if PYSIDE_AVAILABLE:
 
             controls = QHBoxLayout()
             root.addLayout(controls)
-            self.play_button = QPushButton("Lire")
+            self.play_button = QPushButton("▶")
             self.play_button.setCheckable(True)
             self.play_button.toggled.connect(self._toggle_play)
             controls.addWidget(self.play_button)
@@ -511,7 +556,7 @@ if PYSIDE_AVAILABLE:
             self.viewer.set_selected_label(items[0].text() if items else None)
 
         def _toggle_play(self, checked: bool) -> None:
-            self.play_button.setText("Pause" if checked else "Lire")
+            self.play_button.setText("⏸" if checked else "▶")
             if checked:
                 interval = max(1, int(1000.0 / max(self.data.rate, 1.0)))
                 self.timer.start(interval)

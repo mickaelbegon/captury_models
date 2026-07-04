@@ -5,11 +5,13 @@ from __future__ import annotations
 
 import argparse
 import csv
+import hashlib
 import json
 import os
+import re
 import subprocess
 import sys
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any
 
@@ -46,6 +48,17 @@ DEFAULT_DATA_ROOT = Path("local_trials/2026-06-30_P6_flat")
 DEFAULT_OUTPUT_ROOT = Path("out_p6_motive_captury_comparison")
 ANGLE_LABEL_REGEX = r"(?i)(^.*angles?$|^.*_angle[s]?$|angle)"
 FOOT_MARKER_PATTERN = r"(LFCC|RFCC|LFM|RFM|LDP|RDP|Foot|Toe|Heel)"
+CACHE_VERSION = 3
+
+MODEL_JOINT_MARKER_PROXIES = {
+    "Hips": ("LIAS", "RIAS", "LIPS", "RIPS"),
+    "LeftUpLeg": ("LIAS", "LIPS", "LFTC"),
+    "RightUpLeg": ("RIAS", "RIPS", "RFTC"),
+    "LeftLeg": ("LFLE", "LFME"),
+    "RightLeg": ("RFLE", "RFME"),
+    "LeftFoot": ("LFAL", "LTAM", "LFAX"),
+    "RightFoot": ("RFAL", "RTAM", "RFAX"),
+}
 
 
 @dataclass
@@ -72,6 +85,136 @@ class ModelRun:
     centres_native: dict[str, np.ndarray]
     unit_scale_to_m: float
     mesh_report: dict[str, Any]
+    root_offset_policy: dict[str, Any]
+
+
+def file_fingerprint(path: Path | None) -> dict[str, Any] | None:
+    if path is None:
+        return None
+    resolved = path.expanduser().resolve()
+    if not resolved.exists():
+        return {"path": str(resolved), "exists": False}
+    stat = resolved.stat()
+    return {
+        "path": str(resolved),
+        "exists": True,
+        "size": stat.st_size,
+        "mtime_ns": stat.st_mtime_ns,
+    }
+
+
+def _static_alignment_cache_payload(
+    transform: tuple[np.ndarray, np.ndarray] | None,
+) -> dict[str, Any] | None:
+    if transform is None:
+        return None
+    rotation, translation = transform
+    return {
+        "rotation": np.asarray(rotation, dtype=float).round(12).tolist(),
+        "translation_mm": np.asarray(translation, dtype=float).round(12).tolist(),
+    }
+
+
+def trial_cache_fingerprint(
+    bundle: TrialBundle,
+    args: argparse.Namespace,
+    static_alignment_transform: tuple[np.ndarray, np.ndarray] | None = None,
+) -> dict[str, Any]:
+    payload = {
+        "cache_version": CACHE_VERSION,
+        "implementation": file_fingerprint(Path(__file__)),
+        "inputs": {
+            "captury_c3d": file_fingerprint(bundle.captury_c3d),
+            "captury_bvh": file_fingerprint(bundle.captury_bvh),
+            "captury_fbx": file_fingerprint(bundle.captury_fbx),
+            "motive_c3d": file_fingerprint(bundle.motive_c3d),
+            "motive_bvh": file_fingerprint(bundle.motive_bvh),
+            "motive_fbx": file_fingerprint(bundle.motive_fbx),
+        },
+        "options": {
+            "model_source": args.model_source,
+            "model_to_c3d_axis": args.model_to_c3d_axis,
+            "captury_unit_scale_to_m": args.captury_unit_scale_to_m,
+            "motive_unit_scale_to_m": args.motive_unit_scale_to_m,
+            "root_offset_mode": args.root_offset_mode,
+            "angle_label_regex": args.angle_label_regex,
+            "c3d_angle_unit": args.c3d_angle_unit,
+            "joint_filter": list(args.joint_filter),
+            "no_mesh": bool(args.no_mesh),
+            "max_mesh_points": int(args.max_mesh_points),
+            "run_ik_batch": bool(args.run_ik_batch),
+            "ik_max_frames": int(args.ik_max_frames),
+            "cut_mode": args.cut_mode,
+            "time_start": args.time_start,
+            "time_end": args.time_end,
+            "no_figures": bool(args.no_figures),
+        },
+        "static_alignment": _static_alignment_cache_payload(static_alignment_transform),
+    }
+    encoded = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    return {
+        "version": CACHE_VERSION,
+        "digest": hashlib.sha256(encoded).hexdigest(),
+        "payload": payload,
+    }
+
+
+def required_trial_outputs(trial_dir: Path, trial_name: str) -> list[Path]:
+    safe_trial = safe_name(trial_name)
+    return [
+        trial_dir / f"{safe_trial}_motive_with_capjc_motjc.c3d",
+        trial_dir / "joint_centre_metrics.csv",
+        trial_dir / "joint_centre_timeseries.npz",
+        trial_dir / "kinematics_q_metrics.csv",
+        trial_dir / "kinematics_q_timeseries.npz",
+        trial_dir / "captury_c3d_angle_metrics.csv",
+        trial_dir / "captury_c3d_angle_timeseries.npz",
+        trial_dir / "model_dimensions.csv",
+        trial_dir / "motive_marker_occlusions.csv",
+        trial_dir / "skin_marker_correspondence_metrics.csv",
+        trial_dir / "trial_events_contacts.csv",
+        trial_dir / "run_report.json",
+    ]
+
+
+def cached_trial_report(
+    trial_dir: Path,
+    bundle: TrialBundle,
+    args: argparse.Namespace,
+    static_alignment_transform: tuple[np.ndarray, np.ndarray] | None = None,
+) -> dict[str, Any] | None:
+    if args.no_cache:
+        return None
+    report_path = trial_dir / "run_report.json"
+    if not report_path.exists():
+        return None
+    try:
+        report = json.loads(report_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+    expected = trial_cache_fingerprint(bundle, args, static_alignment_transform)
+    if report.get("cache", {}).get("fingerprint") != expected:
+        return None
+    for output_path in required_trial_outputs(trial_dir, bundle.name):
+        if not output_path.exists() or output_path.stat().st_size == 0:
+            return None
+    if args.run_ik_batch and "motive_ik_batch" not in report:
+        return None
+    return report
+
+
+def static_transform_from_report(
+    report: dict[str, Any],
+) -> tuple[np.ndarray, np.ndarray] | None:
+    alignment = report.get("alignment", {})
+    rotation = alignment.get("rotation")
+    translation = alignment.get("translation_mm")
+    if rotation is None or translation is None:
+        return None
+    try:
+        return np.asarray(rotation, dtype=float), np.asarray(translation, dtype=float)
+    except (TypeError, ValueError):
+        return None
 
 
 def safe_name(value: str) -> str:
@@ -203,11 +346,19 @@ def build_model_run(
     include_mesh: bool,
     max_mesh_points: int,
     unit_scale_override: float | None,
+    root_offset_mode: str,
+    model_to_c3d_axis: str,
+    angle_label_regex: str,
 ) -> ModelRun:
     source_kind, source_path = select_model_file(bundle, system, model_source)
     source_dir = out_dir / system / source_kind
     source_dir.mkdir(parents=True, exist_ok=True)
     biomod_path = source_dir / f"{system}_{source_kind}_biobuddy.bioMod"
+    unit_scale_to_m = native_unit_scale_to_m(system, source_kind, unit_scale_override)
+    c3d_path = bundle.captury_c3d if system == "captury" else bundle.motive_c3d
+    _labels, c3d_points_mm, _residuals, c3d_time = read_c3d_points_mm(
+        c3d_path, angle_label_regex
+    )
     mesh_report: dict[str, Any] = {
         "mesh_file_count": 0,
         "mesh_vertices": 0,
@@ -217,10 +368,13 @@ def build_model_run(
         _, parser = build_biomod_from_bvh_with_biobuddy(
             source_path, biomod_path, add_joint_centre_markers=True
         )
-        runtime = extract_q_from_biobuddy_bvh_parser(
+        corrected_runtime = extract_q_from_biobuddy_bvh_parser(
             parser, apply_root_offset_correction=True
         )
-        joint_names = runtime.joint_names
+        uncorrected_runtime = extract_q_from_biobuddy_bvh_parser(
+            parser, apply_root_offset_correction=False
+        )
+        joint_names = corrected_runtime.joint_names
     else:
         _, parser, mesh_report = build_biomod_from_fbx_with_biobuddy(
             source_path,
@@ -229,7 +383,12 @@ def build_model_run(
             include_mesh=include_mesh,
             max_mesh_points=max_mesh_points,
         )
-        runtime = extract_q_from_fbx_parser(parser, apply_root_offset_correction=True)
+        corrected_runtime = extract_q_from_fbx_parser(
+            parser, source_path, apply_root_offset_correction=True
+        )
+        uncorrected_runtime = extract_q_from_fbx_parser(
+            parser, source_path, apply_root_offset_correction=False
+        )
         joint_names = collect_fbx_joint_names_depth_first(parser)
         mesh_dir = biomod_path.parent / "meshes"
         if include_mesh and mesh_dir.exists():
@@ -237,6 +396,42 @@ def build_model_run(
                 mesh_report = convert_biobuddy_ply_meshes_to_vtp(mesh_dir)
             except Exception:
                 pass
+    use_correction, root_offset_policy, centres_native = (
+        choose_root_offset_policy_in_c3d(
+            source_name=f"{system}_{source_kind}",
+            biomod_path=biomod_path,
+            corrected_q=corrected_runtime.q,
+            uncorrected_q=uncorrected_runtime.q,
+            q_names=corrected_runtime.q_names,
+            time=corrected_runtime.time,
+            joint_names=joint_names,
+            unit_scale_to_m=unit_scale_to_m,
+            model_to_c3d_axis=model_to_c3d_axis,
+            c3d_markers_mm=c3d_points_mm,
+            c3d_time=c3d_time,
+            requested_mode=root_offset_mode,
+            out_dir=source_dir,
+        )
+    )
+    runtime = corrected_runtime if use_correction else uncorrected_runtime
+    root_offset_policy.update(
+        {
+            "source_file": str(source_path),
+            "c3d_file": str(c3d_path),
+            "root_offset_native": (
+                runtime.root_offset_native.tolist()
+                if runtime.root_offset_native is not None
+                else None
+            ),
+            "root_offset_correction_applied": bool(
+                runtime.root_offset_correction_applied
+            ),
+            "source_unit_scale_to_m": unit_scale_to_m,
+        }
+    )
+    (source_dir / f"{system}_{source_kind}_root_translation_policy.json").write_text(
+        json.dumps(root_offset_policy, indent=2), encoding="utf-8"
+    )
     if source_kind == "fbx":
         append_joint_centre_markers_to_biomod(
             biomod_path, joint_names, marker_prefix=f"{system.upper()}JC_"
@@ -249,9 +444,6 @@ def build_model_run(
         source_name=system,
         q_units=runtime.q_units,
     )
-    centres_native = compute_model_joint_centres_native(
-        biomod_path, runtime.q, set(joint_names)
-    )
     save_model_joint_centres(centres_native, runtime.time, source_dir, system)
     return ModelRun(
         system=system,
@@ -263,10 +455,9 @@ def build_model_run(
         time=runtime.time,
         joint_names=joint_names,
         centres_native=centres_native,
-        unit_scale_to_m=native_unit_scale_to_m(
-            system, source_kind, unit_scale_override
-        ),
+        unit_scale_to_m=unit_scale_to_m,
         mesh_report=mesh_report,
+        root_offset_policy=root_offset_policy,
     )
 
 
@@ -292,6 +483,95 @@ def centres_to_c3d_mm(
     matrix = model_to_c3d_matrix(axis_mode)
     factor = unit_scale_to_m * 1000.0
     return {name: matrix @ (values * factor) for name, values in centres_native.items()}
+
+
+def root_alignment_score_mm(
+    centres_c3d_mm: dict[str, np.ndarray],
+    source_time: np.ndarray,
+    c3d_markers_mm: np.ndarray,
+    c3d_time: np.ndarray,
+    max_frames: int = 120,
+) -> float:
+    if not centres_c3d_mm or c3d_markers_mm.size == 0:
+        return float("inf")
+    stacked = np.stack(list(centres_c3d_mm.values()), axis=1)
+    centres_on_c3d = interpolate_array(stacked, source_time, c3d_time)
+    n_frames = centres_on_c3d.shape[2]
+    frame_indices = np.linspace(0, n_frames - 1, min(max_frames, n_frames), dtype=int)
+    frame_scores: list[float] = []
+    for frame in frame_indices:
+        centres = centres_on_c3d[:, :, frame].T
+        markers = c3d_markers_mm[:, :, frame].T
+        finite_centres = np.all(np.isfinite(centres), axis=1)
+        finite_markers = np.all(np.isfinite(markers), axis=1)
+        centres = centres[finite_centres]
+        markers = markers[finite_markers]
+        if centres.size == 0 or markers.size == 0:
+            continue
+        distances = np.linalg.norm(centres[:, None, :] - markers[None, :, :], axis=2)
+        frame_scores.append(float(np.nanmedian(np.nanmin(distances, axis=1))))
+    return float(np.nanmedian(frame_scores)) if frame_scores else float("inf")
+
+
+def choose_root_offset_policy_in_c3d(
+    source_name: str,
+    biomod_path: Path,
+    corrected_q: np.ndarray,
+    uncorrected_q: np.ndarray,
+    q_names: list[str],
+    time: np.ndarray,
+    joint_names: list[str],
+    unit_scale_to_m: float,
+    model_to_c3d_axis: str,
+    c3d_markers_mm: np.ndarray,
+    c3d_time: np.ndarray,
+    requested_mode: str,
+    out_dir: Path,
+) -> tuple[bool, dict[str, Any], dict[str, np.ndarray]]:
+    corrected_centres = compute_model_joint_centres_native(
+        biomod_path, corrected_q, set(joint_names)
+    )
+    uncorrected_centres = compute_model_joint_centres_native(
+        biomod_path, uncorrected_q, set(joint_names)
+    )
+    corrected_score = root_alignment_score_mm(
+        centres_to_c3d_mm(corrected_centres, unit_scale_to_m, model_to_c3d_axis),
+        time,
+        c3d_markers_mm,
+        c3d_time,
+    )
+    uncorrected_score = root_alignment_score_mm(
+        centres_to_c3d_mm(uncorrected_centres, unit_scale_to_m, model_to_c3d_axis),
+        time,
+        c3d_markers_mm,
+        c3d_time,
+    )
+    if requested_mode == "subtract":
+        use_correction = True
+    elif requested_mode == "keep":
+        use_correction = False
+    else:
+        use_correction = corrected_score <= uncorrected_score
+    report = {
+        "source": source_name,
+        "requested_mode": requested_mode,
+        "selected_mode": (
+            "subtract_static_offset_from_root_q"
+            if use_correction
+            else "keep_root_q_as_file"
+        ),
+        "score_mm_subtract_static_offset": corrected_score,
+        "score_mm_keep_file_translation": uncorrected_score,
+        "score_frame": "c3d_mm_after_model_to_c3d_axis",
+        "model_to_c3d_axis": model_to_c3d_axis,
+        "q_names": q_names,
+    }
+    out_dir.mkdir(parents=True, exist_ok=True)
+    (out_dir / f"{source_name}_root_translation_policy.json").write_text(
+        json.dumps(report, indent=2), encoding="utf-8"
+    )
+    selected_centres = corrected_centres if use_correction else uncorrected_centres
+    return use_correction, report, selected_centres
 
 
 def kabsch_rows(
@@ -362,6 +642,149 @@ def apply_alignment(
     return aligned
 
 
+def yaw_rotation_rows(angle_rad: float) -> np.ndarray:
+    cosine = float(np.cos(angle_rad))
+    sine = float(np.sin(angle_rad))
+    return np.asarray(
+        [
+            [cosine, sine, 0.0],
+            [-sine, cosine, 0.0],
+            [0.0, 0.0, 1.0],
+        ],
+        dtype=float,
+    )
+
+
+def yaw_alignment_rows(
+    reference_rows: np.ndarray,
+    moving_rows: np.ndarray,
+    min_points: int = 3,
+) -> tuple[np.ndarray, np.ndarray, dict[str, Any]]:
+    reference = np.asarray(reference_rows, dtype=float)
+    moving = np.asarray(moving_rows, dtype=float)
+    valid = np.all(np.isfinite(reference), axis=1) & np.all(np.isfinite(moving), axis=1)
+    reference = reference[valid]
+    moving = moving[valid]
+    if reference.shape[0] < min_points:
+        return (
+            np.eye(3),
+            np.zeros(3),
+            {
+                "status": "not_enough_points",
+                "n_points": int(reference.shape[0]),
+            },
+        )
+
+    reference_center = np.nanmedian(reference, axis=0)
+    moving_center = np.nanmedian(moving, axis=0)
+    reference_xy = reference[:, :2] - reference_center[:2]
+    moving_xy = moving[:, :2] - moving_center[:2]
+    numerator = float(
+        np.nansum(moving_xy[:, 0] * reference_xy[:, 1])
+        - np.nansum(moving_xy[:, 1] * reference_xy[:, 0])
+    )
+    denominator = float(
+        np.nansum(moving_xy[:, 0] * reference_xy[:, 0])
+        + np.nansum(moving_xy[:, 1] * reference_xy[:, 1])
+    )
+    angle_rad = float(np.arctan2(numerator, denominator))
+    rotation = yaw_rotation_rows(angle_rad)
+    rotated = moving @ rotation
+    translation = np.nanmedian(reference - rotated, axis=0)
+    residuals = np.linalg.norm(rotated + translation - reference, axis=1)
+    return (
+        rotation,
+        translation,
+        {
+            "status": "ok",
+            "n_points": int(reference.shape[0]),
+            "yaw_deg": float(np.degrees(angle_rad)),
+            "median_residual_mm": float(np.nanmedian(residuals)),
+            "p95_residual_mm": float(np.nanpercentile(residuals, 95)),
+            "rotation": rotation.tolist(),
+            "translation_mm": translation.tolist(),
+        },
+    )
+
+
+def horizontal_principal_axis_rows(rows: np.ndarray) -> np.ndarray:
+    values = np.asarray(rows, dtype=float)
+    values = values[np.all(np.isfinite(values), axis=1)]
+    if values.shape[0] < 3:
+        return np.asarray((1.0, 0.0), dtype=float)
+    centered = values[:, :2] - np.nanmean(values[:, :2], axis=0)
+    covariance = centered.T @ centered / max(1, centered.shape[0] - 1)
+    _values, vectors = np.linalg.eigh(covariance)
+    axis = vectors[:, -1]
+    norm = float(np.linalg.norm(axis))
+    if norm <= 1e-12:
+        return np.asarray((1.0, 0.0), dtype=float)
+    return axis / norm
+
+
+def nearest_distance_score(
+    reference_rows: np.ndarray, moving_rows: np.ndarray
+) -> float:
+    reference = np.asarray(reference_rows, dtype=float)
+    moving = np.asarray(moving_rows, dtype=float)
+    reference = reference[np.all(np.isfinite(reference), axis=1)]
+    moving = moving[np.all(np.isfinite(moving), axis=1)]
+    if reference.size == 0 or moving.size == 0:
+        return float("inf")
+    distances = np.linalg.norm(moving[:, None, :] - reference[None, :, :], axis=2)
+    return float(np.nanmean(np.nanmin(distances, axis=1)))
+
+
+def pca_yaw_alignment_rows(
+    reference_rows: np.ndarray,
+    moving_rows: np.ndarray,
+    min_points: int = 3,
+) -> tuple[np.ndarray, np.ndarray, dict[str, Any]]:
+    reference = np.asarray(reference_rows, dtype=float)
+    moving = np.asarray(moving_rows, dtype=float)
+    reference = reference[np.all(np.isfinite(reference), axis=1)]
+    moving = moving[np.all(np.isfinite(moving), axis=1)]
+    if reference.shape[0] < min_points or moving.shape[0] < min_points:
+        return (
+            np.eye(3),
+            np.zeros(3),
+            {
+                "status": "not_enough_points",
+                "reference_points": int(reference.shape[0]),
+                "moving_points": int(moving.shape[0]),
+            },
+        )
+    reference_axis = horizontal_principal_axis_rows(reference)
+    moving_axis = horizontal_principal_axis_rows(moving)
+    base_angle = float(
+        np.arctan2(
+            moving_axis[0] * reference_axis[1] - moving_axis[1] * reference_axis[0],
+            np.dot(moving_axis, reference_axis),
+        )
+    )
+    candidates: list[tuple[float, np.ndarray, np.ndarray, float]] = []
+    for angle_rad in (base_angle, base_angle + np.pi):
+        rotation = yaw_rotation_rows(angle_rad)
+        rotated = moving @ rotation
+        translation = np.nanmedian(reference, axis=0) - np.nanmedian(rotated, axis=0)
+        score = nearest_distance_score(reference, rotated + translation)
+        candidates.append((score, rotation, translation, angle_rad))
+    score, rotation, translation, angle_rad = min(candidates, key=lambda item: item[0])
+    return (
+        rotation,
+        translation,
+        {
+            "status": "ok_pca_fallback",
+            "reference_points": int(reference.shape[0]),
+            "moving_points": int(moving.shape[0]),
+            "yaw_deg": float(np.degrees(angle_rad)),
+            "nearest_distance_mm": score,
+            "rotation": rotation.tolist(),
+            "translation_mm": translation.tolist(),
+        },
+    )
+
+
 def interpolate_centres_to_time(
     centres_mm: dict[str, np.ndarray], source_time: np.ndarray, target_time: np.ndarray
 ) -> dict[str, np.ndarray]:
@@ -369,6 +792,67 @@ def interpolate_centres_to_time(
         name: interpolate_array(values, source_time, target_time)
         for name, values in centres_mm.items()
     }
+
+
+def time_window_mask(
+    time: np.ndarray, start_s: float | None, end_s: float | None
+) -> np.ndarray:
+    mask = np.ones(time.shape[0], dtype=bool)
+    if start_s is not None:
+        mask &= time >= float(start_s)
+    if end_s is not None:
+        mask &= time <= float(end_s)
+    if not np.any(mask):
+        raise ValueError(
+            f"Empty time window start={start_s!r}, end={end_s!r} for "
+            f"signal spanning {float(time[0]) if time.size else np.nan:.3f} to "
+            f"{float(time[-1]) if time.size else np.nan:.3f} s."
+        )
+    return mask
+
+
+def trim_centres(
+    centres: dict[str, np.ndarray], mask: np.ndarray
+) -> dict[str, np.ndarray]:
+    return {name: values[:, mask] for name, values in centres.items()}
+
+
+def trim_model_run(
+    run: ModelRun, start_s: float | None, end_s: float | None
+) -> ModelRun:
+    if start_s is None and end_s is None:
+        return run
+    mask = time_window_mask(run.time, start_s, end_s)
+    return replace(
+        run,
+        q=run.q[:, mask],
+        time=run.time[mask],
+        centres_native=trim_centres(run.centres_native, mask),
+    )
+
+
+def resolve_cut_window(
+    cut_mode: str,
+    manual_start_s: float | None,
+    manual_end_s: float | None,
+    event_report: dict[str, Any],
+) -> tuple[float | None, float | None, str]:
+    if cut_mode == "full":
+        return None, None, "full"
+    if cut_mode == "movement":
+        return (
+            float(event_report["movement_start_time"]),
+            float(event_report["movement_end_time"]),
+            "movement",
+        )
+    if manual_start_s is not None and manual_end_s is not None:
+        if manual_start_s > manual_end_s:
+            raise ValueError(
+                f"Manual time window start ({manual_start_s}) is after end ({manual_end_s})."
+            )
+    if manual_start_s is None and manual_end_s is None:
+        return None, None, "full"
+    return manual_start_s, manual_end_s, "manual"
 
 
 def append_centres_to_motive_c3d(
@@ -439,37 +923,40 @@ def centre_metric_rows(
         captury_centres_mm, captury_time, motive_time
     )
     common = sorted(set(cap_on_motive).intersection(motive_centres_mm))
+    metric_joints = common
     if joint_filters:
         import re
 
         regexes = [re.compile(pattern) for pattern in joint_filters]
-        common = [
+        metric_joints = [
             joint for joint in common if any(regex.search(joint) for regex in regexes)
         ]
+    metric_joint_set = set(metric_joints)
     for joint in common:
         cap = cap_on_motive[joint].T
         mot = motive_centres_mm[joint].T
         valid = np.all(np.isfinite(cap), axis=1) & np.all(np.isfinite(mot), axis=1)
         errors = np.linalg.norm(cap - mot, axis=1)
-        summary_rows.append(
-            {
-                "trial": trial,
-                "joint": joint,
-                "n_frames": int(valid.sum()),
-                "median_error_mm": (
-                    float(np.nanmedian(errors[valid])) if valid.any() else np.nan
-                ),
-                "p95_error_mm": (
-                    float(np.nanpercentile(errors[valid], 95))
-                    if valid.any()
-                    else np.nan
-                ),
-                "max_error_mm": (
-                    float(np.nanmax(errors[valid])) if valid.any() else np.nan
-                ),
-                **joint_center_error_xyz(mot, cap),
-            }
-        )
+        if joint in metric_joint_set:
+            summary_rows.append(
+                {
+                    "trial": trial,
+                    "joint": joint,
+                    "n_frames": int(valid.sum()),
+                    "median_error_mm": (
+                        float(np.nanmedian(errors[valid])) if valid.any() else np.nan
+                    ),
+                    "p95_error_mm": (
+                        float(np.nanpercentile(errors[valid], 95))
+                        if valid.any()
+                        else np.nan
+                    ),
+                    "max_error_mm": (
+                        float(np.nanmax(errors[valid])) if valid.any() else np.nan
+                    ),
+                    **joint_center_error_xyz(mot, cap),
+                }
+            )
         for i, time_value in enumerate(motive_time):
             timeseries_rows.append(
                 {
@@ -523,6 +1010,77 @@ def q_metric_rows(
     return summary_rows, timeseries_rows
 
 
+def c3d_angle_scale_to_deg(unit: str) -> float:
+    normalized = str(unit).strip().lower()
+    if normalized in {"rad", "radian", "radians"}:
+        return 180.0 / np.pi
+    return 1.0
+
+
+def sanitize_channel_name(name: str, fallback: str) -> str:
+    cleaned = re.sub(r"\W+", "_", str(name).strip()).strip("_")
+    if not cleaned:
+        return fallback
+    if cleaned[0].isdigit():
+        cleaned = f"_{cleaned}"
+    return cleaned
+
+
+def captury_c3d_angle_rows(
+    trial: str,
+    captury_c3d: Path,
+    angle_label_regex: str,
+    c3d_angle_unit: str,
+    cut_start_s: float | None,
+    cut_end_s: float | None,
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    split = split_c3d_points(
+        captury_c3d,
+        bvh_unit_scale_to_m=0.001,
+        angle_label_regex=angle_label_regex,
+    )
+    if not split.angle_labels or split.angle_data.size == 0:
+        return [], []
+    mask = time_window_mask(split.time, cut_start_s, cut_end_s)
+    time = split.time[mask]
+    angle_deg = split.angle_data[:, :, mask] * c3d_angle_scale_to_deg(c3d_angle_unit)
+    summary_rows: list[dict[str, Any]] = []
+    timeseries_rows: list[dict[str, Any]] = []
+    axis_names = ("X", "Y", "Z")
+    for angle_index, angle_label in enumerate(split.angle_labels):
+        safe_label = sanitize_channel_name(angle_label, f"angle_{angle_index}")
+        for axis_index, axis_name in enumerate(axis_names):
+            values = angle_deg[axis_index, angle_index, :]
+            finite = values[np.isfinite(values)]
+            if finite.size == 0:
+                continue
+            q_name = f"CapturyC3D_{safe_label}_{axis_name}"
+            summary_rows.append(
+                {
+                    "trial": trial,
+                    "q_name": q_name,
+                    "unit": "deg",
+                    "source": "captury_c3d",
+                    "c3d_angle_label": angle_label,
+                    "c3d_angle_axis": axis_name,
+                    "c3d_mean_deg": float(np.mean(finite)),
+                    "c3d_sd_deg": float(np.std(finite)),
+                    "c3d_min_deg": float(np.min(finite)),
+                    "c3d_max_deg": float(np.max(finite)),
+                }
+            )
+            for frame_index, time_value in enumerate(time):
+                timeseries_rows.append(
+                    {
+                        "trial": trial,
+                        "time": float(time_value),
+                        "q_name": q_name,
+                        "captury_c3d": float(values[frame_index]),
+                    }
+                )
+    return summary_rows, timeseries_rows
+
+
 def c3d_angle_inventory(path: Path, angle_label_regex: str) -> dict[str, Any]:
     ezc3d = require_ezc3d()
     c3d = ezc3d.c3d(str(path))
@@ -552,20 +1110,26 @@ def duplicate_label_inventory(path: Path) -> dict[str, Any]:
 
 def read_c3d_points_mm(
     path: Path,
+    angle_label_regex: str = ANGLE_LABEL_REGEX,
 ) -> tuple[list[str], np.ndarray, np.ndarray, np.ndarray]:
     ezc3d = require_ezc3d()
     c3d = ezc3d.c3d(str(path))
     labels = as_str_list(get_c3d_param(c3d, "POINT", "LABELS", []))
+    angle_indices = set(detect_angle_indices(c3d, labels, angle_label_regex).values())
+    marker_indices = [
+        index for index in range(len(labels)) if index not in angle_indices
+    ]
     unit_mm = unit_scale_to_mm(
         as_str_list(get_c3d_param(c3d, "POINT", "UNITS", [""]))[0]
     )
     points = np.asarray(c3d["data"]["points"], dtype=float)
-    xyz_mm = points[:3] * unit_mm
+    xyz_mm = points[:3, marker_indices, :] * unit_mm
     residuals = (
-        points[3]
+        points[3, marker_indices, :]
         if points.shape[0] > 3
-        else np.zeros((points.shape[1], points.shape[2]))
+        else np.zeros((len(marker_indices), points.shape[2]))
     )
+    xyz_mm[:, residuals < 0] = np.nan
     rate_value = get_c3d_param(c3d, "POINT", "RATE", [120])
     rate = float(
         rate_value[0]
@@ -573,7 +1137,7 @@ def read_c3d_points_mm(
         else rate_value
     )
     time = np.arange(xyz_mm.shape[2], dtype=float) / rate
-    return labels, xyz_mm, residuals, time
+    return [labels[index] for index in marker_indices], xyz_mm, residuals, time
 
 
 def clean_marker_label(label: str) -> str:
@@ -597,27 +1161,150 @@ def average_marker_group(
         return np.nanmean(values, axis=1)
 
 
-def analyze_motive_occlusions(
-    motive_c3d: Path, trial_dir: Path, trial: str
-) -> tuple[list[dict[str, Any]], Path | None]:
-    labels, points_mm, residuals, _ = read_c3d_points_mm(motive_c3d)
+def marker_proxy_centres_from_c3d(
+    labels: list[str], points_mm: np.ndarray
+) -> dict[str, np.ndarray]:
+    lookup = marker_indices_by_clean_label(labels)
+    proxies: dict[str, np.ndarray] = {}
+    for joint, marker_labels in MODEL_JOINT_MARKER_PROXIES.items():
+        indices = [
+            index
+            for marker_label in marker_labels
+            for index in lookup.get(marker_label, [])
+        ]
+        signal = average_marker_group(points_mm, indices)
+        if signal is not None:
+            proxies[joint] = signal
+    return proxies
+
+
+def paired_model_marker_rows(
+    model_centres_mm: dict[str, np.ndarray],
+    model_time: np.ndarray,
+    marker_proxy_centres_mm: dict[str, np.ndarray],
+    marker_time: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray, list[str]]:
+    moving_rows: list[np.ndarray] = []
+    reference_rows: list[np.ndarray] = []
+    used_joints: list[str] = []
+    for joint in sorted(set(model_centres_mm).intersection(marker_proxy_centres_mm)):
+        model_signal = interpolate_array(
+            model_centres_mm[joint], model_time, marker_time
+        ).T
+        marker_signal = marker_proxy_centres_mm[joint].T
+        valid = np.all(np.isfinite(model_signal), axis=1) & np.all(
+            np.isfinite(marker_signal), axis=1
+        )
+        if not np.any(valid):
+            continue
+        moving_rows.append(model_signal[valid])
+        reference_rows.append(marker_signal[valid])
+        used_joints.append(joint)
+    if not moving_rows:
+        return np.empty((0, 3)), np.empty((0, 3)), []
+    return np.vstack(reference_rows), np.vstack(moving_rows), used_joints
+
+
+def stacked_finite_rows_from_centres(
+    centres_mm: dict[str, np.ndarray],
+    time: np.ndarray,
+    reference_time: np.ndarray,
+    max_rows: int = 2000,
+) -> np.ndarray:
+    rows: list[np.ndarray] = []
+    for values in centres_mm.values():
+        interpolated = interpolate_array(values, time, reference_time).T
+        interpolated = interpolated[np.all(np.isfinite(interpolated), axis=1)]
+        if interpolated.size:
+            rows.append(interpolated)
+    if not rows:
+        return np.empty((0, 3))
+    stacked = np.vstack(rows)
+    if stacked.shape[0] > max_rows:
+        step = int(np.ceil(stacked.shape[0] / max_rows))
+        stacked = stacked[::step]
+    return stacked
+
+
+def stacked_finite_rows_from_marker_points(
+    points_mm: np.ndarray, max_rows: int = 4000
+) -> np.ndarray:
+    rows = np.asarray(points_mm, dtype=float).transpose(2, 1, 0).reshape(-1, 3)
+    rows = rows[np.all(np.isfinite(rows), axis=1)]
+    if rows.shape[0] > max_rows:
+        step = int(np.ceil(rows.shape[0] / max_rows))
+        rows = rows[::step]
+    return rows
+
+
+def model_to_motive_marker_alignment(
+    model_centres_mm: dict[str, np.ndarray],
+    model_time: np.ndarray,
+    motive_c3d: Path,
+) -> tuple[np.ndarray, np.ndarray, dict[str, Any]]:
+    labels, marker_points_mm, residuals, marker_time = read_c3d_points_mm(motive_c3d)
+    if residuals.shape == marker_points_mm.shape[1:]:
+        marker_points_mm = marker_points_mm.copy()
+        marker_points_mm[:, residuals < 0] = np.nan
+    marker_proxies = marker_proxy_centres_from_c3d(labels, marker_points_mm)
+    reference_rows, moving_rows, used_joints = paired_model_marker_rows(
+        model_centres_mm, model_time, marker_proxies, marker_time
+    )
+    rotation, translation, report = yaw_alignment_rows(reference_rows, moving_rows)
+    report["used_proxy_joints"] = used_joints
+    report["method"] = "motive_57_marker_proxies"
+    if report.get("status") == "ok":
+        return rotation, translation, report
+
+    marker_rows = stacked_finite_rows_from_marker_points(marker_points_mm)
+    model_rows = stacked_finite_rows_from_centres(
+        model_centres_mm, model_time, marker_time
+    )
+    rotation, translation, fallback_report = pca_yaw_alignment_rows(
+        marker_rows, model_rows
+    )
+    fallback_report["used_proxy_joints"] = used_joints
+    fallback_report["method"] = "horizontal_pca_fallback"
+    fallback_report["proxy_status"] = report
+    return rotation, translation, fallback_report
+
+
+def occlusion_rows_from_points(
+    trial: str, labels: list[str], points_mm: np.ndarray, residuals: np.ndarray
+) -> list[dict[str, Any]]:
+    finite_xyz = np.all(np.isfinite(points_mm), axis=0)
+    missing = ~finite_xyz
+    if residuals.shape == missing.shape:
+        missing = missing | (residuals < 0)
     rows: list[dict[str, Any]] = []
     for i, label in enumerate(labels):
-        xyz = points_mm[:, i, :]
-        missing = ~np.all(np.isfinite(xyz), axis=0)
-        if residuals.shape[0] > i:
-            missing = missing | (residuals[i, :] < 0)
+        marker_missing = missing[i]
         rows.append(
             {
                 "trial": trial,
-                "marker": label,
-                "missing_frames": int(np.sum(missing)),
-                "total_frames": int(missing.shape[0]),
-                "missing_percent": float(100.0 * np.mean(missing)),
+                "marker_order": i,
+                "marker": clean_marker_label(label),
+                "raw_marker": label,
+                "missing_frames": int(np.sum(marker_missing)),
+                "total_frames": int(marker_missing.shape[0]),
+                "missing_percent": float(100.0 * np.mean(marker_missing)),
             }
         )
+    return rows
+
+
+def analyze_motive_occlusions(
+    motive_c3d: Path,
+    trial_dir: Path,
+    trial: str,
+    generate_figure: bool = True,
+) -> tuple[list[dict[str, Any]], Path | None]:
+    labels, points_mm, residuals, _ = read_c3d_points_mm(motive_c3d)
+    rows = occlusion_rows_from_points(trial, labels, points_mm, residuals)
     csv_path = trial_dir / "motive_marker_occlusions.csv"
     write_rows(csv_path, rows)
+    if not generate_figure:
+        return rows, None
     fig_path = plot_metric_barh(
         pd.DataFrame(rows),
         category="marker",
@@ -634,6 +1321,8 @@ def detect_trial_events_and_contacts(
     trial_dir: Path,
     trial: str,
     foot_marker_regex: str = FOOT_MARKER_PATTERN,
+    time_start_s: float | None = None,
+    time_end_s: float | None = None,
 ) -> tuple[dict[str, Any], list[dict[str, Any]]]:
     import re
 
@@ -682,7 +1371,10 @@ def detect_trial_events_and_contacts(
     left_contact, left_z, left_speed = foot_contact(left_indices)
     right_contact, right_z, right_speed = foot_contact(right_indices)
     rows: list[dict[str, Any]] = []
+    contact_mask = time_window_mask(time, time_start_s, time_end_s)
     for i, time_value in enumerate(time):
+        if not contact_mask[i]:
+            continue
         rows.append(
             {
                 "trial": trial,
@@ -712,6 +1404,14 @@ def detect_trial_events_and_contacts(
         "movement_start_time": float(time[start_index]),
         "movement_end_time": float(time[end_index]),
         "movement_speed_threshold_mm_s": threshold,
+        "manual_time_start_s": time_start_s,
+        "manual_time_end_s": time_end_s,
+        "used_start_time": (
+            float(time[contact_mask][0]) if np.any(contact_mask) else np.nan
+        ),
+        "used_end_time": (
+            float(time[contact_mask][-1]) if np.any(contact_mask) else np.nan
+        ),
         "left_foot_markers": [labels[i] for i in left_indices],
         "right_foot_markers": [labels[i] for i in right_indices],
     }
@@ -885,6 +1585,20 @@ def write_rows(path: Path, rows: list[dict[str, Any]]) -> None:
         path.write_text("", encoding="utf-8")
         return
     pd.DataFrame(rows).to_csv(path, index=False)
+
+
+def write_table_npz(path: Path, rows: list[dict[str, Any]]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    dataframe = pd.DataFrame(rows)
+    columns = np.asarray(list(dataframe.columns), dtype=str)
+    payload: dict[str, np.ndarray] = {"columns": columns}
+    for index, column in enumerate(columns):
+        series = dataframe[str(column)]
+        if pd.api.types.is_numeric_dtype(series):
+            payload[f"col_{index}"] = series.to_numpy()
+        else:
+            payload[f"col_{index}"] = series.fillna("").astype(str).to_numpy(dtype=str)
+    np.savez_compressed(path, **payload)
 
 
 def metric_columns(df: pd.DataFrame, exclude: set[str]) -> list[str]:
@@ -1062,6 +1776,26 @@ def compare_trial(
 ) -> tuple[dict[str, Any], tuple[np.ndarray, np.ndarray] | None]:
     trial_dir = out_root / safe_name(bundle.name)
     trial_dir.mkdir(parents=True, exist_ok=True)
+    cache_fingerprint = trial_cache_fingerprint(
+        bundle, args, static_alignment_transform
+    )
+    cached_report = cached_trial_report(
+        trial_dir, bundle, args, static_alignment_transform
+    )
+    if cached_report is not None:
+        print(f"Using cached trial outputs: {bundle.name}")
+        cached_report.setdefault("cache", {})["hit"] = True
+        enriched_c3d = cached_report.get("outputs", {}).get("enriched_c3d")
+        if (
+            args.visualize
+            and (args.visualize_trial is None or args.visualize_trial == bundle.name)
+            and enriched_c3d
+        ):
+            visualize_enriched_c3d(
+                Path(enriched_c3d), args.rerun_wait_seconds, args.headless
+            )
+        cached_transform = static_transform_from_report(cached_report)
+        return cached_report, static_alignment_transform or cached_transform
     captury = build_model_run(
         bundle,
         "captury",
@@ -1070,6 +1804,9 @@ def compare_trial(
         include_mesh=not args.no_mesh,
         max_mesh_points=args.max_mesh_points,
         unit_scale_override=args.captury_unit_scale_to_m,
+        root_offset_mode=args.root_offset_mode,
+        model_to_c3d_axis=args.model_to_c3d_axis,
+        angle_label_regex=args.angle_label_regex,
     )
     motive = build_model_run(
         bundle,
@@ -1079,6 +1816,9 @@ def compare_trial(
         include_mesh=not args.no_mesh,
         max_mesh_points=args.max_mesh_points,
         unit_scale_override=args.motive_unit_scale_to_m,
+        root_offset_mode=args.root_offset_mode,
+        model_to_c3d_axis=args.model_to_c3d_axis,
+        angle_label_regex=args.angle_label_regex,
     )
     cap_c3d_mm = centres_to_c3d_mm(
         captury.centres_native, captury.unit_scale_to_m, args.model_to_c3d_axis
@@ -1100,6 +1840,16 @@ def compare_trial(
             "translation_mm": translation.tolist(),
         }
     cap_aligned_mm = apply_alignment(cap_c3d_mm, rotation, translation)
+    model_marker_rotation, model_marker_translation, model_marker_report = (
+        model_to_motive_marker_alignment(mot_c3d_mm, motive.time, bundle.motive_c3d)
+    )
+    cap_aligned_mm = apply_alignment(
+        cap_aligned_mm, model_marker_rotation, model_marker_translation
+    )
+    mot_c3d_mm = apply_alignment(
+        mot_c3d_mm, model_marker_rotation, model_marker_translation
+    )
+    alignment_report["motive_model_to_c3d_markers"] = model_marker_report
     enriched_c3d = append_centres_to_motive_c3d(
         bundle.motive_c3d,
         trial_dir / f"{safe_name(bundle.name)}_motive_with_capjc_motjc.c3d",
@@ -1109,29 +1859,62 @@ def compare_trial(
         motive.time,
         args.angle_label_regex,
     )
+    detected_event_report, _ = detect_trial_events_and_contacts(
+        bundle.motive_c3d, trial_dir, bundle.name
+    )
+    cut_start_s, cut_end_s, effective_cut_mode = resolve_cut_window(
+        args.cut_mode, args.time_start, args.time_end, detected_event_report
+    )
+    captury_metrics = trim_model_run(captury, cut_start_s, cut_end_s)
+    motive_metrics = trim_model_run(motive, cut_start_s, cut_end_s)
+    cap_aligned_metrics_mm = trim_centres(
+        cap_aligned_mm, time_window_mask(captury.time, cut_start_s, cut_end_s)
+    )
+    mot_metrics_mm = trim_centres(
+        mot_c3d_mm, time_window_mask(motive.time, cut_start_s, cut_end_s)
+    )
     centre_rows, centre_ts_rows = centre_metric_rows(
         bundle.name,
-        cap_aligned_mm,
-        mot_c3d_mm,
-        captury.time,
-        motive.time,
+        cap_aligned_metrics_mm,
+        mot_metrics_mm,
+        captury_metrics.time,
+        motive_metrics.time,
         args.joint_filter,
     )
-    q_rows, q_ts_rows = q_metric_rows(bundle.name, captury, motive)
+    q_rows, q_ts_rows = q_metric_rows(bundle.name, captury_metrics, motive_metrics)
+    c3d_angle_rows, c3d_angle_ts_rows = captury_c3d_angle_rows(
+        bundle.name,
+        bundle.captury_c3d,
+        args.angle_label_regex,
+        args.c3d_angle_unit,
+        cut_start_s,
+        cut_end_s,
+    )
+    q_rows.extend(c3d_angle_rows)
+    q_ts_rows.extend(c3d_angle_ts_rows)
     occlusion_rows, occlusion_figure = analyze_motive_occlusions(
-        bundle.motive_c3d, trial_dir, bundle.name
+        bundle.motive_c3d,
+        trial_dir,
+        bundle.name,
+        generate_figure=not args.no_figures,
     )
     event_report, _contact_rows = detect_trial_events_and_contacts(
-        bundle.motive_c3d, trial_dir, bundle.name
+        bundle.motive_c3d,
+        trial_dir,
+        bundle.name,
+        time_start_s=cut_start_s,
+        time_end_s=cut_end_s,
     )
     dimension_rows = model_dimension_rows(bundle.name, [captury, motive])
     marker_rows = marker_correspondence_rows(
         bundle.name, bundle.motive_c3d, bundle.captury_c3d, rotation, translation
     )
     write_rows(trial_dir / "joint_centre_metrics.csv", centre_rows)
-    write_rows(trial_dir / "joint_centre_timeseries.csv", centre_ts_rows)
+    write_table_npz(trial_dir / "joint_centre_timeseries.npz", centre_ts_rows)
     write_rows(trial_dir / "kinematics_q_metrics.csv", q_rows)
-    write_rows(trial_dir / "kinematics_q_timeseries.csv", q_ts_rows)
+    write_table_npz(trial_dir / "kinematics_q_timeseries.npz", q_ts_rows)
+    write_rows(trial_dir / "captury_c3d_angle_metrics.csv", c3d_angle_rows)
+    write_table_npz(trial_dir / "captury_c3d_angle_timeseries.npz", c3d_angle_ts_rows)
     write_rows(trial_dir / "model_dimensions.csv", dimension_rows)
     write_rows(trial_dir / "skin_marker_correspondence_metrics.csv", marker_rows)
     plot_metric_barh(
@@ -1169,6 +1952,7 @@ def compare_trial(
                 "mesh": captury.mesh_report,
                 "n_q": int(captury.q.shape[0]),
                 "n_frames": int(captury.q.shape[1]),
+                "root_offset_policy": captury.root_offset_policy,
             },
             "motive": {
                 "source_kind": motive.source_kind,
@@ -1177,14 +1961,31 @@ def compare_trial(
                 "mesh": motive.mesh_report,
                 "n_q": int(motive.q.shape[0]),
                 "n_frames": int(motive.q.shape[1]),
+                "root_offset_policy": motive.root_offset_policy,
             },
         },
         "axis_conversion": args.model_to_c3d_axis,
+        "time_window": {
+            "cut_mode": args.cut_mode,
+            "effective_cut_mode": effective_cut_mode,
+            "manual_start_s": args.time_start,
+            "manual_end_s": args.time_end,
+            "used_start_s": cut_start_s,
+            "used_end_s": cut_end_s,
+            "captury_frames": int(captury_metrics.time.shape[0]),
+            "motive_frames": int(motive_metrics.time.shape[0]),
+        },
         "alignment": alignment_report,
         "outputs": {
             "enriched_c3d": str(enriched_c3d),
             "joint_centre_metrics": str(trial_dir / "joint_centre_metrics.csv"),
             "kinematics_q_metrics": str(trial_dir / "kinematics_q_metrics.csv"),
+            "captury_c3d_angle_metrics": str(
+                trial_dir / "captury_c3d_angle_metrics.csv"
+            ),
+            "captury_c3d_angle_timeseries": str(
+                trial_dir / "captury_c3d_angle_timeseries.npz"
+            ),
             "motive_marker_occlusions": str(trial_dir / "motive_marker_occlusions.csv"),
             "trial_events_contacts": str(trial_dir / "trial_events_contacts.csv"),
             "model_dimensions": str(trial_dir / "model_dimensions.csv"),
@@ -1209,6 +2010,11 @@ def compare_trial(
             "Euler angle values can differ because Captury and Motive may export different axis orders and local segment frames.",
             "Joint-centre distances are the primary spatial comparison after static rigid alignment.",
         ],
+        "cache": {
+            "version": CACHE_VERSION,
+            "hit": False,
+            "fingerprint": cache_fingerprint,
+        },
     }
     if args.run_ik_batch:
         report["motive_ik_batch"] = run_ik_batch(
@@ -1244,7 +2050,37 @@ def parse_args() -> argparse.Namespace:
         default="Static",
         help="Trial used to compute Captury -> Motive alignment.",
     )
+    parser.add_argument(
+        "--time-start",
+        type=float,
+        default=None,
+        help="Manual analysis window start in seconds.",
+    )
+    parser.add_argument(
+        "--time-end",
+        type=float,
+        default=None,
+        help="Manual analysis window end in seconds.",
+    )
+    parser.add_argument(
+        "--cut-mode",
+        choices=["manual", "movement", "full"],
+        default="manual",
+        help=(
+            "Trial cutting mode: manual uses --time-start/--time-end when provided, "
+            "movement uses detected movement bounds, full ignores both."
+        ),
+    )
     parser.add_argument("--model-source", choices=["auto", "bvh", "fbx"], default="bvh")
+    parser.add_argument(
+        "--root-offset-mode",
+        choices=["auto", "subtract", "keep"],
+        default="auto",
+        help=(
+            "How to handle static BVH/FBX root offsets: auto scores both "
+            "subtract and keep conventions against the matching C3D marker cloud."
+        ),
+    )
     parser.add_argument(
         "--model-to-c3d-axis",
         choices=["auto", "y_up_to_z_up", "identity"],
@@ -1253,6 +2089,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--captury-unit-scale-to-m", type=float, default=None)
     parser.add_argument("--motive-unit-scale-to-m", type=float, default=None)
     parser.add_argument("--angle-label-regex", default=ANGLE_LABEL_REGEX)
+    parser.add_argument(
+        "--c3d-angle-unit",
+        choices=["deg", "rad"],
+        default="deg",
+        help="Unit used by Captury C3D angle channels stored in POINT.",
+    )
     parser.add_argument(
         "--no-mesh", action="store_true", help="Skip FBX visual mesh extraction."
     )
@@ -1266,8 +2108,60 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--no-figures", action="store_true", help="Skip PNG metric figure generation."
     )
+    parser.add_argument(
+        "--no-cache",
+        action="store_true",
+        help="Force recomputation even when trial outputs match the cache.",
+    )
+    parser.add_argument(
+        "--occlusions-only",
+        action="store_true",
+        help="Only compute Motive marker occlusion CSV outputs.",
+    )
     parser.add_argument("--list-trials", action="store_true")
     return parser.parse_args()
+
+
+def run_occlusions_only(
+    trials: list[TrialBundle], args: argparse.Namespace
+) -> list[dict[str, Any]]:
+    all_rows: list[dict[str, Any]] = []
+    reports: list[dict[str, Any]] = []
+    for bundle in trials:
+        trial_dir = args.out_dir / safe_name(bundle.name)
+        trial_dir.mkdir(parents=True, exist_ok=True)
+        rows, figure = analyze_motive_occlusions(
+            bundle.motive_c3d,
+            trial_dir,
+            bundle.name,
+            generate_figure=not args.no_figures,
+        )
+        all_rows.extend(rows)
+        reports.append(
+            {
+                "trial": bundle.name,
+                "motive_c3d": str(bundle.motive_c3d),
+                "rows": len(rows),
+                "output": str(trial_dir / "motive_marker_occlusions.csv"),
+                "figure": str(figure) if figure else None,
+            }
+        )
+    write_rows(args.out_dir / "all_motive_marker_occlusions.csv", all_rows)
+    (args.out_dir / "run_report_occlusions.json").write_text(
+        json.dumps(
+            {
+                "data_root": str(args.data_root),
+                "out_dir": str(args.out_dir),
+                "n_trials": len(trials),
+                "reports": reports,
+            },
+            indent=2,
+        ),
+        encoding="utf-8",
+    )
+    print(f"Computed occlusions for {len(trials)} trial(s).")
+    print(f"Occlusions: {args.out_dir / 'all_motive_marker_occlusions.csv'}")
+    return all_rows
 
 
 def main() -> None:
@@ -1283,6 +2177,9 @@ def main() -> None:
     if not trials:
         raise RuntimeError(f"No trials found in {args.data_root}.")
     args.out_dir.mkdir(parents=True, exist_ok=True)
+    if args.occlusions_only:
+        run_occlusions_only(trials, args)
+        return
 
     static_bundle = next(
         (
