@@ -42,6 +42,22 @@ GRAPH_CONFIGS = {
         ),
         "title": "Centres articulaires",
     },
+    "segments": {
+        "csv": "all_segment_rotation_metrics.csv",
+        "groups": ("reference", "source", "segment"),
+        "metrics": (
+            "median_global_deg",
+            "p95_global_deg",
+            "max_global_deg",
+            "median_abs_x_deg",
+            "median_abs_y_deg",
+            "median_abs_z_deg",
+            "p95_abs_x_deg",
+            "p95_abs_y_deg",
+            "p95_abs_z_deg",
+        ),
+        "title": "Segments",
+    },
     "skin_markers": {
         "csv": "all_skin_marker_correspondence_metrics.csv",
         "groups": ("landmark",),
@@ -91,6 +107,12 @@ EVENT_METRICS = (
 )
 KINEMATIC_RAD_METRICS = {"bias_rad", "mae_rad", "rmse_rad"}
 KINEMATIC_TIMESERIES_COLUMNS = ("motive", "captury", "captury_c3d", "difference")
+SEGMENT_TIMESERIES_COLUMNS = (
+    "global_deg",
+    "x_deg",
+    "y_deg",
+    "z_deg",
+)
 
 
 def graph_metric_columns(
@@ -186,6 +208,98 @@ def draw_joint_centre_error_timeseries(
     axes.legend()
     axes.grid(alpha=0.3)
     return True
+
+
+def draw_segment_rotation_timeseries(
+    axes: object,
+    dataframe: "pd.DataFrame",
+    trial: str,
+    source: str,
+    segment: str,
+) -> bool:
+    required = {"time", "source", "segment", *SEGMENT_TIMESERIES_COLUMNS}
+    if pd is None or not required.issubset(dataframe.columns):
+        axes.set_title("Aucune rotation segmentaire temporelle")
+        return False
+    values = dataframe[
+        (dataframe["source"].astype(str) == str(source))
+        & (dataframe["segment"].astype(str) == str(segment))
+    ].copy()
+    if values.empty:
+        axes.set_title(f"Aucune rotation segmentaire: {source} / {segment}")
+        return False
+    values["time"] = values["time"].astype(float)
+    curves = (
+        ("global_deg", "global", "#111827"),
+        ("x_deg", "x", "#ef4444"),
+        ("y_deg", "y", "#22c55e"),
+        ("z_deg", "z", "#3b82f6"),
+    )
+    for column, label, color in curves:
+        axes.plot(
+            values["time"], values[column].astype(float), label=label, color=color
+        )
+    axes.set_title(f"{trial} - {source} / {segment} - déviation rotation")
+    axes.set_xlabel("Temps (s)")
+    axes.set_ylabel("Déviation (deg)")
+    axes.legend()
+    axes.grid(alpha=0.3)
+    return True
+
+
+def segment_rotation_boxplot_series(
+    dataframe: "pd.DataFrame",
+    metric: str,
+    *,
+    trial: str | None = None,
+    source: str | None = None,
+    segments: Iterable[str] | None = None,
+) -> list[dict[str, object]]:
+    if pd is None or dataframe.empty:
+        return []
+    values = dataframe.copy()
+    if trial and "trial" in values.columns:
+        values = values[values["trial"].astype(str) == str(trial)]
+    if source and "source" in values.columns:
+        values = values[values["source"].astype(str) == str(source)]
+    requested_segments = {str(segment) for segment in segments or () if str(segment)}
+    if values.empty or "segment" not in values.columns:
+        return []
+    metric_column = {
+        "median_global_deg": "global_deg",
+        "p95_global_deg": "global_deg",
+        "max_global_deg": "global_deg",
+        "median_abs_x_deg": "abs_x_deg",
+        "median_abs_y_deg": "abs_y_deg",
+        "median_abs_z_deg": "abs_z_deg",
+        "p95_abs_x_deg": "abs_x_deg",
+        "p95_abs_y_deg": "abs_y_deg",
+        "p95_abs_z_deg": "abs_z_deg",
+    }.get(metric, "global_deg")
+    series: list[dict[str, object]] = []
+    group_columns = ["source", "segment"] if "source" in values.columns else ["segment"]
+    for keys, rows in values.groupby(group_columns, sort=True):
+        if isinstance(keys, tuple):
+            source_label, segment = str(keys[0]), str(keys[1])
+            label = f"{source_label} / {segment}"
+        else:
+            segment = str(keys)
+            label = segment
+        if requested_segments and segment not in requested_segments:
+            continue
+        if metric_column not in rows.columns:
+            continue
+        item_values = rows[metric_column].astype(float).dropna().to_numpy()
+        if item_values.size:
+            series.append(
+                {
+                    "metric": metric,
+                    "label": label,
+                    "values": np.abs(item_values),
+                    "dataframe": rows,
+                }
+            )
+    return series
 
 
 def joint_centre_error_boxplot_series(

@@ -41,6 +41,8 @@ from gui_commands import (
     MODEL_EDITOR_SCRIPT,
     PIPELINE_SCRIPT,
     PROJECT_DIR,
+    ROOT_OFFSET_MODE_CHOICES,
+    ROOT_OFFSET_MODE_LABELS,
     build_biobuddy_c3d_model_args,
     build_comparison_args,
     build_p6_args,
@@ -55,6 +57,7 @@ from gui_graphs import (
     GRAPH_CONFIGS,
     KINEMATIC_TIMESERIES_COLUMNS,
     draw_dimension_metric_graph,
+    draw_segment_rotation_timeseries,
     joint_centre_error_boxplot_series,
     draw_joint_centre_error_timeseries,
     draw_metric_boxplot,
@@ -62,6 +65,7 @@ from gui_graphs import (
     is_rotation_q_name,
     metric_display_name,
     read_table_npz,
+    segment_rotation_boxplot_series,
     values_for_display,
 )
 from gui_trial_viewer import (
@@ -324,7 +328,7 @@ class CapturyBioBuddyGui(tk.Tk):
             "model_explorer_path": "out_biobuddy_bvh_c3d/model_from_fbx_biobuddy.bioMod",
             "no_biomod_joint_centre_markers": False,
             "no_root_offset_correction": False,
-            "root_offset_mode": "auto",
+            "root_offset_mode": ROOT_OFFSET_MODE_LABELS["auto"],
             "no_fbx_mesh": False,
             "max_fbx_mesh_points": "0",
             "animate": False,
@@ -376,6 +380,9 @@ class CapturyBioBuddyGui(tk.Tk):
             "p6_no_cache": False,
             "p6_model_source": "bvh",
             "p6_model_to_c3d_axis": "auto",
+            "p6_segment_reference": "biobuddy",
+            "p6_disable_static_model_alignment": False,
+            "p6_disable_motive_marker_alignment": False,
             "p6_no_mesh": False,
             "p6_max_mesh_points": "0",
             "p6_run_ik_batch": False,
@@ -467,6 +474,7 @@ class CapturyBioBuddyGui(tk.Tk):
         self._build_occlusions_tab(notebook)
         self._build_trial_cutting_tab(notebook)
         self._build_dimensions_tab(notebook)
+        self._build_segments_tab(notebook)
         self._build_joint_centres_tab(notebook)
         self._build_skin_markers_tab(notebook)
         self._build_kinematics_compare_tab(notebook)
@@ -527,9 +535,9 @@ class CapturyBioBuddyGui(tk.Tk):
         self._combo_row(
             data,
             6,
-            "Root offset",
+            "Offset racine",
             "root_offset_mode",
-            ("auto", "subtract", "keep"),
+            ROOT_OFFSET_MODE_CHOICES,
         )
         inventory = ttk.LabelFrame(tab, text="Fichiers détectés")
         inventory.grid(row=1, column=0, sticky="nsew", pady=(12, 0))
@@ -796,6 +804,26 @@ class CapturyBioBuddyGui(tk.Tk):
         self._analysis_action_row(tab, 1)
         self._build_graph_panel(tab, 2, "dimensions")
 
+    def _build_segments_tab(self, notebook: ttk.Notebook) -> None:
+        tab = self._tab(notebook, "Segments")
+        tab.rowconfigure(2, weight=1)
+        panel = ttk.LabelFrame(tab, text="Repères segmentaires")
+        panel.grid(row=0, column=0, sticky="ew")
+        panel.columnconfigure(1, weight=1)
+        self._combo_row(
+            panel,
+            0,
+            "Référence",
+            "p6_segment_reference",
+            ("biobuddy", "motive", "captury"),
+        )
+        self._combo_row(
+            panel, 1, "Source modèle", "p6_model_source", ("bvh", "fbx", "auto")
+        )
+        self._entry_row(panel, 2, "Filtre segments", "p6_joint_filter")
+        self._analysis_action_row(tab, 1)
+        self._build_graph_panel(tab, 2, "segments")
+
     def _build_joint_centres_tab(self, notebook: ttk.Notebook) -> None:
         tab = self._tab(notebook, "Centres")
         tab.rowconfigure(2, weight=1)
@@ -954,9 +982,9 @@ class CapturyBioBuddyGui(tk.Tk):
         self._combo_row(
             generation,
             0,
-            "Correction root offset",
+            "Offset racine",
             "root_offset_mode",
-            ("auto", "subtract", "keep"),
+            ROOT_OFFSET_MODE_CHOICES,
         )
         self._entry_row(generation, 1, "Max points mesh FBX", "max_fbx_mesh_points")
         self._check(
@@ -993,9 +1021,9 @@ class CapturyBioBuddyGui(tk.Tk):
         self._combo_row(
             chain_compare,
             2,
-            "Root offset",
+            "Offset racine",
             "root_offset_mode",
-            ("auto", "subtract", "keep"),
+            ROOT_OFFSET_MODE_CHOICES,
         )
         self._check(chain_compare, 3, "Ne pas extraire les meshes FBX", "p6_no_mesh")
         self._entry_row(chain_compare, 4, "Max points mesh", "p6_max_mesh_points")
@@ -1270,6 +1298,21 @@ class CapturyBioBuddyGui(tk.Tk):
         )
         self._check(environment, 2, "Ignorer le cache", "p6_no_cache")
         self._check(environment, 3, "Analyse auto au choix d'essai", "p6_auto_analyze")
+
+        diagnostics = ttk.LabelFrame(tab, text="Diagnostic recalage")
+        diagnostics.grid(row=2, column=0, sticky="ew", pady=(12, 0))
+        self._check(
+            diagnostics,
+            0,
+            "Désactiver recalage statique Captury -> Motive",
+            "p6_disable_static_model_alignment",
+        )
+        self._check(
+            diagnostics,
+            1,
+            "Désactiver recalage Motive -> marqueurs C3D",
+            "p6_disable_motive_marker_alignment",
+        )
 
     def _build_actions(self, parent: ttk.Frame) -> None:
         actions = ttk.LabelFrame(parent, text="Exécution")
@@ -1765,6 +1808,17 @@ class CapturyBioBuddyGui(tk.Tk):
     def _occlusion_csv_path(self) -> Path:
         return self._graph_output_root() / "all_motive_marker_occlusions.csv"
 
+    @staticmethod
+    def _read_csv_or_empty(path: Path) -> "pd.DataFrame":
+        if pd is None:
+            return pd.DataFrame()
+        if not path.exists() or path.stat().st_size == 0:
+            return pd.DataFrame()
+        try:
+            return pd.read_csv(path)
+        except pd.errors.EmptyDataError:
+            return pd.DataFrame()
+
     def _set_occlusion_table_headings(self) -> None:
         labels = {
             "marker": "Marqueur",
@@ -1824,9 +1878,9 @@ class CapturyBioBuddyGui(tk.Tk):
         table = self.occlusion_table
         table.delete(*table.get_children())
         path = self._occlusion_csv_path()
-        if not path.exists() or path.stat().st_size == 0:
+        dataframe = self._read_csv_or_empty(path)
+        if dataframe.empty:
             return
-        dataframe = pd.read_csv(path)
         selected = str(self.vars["selected_trial"].get()).strip()
         if selected and selected != ALL_TRIALS_LABEL and "trial" in dataframe.columns:
             dataframe = dataframe[dataframe["trial"].astype(str) == selected]
@@ -1888,7 +1942,10 @@ class CapturyBioBuddyGui(tk.Tk):
         if not path.exists():
             tree.insert("", tk.END, text=f"CSV absent: {path.name}")
             return
-        dataframe = pd.read_csv(path)
+        dataframe = self._read_csv_or_empty(path)
+        if dataframe.empty:
+            tree.insert("", tk.END, text=f"CSV vide: {path.name}")
+            return
         metrics = graph_metric_columns(dataframe, config["metrics"])
         if not metrics:
             tree.insert("", tk.END, text="Aucune métrique numérique")
@@ -1964,7 +2021,9 @@ class CapturyBioBuddyGui(tk.Tk):
             if path is None:
                 continue
             trial_id = tree.insert("", tk.END, text=trial, open=True)
-            dataframe = pd.read_csv(path)
+            dataframe = self._read_csv_or_empty(path)
+            if dataframe.empty:
+                continue
             for metric in graph_metric_columns(dataframe, EVENT_METRICS):
                 self._insert_graph_node(
                     tree,
@@ -2041,11 +2100,18 @@ class CapturyBioBuddyGui(tk.Tk):
         axes = panel["axes"]
         canvas = panel["canvas"]
         config = GRAPH_CONFIGS[graph_kind]
-        dataframe = pd.read_csv(self._graph_csv_path(graph_kind))
+        dataframe = self._read_csv_or_empty(self._graph_csv_path(graph_kind))
+        if dataframe.empty:
+            axes.clear()
+            axes.set_title("Aucune donnée")
+            canvas.draw_idle()
+            return
         if graph_kind == "kinematics":
             self._draw_kinematics_graph(payloads, dataframe)
             return
         if graph_kind == "centres" and self._draw_joint_centre_graph(payloads):
+            return
+        if graph_kind == "segments" and self._draw_segment_graph(payloads):
             return
         series = self._metric_series_from_payloads(dataframe, payloads, config)
         axes.clear()
@@ -2122,6 +2188,13 @@ class CapturyBioBuddyGui(tk.Tk):
             / "joint_centre_timeseries.npz"
         )
 
+    def _segment_rotation_timeseries_path(self, trial: str) -> Path:
+        return (
+            self._graph_output_root()
+            / safe_trial_dir_name(trial)
+            / "segment_rotation_timeseries.npz"
+        )
+
     def _legacy_kinematics_timeseries_csv_path(self, trial: str) -> Path:
         return (
             self._graph_output_root()
@@ -2136,13 +2209,21 @@ class CapturyBioBuddyGui(tk.Tk):
             / "joint_centre_timeseries.csv"
         )
 
+    def _legacy_segment_rotation_timeseries_csv_path(self, trial: str) -> Path:
+        return (
+            self._graph_output_root()
+            / safe_trial_dir_name(trial)
+            / "segment_rotation_timeseries.csv"
+        )
+
     def _read_timeseries_table(
         self, path: Path, legacy_csv_path: Path
     ) -> "pd.DataFrame | None":
         if path.exists() and path.stat().st_size:
             return read_table_npz(path)
         if legacy_csv_path.exists() and legacy_csv_path.stat().st_size:
-            return pd.read_csv(legacy_csv_path)
+            dataframe = self._read_csv_or_empty(legacy_csv_path)
+            return dataframe if not dataframe.empty else None
         return None
 
     def _draw_joint_centre_graph(self, payloads: list[dict[str, object]]) -> bool:
@@ -2187,6 +2268,55 @@ class CapturyBioBuddyGui(tk.Tk):
                     axes.set_ylabel("Erreur (mm)")
                 else:
                     axes.set_title("Aucune erreur temporelle")
+        panel["figure"].tight_layout()
+        canvas.draw_idle()
+        return True
+
+    def _draw_segment_graph(self, payloads: list[dict[str, object]]) -> bool:
+        if not payloads:
+            return False
+        metrics = {str(payload["metric"]) for payload in payloads}
+        if len(metrics) != 1:
+            return False
+        metric = next(iter(metrics))
+        filters = dict(payloads[0]["filters"])
+        trial = str(filters.get("trial", ""))
+        if not trial:
+            return False
+        panel = self.graph_panels["segments"]
+        axes = panel["axes"]
+        canvas = panel["canvas"]
+        axes.clear()
+        path = self._segment_rotation_timeseries_path(trial)
+        dataframe = self._read_timeseries_table(
+            path, self._legacy_segment_rotation_timeseries_csv_path(trial)
+        )
+        if dataframe is None:
+            axes.set_title(f"Série temporelle absente: {path.name}")
+        else:
+            selected_segments = [
+                str(dict(payload["filters"]).get("segment", ""))
+                for payload in payloads
+                if str(dict(payload["filters"]).get("segment", ""))
+            ]
+            source = str(filters.get("source", ""))
+            if len(payloads) == 1 and selected_segments and source:
+                draw_segment_rotation_timeseries(
+                    axes, dataframe, trial, source, selected_segments[0]
+                )
+            else:
+                series = segment_rotation_boxplot_series(
+                    dataframe,
+                    metric,
+                    trial=trial,
+                    source=source or None,
+                    segments=selected_segments,
+                )
+                if series:
+                    self._draw_metric_boxplot(axes, series, f"Segments - {metric}")
+                    axes.set_ylabel("Déviation absolue (deg)")
+                else:
+                    axes.set_title("Aucune rotation segmentaire")
         panel["figure"].tight_layout()
         canvas.draw_idle()
         return True
@@ -2466,8 +2596,12 @@ class CapturyBioBuddyGui(tk.Tk):
         canvas = panel["canvas"]
         path = Path(str(payload["filters"]["path"]))
         metric = str(payload["metric"])
-        dataframe = pd.read_csv(path)
+        dataframe = self._read_csv_or_empty(path)
         axes.clear()
+        if dataframe.empty:
+            axes.set_title("Aucune donnée")
+            canvas.draw_idle()
+            return
         if "time" not in dataframe.columns or metric not in dataframe.columns:
             axes.set_title("Aucune donnée")
             canvas.draw_idle()
@@ -2704,9 +2838,17 @@ class CapturyBioBuddyGui(tk.Tk):
         self.vars["p6_data_root"].trace_add(
             "write", lambda *_: self._refresh_trial_inventory()
         )
-        self.vars["p6_model_source"].trace_add(
-            "write", lambda *_: self._on_p6_model_source_changed()
-        )
+        for name in (
+            "p6_model_source",
+            "p6_model_to_c3d_axis",
+            "root_offset_mode",
+            "p6_segment_reference",
+            "p6_disable_static_model_alignment",
+            "p6_disable_motive_marker_alignment",
+        ):
+            self.vars[name].trace_add(
+                "write", lambda *_: self._on_p6_auto_analysis_option_changed()
+            )
         self.vars["biobuddy_c3d_folder"].trace_add(
             "write", lambda *_: self._refresh_motive57_c3d_mapping()
         )
@@ -3007,7 +3149,7 @@ class CapturyBioBuddyGui(tk.Tk):
             return
         self._run_args(self._p6_auto_analysis_args(selected))
 
-    def _on_p6_model_source_changed(self) -> None:
+    def _on_p6_auto_analysis_option_changed(self) -> None:
         self._run_selected_trial_auto_analysis()
 
     def _load_p6_debug_preset(self) -> None:
@@ -3024,6 +3166,8 @@ class CapturyBioBuddyGui(tk.Tk):
         self.vars["p6_auto_analyze"].set(True)
         self.vars["p6_model_source"].set("bvh")
         self.vars["p6_model_to_c3d_axis"].set("auto")
+        self.vars["root_offset_mode"].set(ROOT_OFFSET_MODE_LABELS["auto"])
+        self.vars["p6_segment_reference"].set("biobuddy")
         self.vars["p6_no_mesh"].set(True)
         self.vars["p6_no_figures"].set(True)
         self.vars["p6_no_cache"].set(False)

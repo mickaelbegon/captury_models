@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import sys
+import tempfile
 import unittest
 from pathlib import Path
 
@@ -19,6 +20,7 @@ from captury_biobuddy_gui import (
     vertical_axis_label,
 )
 from gui_graphs import joint_centre_error_boxplot_series, joint_centre_error_timeseries
+from gui_commands import ROOT_OFFSET_MODE_LABELS
 from gui_trial_viewer import local_chain_axes
 
 
@@ -123,6 +125,24 @@ class GuiRefactorContracts(unittest.TestCase):
         self.assertIn("Ankle", args)
         self.assertIn("--no-cache", args)
         self.assertIn("--headless", args)
+
+    def test_explicit_root_offset_label_maps_to_cli_value(self) -> None:
+        gui = make_gui_stub()
+        gui.vars["root_offset_mode"].set(ROOT_OFFSET_MODE_LABELS["keep"])
+
+        args = CapturyBioBuddyGui._p6_args(gui)
+
+        option_index = args.index("--root-offset-mode")
+        self.assertEqual(args[option_index + 1], "keep")
+
+    def test_empty_csv_reads_as_empty_dataframe(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "empty.csv"
+            path.write_text("", encoding="utf-8")
+
+            dataframe = CapturyBioBuddyGui._read_csv_or_empty(path)
+
+        self.assertTrue(dataframe.empty)
 
     def test_p6_auto_command_is_lightweight_contract(self) -> None:
         gui = make_gui_stub()

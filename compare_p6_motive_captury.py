@@ -31,6 +31,7 @@ from bvh_c3d_biobuddy_pyorerun_compare import (
     extract_q_from_fbx_parser,
     get_c3d_param,
     interpolate_array,
+    require_biorbd,
     require_ezc3d,
     require_pyorerun,
     save_model_joint_centres,
@@ -83,6 +84,7 @@ class ModelRun:
     time: np.ndarray
     joint_names: list[str]
     centres_native: dict[str, np.ndarray]
+    rotations_native: dict[str, np.ndarray]
     unit_scale_to_m: float
     mesh_report: dict[str, Any]
     root_offset_policy: dict[str, Any]
@@ -139,6 +141,11 @@ def trial_cache_fingerprint(
             "root_offset_mode": args.root_offset_mode,
             "angle_label_regex": args.angle_label_regex,
             "c3d_angle_unit": args.c3d_angle_unit,
+            "segment_reference": args.segment_reference,
+            "disable_static_model_alignment": bool(args.disable_static_model_alignment),
+            "disable_motive_marker_alignment": bool(
+                args.disable_motive_marker_alignment
+            ),
             "joint_filter": list(args.joint_filter),
             "no_mesh": bool(args.no_mesh),
             "max_mesh_points": int(args.max_mesh_points),
@@ -169,6 +176,8 @@ def required_trial_outputs(trial_dir: Path, trial_name: str) -> list[Path]:
         trial_dir / "kinematics_q_timeseries.npz",
         trial_dir / "captury_c3d_angle_metrics.csv",
         trial_dir / "captury_c3d_angle_timeseries.npz",
+        trial_dir / "segment_rotation_metrics.csv",
+        trial_dir / "segment_rotation_timeseries.npz",
         trial_dir / "model_dimensions.csv",
         trial_dir / "motive_marker_occlusions.csv",
         trial_dir / "skin_marker_correspondence_metrics.csv",
@@ -338,6 +347,46 @@ def native_unit_scale_to_m(
     return 0.001
 
 
+def biorbd_segment_names(model: Any) -> list[str]:
+    return [
+        model.segment(index).name().to_string() for index in range(model.nbSegment())
+    ]
+
+
+def compute_model_segment_rotations_native(
+    biomod_path: Path,
+    q: np.ndarray,
+    keep_segment_names: set[str] | None = None,
+) -> dict[str, np.ndarray]:
+    """Extract segment global rotation matrices from a biorbd model.
+
+    ``biorbd.Model.globalJCS(q, i)`` returns the homogeneous transform of each
+    segment. This helper stores the rotational ``3x3`` block for every requested
+    non-root segment as an array shaped ``(3, 3, n_frames)``.
+    """
+
+    biorbd = require_biorbd()
+    model = biorbd.Model(str(biomod_path))
+    if q.shape[0] != model.nbQ():
+        raise RuntimeError(f"{biomod_path} expects {model.nbQ()} q, got {q.shape[0]}.")
+    names = biorbd_segment_names(model)
+    rotations: dict[str, np.ndarray] = {}
+    for index, name in enumerate(names):
+        if name == "root":
+            continue
+        if keep_segment_names is not None and name not in keep_segment_names:
+            continue
+        rotations[name] = np.zeros((3, 3, q.shape[1]), dtype=float)
+    for frame in range(q.shape[1]):
+        q_frame = np.ascontiguousarray(q[:, frame], dtype=float)
+        for index, name in enumerate(names):
+            if name not in rotations:
+                continue
+            rt = np.asarray(model.globalJCS(q_frame, index).to_array(), dtype=float)
+            rotations[name][:, :, frame] = rt[:3, :3]
+    return rotations
+
+
 def build_model_run(
     bundle: TrialBundle,
     system: str,
@@ -414,6 +463,9 @@ def build_model_run(
         )
     )
     runtime = corrected_runtime if use_correction else uncorrected_runtime
+    rotations_native = compute_model_segment_rotations_native(
+        biomod_path, runtime.q, set(joint_names)
+    )
     root_offset_policy.update(
         {
             "source_file": str(source_path),
@@ -455,6 +507,7 @@ def build_model_run(
         time=runtime.time,
         joint_names=joint_names,
         centres_native=centres_native,
+        rotations_native=rotations_native,
         unit_scale_to_m=unit_scale_to_m,
         mesh_report=mesh_report,
         root_offset_policy=root_offset_policy,
@@ -483,6 +536,159 @@ def centres_to_c3d_mm(
     matrix = model_to_c3d_matrix(axis_mode)
     factor = unit_scale_to_m * 1000.0
     return {name: matrix @ (values * factor) for name, values in centres_native.items()}
+
+
+def rotations_to_c3d(
+    rotations_native: dict[str, np.ndarray],
+    axis_mode: str,
+    row_global_rotation: np.ndarray | None = None,
+) -> dict[str, np.ndarray]:
+    matrix = model_to_c3d_matrix(axis_mode)
+    if row_global_rotation is not None:
+        matrix = np.asarray(row_global_rotation, dtype=float).T @ matrix
+    return {
+        name: np.einsum("ij,jkf->ikf", matrix, values)
+        for name, values in rotations_native.items()
+    }
+
+
+def trim_rotations(
+    rotations: dict[str, np.ndarray], mask: np.ndarray
+) -> dict[str, np.ndarray]:
+    return {name: values[:, :, mask] for name, values in rotations.items()}
+
+
+def nearest_time_indices(
+    source_time: np.ndarray, target_time: np.ndarray
+) -> np.ndarray:
+    if source_time.size == 0 or target_time.size == 0:
+        return np.zeros(0, dtype=int)
+    indices = np.searchsorted(source_time, target_time, side="left")
+    indices = np.clip(indices, 0, source_time.size - 1)
+    previous = np.clip(indices - 1, 0, source_time.size - 1)
+    use_previous = np.abs(target_time - source_time[previous]) < np.abs(
+        target_time - source_time[indices]
+    )
+    indices[use_previous] = previous[use_previous]
+    return indices
+
+
+def rotation_deviation_vector(R1: np.ndarray, R2: np.ndarray) -> np.ndarray:
+    """Return the rotation-vector deviation that maps ``R1`` to ``R2``.
+
+    The implementation follows the logarithm map supplied in the GUI request:
+    ``R = R1.T @ R2`` and the returned vector components are expressed in
+    radians around the local X/Y/Z axes of the reference orientation.
+    """
+
+    R = np.asarray(R1, dtype=float).T @ np.asarray(R2, dtype=float)
+    cos_theta = (np.trace(R) - 1.0) / 2.0
+    cos_theta = np.clip(cos_theta, -1.0, 1.0)
+    theta = float(np.arccos(cos_theta))
+    skew_vector = np.array(
+        [
+            R[2, 1] - R[1, 2],
+            R[0, 2] - R[2, 0],
+            R[1, 0] - R[0, 1],
+        ],
+        dtype=float,
+    )
+    if theta < 1e-8:
+        return 0.5 * skew_vector
+    return theta / (2.0 * np.sin(theta)) * skew_vector
+
+
+def segment_rotation_metric_rows(
+    trial: str,
+    rotations_by_source: dict[str, dict[str, np.ndarray]],
+    times_by_source: dict[str, np.ndarray],
+    reference_source: str,
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]], dict[str, Any]]:
+    reference_source = reference_source.lower()
+    available = sorted(
+        source
+        for source, rotations in rotations_by_source.items()
+        if rotations and times_by_source.get(source, np.asarray([])).size
+    )
+    report: dict[str, Any] = {
+        "requested_reference": reference_source,
+        "available_sources": available,
+    }
+    if reference_source not in rotations_by_source or not rotations_by_source.get(
+        reference_source
+    ):
+        fallback = "motive" if reference_source == "biobuddy" else ""
+        if fallback and rotations_by_source.get(fallback):
+            report["status"] = "fallback_missing_reference"
+            report["effective_reference"] = fallback
+            reference_source = fallback
+        else:
+            report["status"] = "missing_reference"
+            return [], [], report
+    else:
+        report["effective_reference"] = reference_source
+    reference_rotations = rotations_by_source[reference_source]
+    reference_time = times_by_source[reference_source]
+    summary_rows: list[dict[str, Any]] = []
+    timeseries_rows: list[dict[str, Any]] = []
+    for source, source_rotations in sorted(rotations_by_source.items()):
+        if source == reference_source or not source_rotations:
+            continue
+        source_time = times_by_source[source]
+        source_indices = nearest_time_indices(source_time, reference_time)
+        common_segments = sorted(
+            set(reference_rotations).intersection(source_rotations)
+        )
+        for segment in common_segments:
+            values: list[dict[str, Any]] = []
+            for frame, source_frame in enumerate(source_indices):
+                vector_rad = rotation_deviation_vector(
+                    reference_rotations[segment][:, :, frame],
+                    source_rotations[segment][:, :, source_frame],
+                )
+                vector_deg = np.degrees(vector_rad)
+                global_deg = float(np.linalg.norm(vector_deg))
+                row = {
+                    "trial": trial,
+                    "reference": reference_source,
+                    "source": source,
+                    "segment": segment,
+                    "time": float(reference_time[frame]),
+                    "global_deg": global_deg,
+                    "x_deg": float(vector_deg[0]),
+                    "y_deg": float(vector_deg[1]),
+                    "z_deg": float(vector_deg[2]),
+                    "abs_x_deg": float(abs(vector_deg[0])),
+                    "abs_y_deg": float(abs(vector_deg[1])),
+                    "abs_z_deg": float(abs(vector_deg[2])),
+                }
+                values.append(row)
+                timeseries_rows.append(row)
+            if not values:
+                continue
+            global_values = np.asarray([row["global_deg"] for row in values])
+            abs_x = np.asarray([row["abs_x_deg"] for row in values])
+            abs_y = np.asarray([row["abs_y_deg"] for row in values])
+            abs_z = np.asarray([row["abs_z_deg"] for row in values])
+            summary_rows.append(
+                {
+                    "trial": trial,
+                    "reference": reference_source,
+                    "source": source,
+                    "segment": segment,
+                    "median_global_deg": float(np.nanmedian(global_values)),
+                    "p95_global_deg": float(np.nanpercentile(global_values, 95)),
+                    "max_global_deg": float(np.nanmax(global_values)),
+                    "median_abs_x_deg": float(np.nanmedian(abs_x)),
+                    "median_abs_y_deg": float(np.nanmedian(abs_y)),
+                    "median_abs_z_deg": float(np.nanmedian(abs_z)),
+                    "p95_abs_x_deg": float(np.nanpercentile(abs_x, 95)),
+                    "p95_abs_y_deg": float(np.nanpercentile(abs_y, 95)),
+                    "p95_abs_z_deg": float(np.nanpercentile(abs_z, 95)),
+                }
+            )
+    report["status"] = "ok" if summary_rows else "no_common_segments"
+    return summary_rows, timeseries_rows, report
 
 
 def root_alignment_score_mm(
@@ -828,6 +1034,7 @@ def trim_model_run(
         q=run.q[:, mask],
         time=run.time[mask],
         centres_native=trim_centres(run.centres_native, mask),
+        rotations_native=trim_rotations(run.rotations_native, mask),
     )
 
 
@@ -1827,7 +2034,17 @@ def compare_trial(
         motive.centres_native, motive.unit_scale_to_m, args.model_to_c3d_axis
     )
     alignment_report: dict[str, Any]
-    if static_alignment_transform is None:
+    if args.disable_static_model_alignment:
+        rotation = np.eye(3)
+        translation = np.zeros(3)
+        alignment_report = {
+            "status": "disabled_static_model_alignment",
+            "rotation": rotation.tolist(),
+            "translation_mm": translation.tolist(),
+            "note": "Captury centres are kept in their converted C3D frame without Captury -> Motive model alignment.",
+        }
+        static_alignment_transform = (rotation, translation)
+    elif static_alignment_transform is None:
         rotation, translation, alignment_report = static_alignment(
             cap_c3d_mm, mot_c3d_mm
         )
@@ -1840,14 +2057,35 @@ def compare_trial(
             "translation_mm": translation.tolist(),
         }
     cap_aligned_mm = apply_alignment(cap_c3d_mm, rotation, translation)
-    model_marker_rotation, model_marker_translation, model_marker_report = (
-        model_to_motive_marker_alignment(mot_c3d_mm, motive.time, bundle.motive_c3d)
-    )
+    if args.disable_motive_marker_alignment:
+        model_marker_rotation = np.eye(3)
+        model_marker_translation = np.zeros(3)
+        model_marker_report = {
+            "status": "disabled_motive_marker_alignment",
+            "method": "identity",
+            "rotation": model_marker_rotation.tolist(),
+            "translation_mm": model_marker_translation.tolist(),
+            "note": "Motive model centres are not yaw/translation-aligned to Motive C3D marker proxies.",
+        }
+    else:
+        model_marker_rotation, model_marker_translation, model_marker_report = (
+            model_to_motive_marker_alignment(mot_c3d_mm, motive.time, bundle.motive_c3d)
+        )
     cap_aligned_mm = apply_alignment(
         cap_aligned_mm, model_marker_rotation, model_marker_translation
     )
     mot_c3d_mm = apply_alignment(
         mot_c3d_mm, model_marker_rotation, model_marker_translation
+    )
+    cap_rotations_c3d = rotations_to_c3d(
+        captury.rotations_native,
+        args.model_to_c3d_axis,
+        rotation @ model_marker_rotation,
+    )
+    mot_rotations_c3d = rotations_to_c3d(
+        motive.rotations_native,
+        args.model_to_c3d_axis,
+        model_marker_rotation,
     )
     alignment_report["motive_model_to_c3d_markers"] = model_marker_report
     enriched_c3d = append_centres_to_motive_c3d(
@@ -1892,6 +2130,26 @@ def compare_trial(
     )
     q_rows.extend(c3d_angle_rows)
     q_ts_rows.extend(c3d_angle_ts_rows)
+    cap_rotation_metrics = trim_rotations(
+        cap_rotations_c3d, time_window_mask(captury.time, cut_start_s, cut_end_s)
+    )
+    mot_rotation_metrics = trim_rotations(
+        mot_rotations_c3d, time_window_mask(motive.time, cut_start_s, cut_end_s)
+    )
+    segment_rows, segment_ts_rows, segment_report = segment_rotation_metric_rows(
+        bundle.name,
+        {
+            "captury": cap_rotation_metrics,
+            "motive": mot_rotation_metrics,
+            "biobuddy": {},
+        },
+        {
+            "captury": captury_metrics.time,
+            "motive": motive_metrics.time,
+            "biobuddy": np.asarray([], dtype=float),
+        },
+        args.segment_reference,
+    )
     occlusion_rows, occlusion_figure = analyze_motive_occlusions(
         bundle.motive_c3d,
         trial_dir,
@@ -1915,6 +2173,8 @@ def compare_trial(
     write_table_npz(trial_dir / "kinematics_q_timeseries.npz", q_ts_rows)
     write_rows(trial_dir / "captury_c3d_angle_metrics.csv", c3d_angle_rows)
     write_table_npz(trial_dir / "captury_c3d_angle_timeseries.npz", c3d_angle_ts_rows)
+    write_rows(trial_dir / "segment_rotation_metrics.csv", segment_rows)
+    write_table_npz(trial_dir / "segment_rotation_timeseries.npz", segment_ts_rows)
     write_rows(trial_dir / "model_dimensions.csv", dimension_rows)
     write_rows(trial_dir / "skin_marker_correspondence_metrics.csv", marker_rows)
     plot_metric_barh(
@@ -1986,6 +2246,10 @@ def compare_trial(
             "captury_c3d_angle_timeseries": str(
                 trial_dir / "captury_c3d_angle_timeseries.npz"
             ),
+            "segment_rotation_metrics": str(trial_dir / "segment_rotation_metrics.csv"),
+            "segment_rotation_timeseries": str(
+                trial_dir / "segment_rotation_timeseries.npz"
+            ),
             "motive_marker_occlusions": str(trial_dir / "motive_marker_occlusions.csv"),
             "trial_events_contacts": str(trial_dir / "trial_events_contacts.csv"),
             "model_dimensions": str(trial_dir / "model_dimensions.csv"),
@@ -1994,6 +2258,7 @@ def compare_trial(
             ),
         },
         "trial_events": event_report,
+        "segment_rotations": segment_report,
         "occlusion_figure": str(occlusion_figure) if occlusion_figure else None,
         "occlusion_marker_count": len(occlusion_rows),
         "angle_inventory": {
@@ -2096,9 +2361,25 @@ def parse_args() -> argparse.Namespace:
         help="Unit used by Captury C3D angle channels stored in POINT.",
     )
     parser.add_argument(
+        "--segment-reference",
+        choices=["biobuddy", "motive", "captury"],
+        default="biobuddy",
+        help="Reference source for segment rotation deviation metrics.",
+    )
+    parser.add_argument(
         "--no-mesh", action="store_true", help="Skip FBX visual mesh extraction."
     )
     parser.add_argument("--max-mesh-points", type=int, default=0)
+    parser.add_argument(
+        "--disable-static-model-alignment",
+        action="store_true",
+        help="Disable the static Captury model -> Motive model rigid alignment.",
+    )
+    parser.add_argument(
+        "--disable-motive-marker-alignment",
+        action="store_true",
+        help="Disable the Motive model -> Motive C3D marker-proxy yaw/translation alignment.",
+    )
     parser.add_argument("--run-ik-batch", action="store_true")
     parser.add_argument("--ik-max-frames", type=int, default=0)
     parser.add_argument("--visualize", action="store_true")
@@ -2217,6 +2498,7 @@ def main() -> None:
     all_occlusion_rows: list[dict[str, Any]] = []
     all_dimension_rows: list[dict[str, Any]] = []
     all_marker_rows: list[dict[str, Any]] = []
+    all_segment_rows: list[dict[str, Any]] = []
     for report in reports:
         trial_dir = args.out_dir / safe_name(report["trial"])
         centre_csv = trial_dir / "joint_centre_metrics.csv"
@@ -2224,6 +2506,7 @@ def main() -> None:
         occlusion_csv = trial_dir / "motive_marker_occlusions.csv"
         dimension_csv = trial_dir / "model_dimensions.csv"
         marker_csv = trial_dir / "skin_marker_correspondence_metrics.csv"
+        segment_csv = trial_dir / "segment_rotation_metrics.csv"
         if centre_csv.exists() and centre_csv.stat().st_size:
             all_centre_rows.extend(pd.read_csv(centre_csv).to_dict("records"))
         if q_csv.exists() and q_csv.stat().st_size:
@@ -2234,10 +2517,13 @@ def main() -> None:
             all_dimension_rows.extend(pd.read_csv(dimension_csv).to_dict("records"))
         if marker_csv.exists() and marker_csv.stat().st_size:
             all_marker_rows.extend(pd.read_csv(marker_csv).to_dict("records"))
+        if segment_csv.exists() and segment_csv.stat().st_size:
+            all_segment_rows.extend(pd.read_csv(segment_csv).to_dict("records"))
     write_rows(args.out_dir / "all_joint_centre_metrics.csv", all_centre_rows)
     write_rows(args.out_dir / "all_kinematics_q_metrics.csv", all_q_rows)
     write_rows(args.out_dir / "all_motive_marker_occlusions.csv", all_occlusion_rows)
     write_rows(args.out_dir / "all_model_dimensions.csv", all_dimension_rows)
+    write_rows(args.out_dir / "all_segment_rotation_metrics.csv", all_segment_rows)
     write_rows(
         args.out_dir / "all_skin_marker_correspondence_metrics.csv", all_marker_rows
     )

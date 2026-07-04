@@ -56,6 +56,9 @@ class P6DebugGuiTests(unittest.TestCase):
             "p6_auto_analyze",
             "p6_model_source",
             "p6_model_to_c3d_axis",
+            "p6_segment_reference",
+            "p6_disable_static_model_alignment",
+            "p6_disable_motive_marker_alignment",
             "root_offset_mode",
             "c3d_angle_unit",
             "p6_no_figures",
@@ -76,6 +79,9 @@ class P6DebugGuiTests(unittest.TestCase):
         gui.vars["c3d_angle_unit"].set("deg")
         gui.vars["p6_auto_analyze"].set(True)
         gui.vars["p6_no_cache"].set(False)
+        gui.vars["p6_segment_reference"].set("biobuddy")
+        gui.vars["p6_disable_static_model_alignment"].set(False)
+        gui.vars["p6_disable_motive_marker_alignment"].set(False)
         gui.vars["p6_no_mesh"].set(False)
         gui.vars["p6_run_ik_batch"].set(False)
         gui.vars["p6_visualize"].set(False)
@@ -107,6 +113,7 @@ class P6DebugGuiTests(unittest.TestCase):
         self.assertIs(gui.vars["p6_auto_analyze"].get(), True)
         self.assertEqual(gui.vars["p6_model_source"].get(), "bvh")
         self.assertEqual(gui.vars["p6_model_to_c3d_axis"].get(), "auto")
+        self.assertEqual(gui.vars["p6_segment_reference"].get(), "biobuddy")
         self.assertIs(gui.vars["p6_no_mesh"].get(), True)
         self.assertIs(gui.vars["p6_headless"].get(), True)
         self.assertEqual(gui.vars["p6_rerun_wait_seconds"].get(), "0")
@@ -128,6 +135,28 @@ class P6DebugGuiTests(unittest.TestCase):
         self.assertNotIn("--no-cache", args)
         self.assertNotIn("--run-ik-batch", args)
         self.assertNotIn("--visualize", args)
+
+    def test_p6_debug_command_can_disable_alignment_diagnostics(self) -> None:
+        gui = self.make_gui_stub()
+        CapturyBioBuddyGui._load_p6_debug_preset(gui)
+        gui.vars["p6_disable_static_model_alignment"].set(True)
+        gui.vars["p6_disable_motive_marker_alignment"].set(True)
+
+        args = CapturyBioBuddyGui._p6_args(gui)
+
+        self.assertIn("--disable-static-model-alignment", args)
+        self.assertIn("--disable-motive-marker-alignment", args)
+
+    def test_p6_debug_command_sets_segment_reference(self) -> None:
+        gui = self.make_gui_stub()
+        CapturyBioBuddyGui._load_p6_debug_preset(gui)
+        gui.vars["p6_segment_reference"].set("motive")
+
+        args = CapturyBioBuddyGui._p6_args(gui)
+
+        self.assertIn("--segment-reference", args)
+        option_index = args.index("--segment-reference")
+        self.assertEqual(args[option_index + 1], "motive")
 
     def test_manual_phase_bounds_are_sorted_and_set_manual_cut_mode(self) -> None:
         gui = self.make_gui_stub()
@@ -255,13 +284,31 @@ class P6DebugGuiTests(unittest.TestCase):
         gui._resolve = lambda value: Path(".")  # type: ignore[method-assign]
         gui._run_args = lambda args: calls.append(args)  # type: ignore[method-assign]
 
-        CapturyBioBuddyGui._on_p6_model_source_changed(gui)
+        CapturyBioBuddyGui._on_p6_auto_analysis_option_changed(gui)
 
         self.assertEqual(len(calls), 1)
         self.assertIn("--model-source", calls[0])
         self.assertIn("fbx", calls[0])
         self.assertIn("--trial", calls[0])
         self.assertIn("Static", calls[0])
+
+    def test_root_offset_change_runs_auto_analysis_for_selected_trial(self) -> None:
+        gui = self.make_gui_stub()
+        gui.vars["p6_data_root"].set("local_trials/2026-06-30_P6_flat")
+        gui.vars["p6_out_dir"].set("out_p6_motive_captury_debug")
+        gui.vars["selected_trial"].set("Static")
+        gui.vars["p6_static_trial"].set("Static")
+        gui.vars["root_offset_mode"].set("conserver les translations root du fichier")
+        gui.trial_inventory = {"Static": {"Motive": {}, "Captury": {}}}
+        calls = []
+        gui._resolve = lambda value: Path(".")  # type: ignore[method-assign]
+        gui._run_args = lambda args: calls.append(args)  # type: ignore[method-assign]
+
+        CapturyBioBuddyGui._on_p6_auto_analysis_option_changed(gui)
+
+        self.assertEqual(len(calls), 1)
+        option_index = calls[0].index("--root-offset-mode")
+        self.assertEqual(calls[0][option_index + 1], "keep")
 
     def test_inventory_p6_dataset_collects_flat_files_for_trial_dropdown(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

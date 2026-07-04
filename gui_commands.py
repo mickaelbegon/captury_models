@@ -27,6 +27,16 @@ COMMAND_MODES = {
     "comparison": "Comparaison générique",
 }
 
+ROOT_OFFSET_MODE_LABELS = {
+    "auto": "auto - choisir la meilleure superposition C3D",
+    "subtract": "soustraire l'offset statique du root",
+    "keep": "conserver les translations root du fichier",
+}
+ROOT_OFFSET_MODE_CHOICES = tuple(ROOT_OFFSET_MODE_LABELS.values())
+ROOT_OFFSET_MODE_VALUES = {
+    label: value for value, label in ROOT_OFFSET_MODE_LABELS.items()
+}
+
 
 def value_of(values: Mapping[str, object], name: str) -> str:
     return str(values.get(name, "")).strip()
@@ -54,6 +64,21 @@ def append_flag(
 ) -> None:
     if bool_value(values, name):
         args.append(option)
+
+
+def normalize_root_offset_mode(value: object) -> str:
+    raw = str(value).strip()
+    if raw in ROOT_OFFSET_MODE_LABELS:
+        return raw
+    if raw in ROOT_OFFSET_MODE_VALUES:
+        return ROOT_OFFSET_MODE_VALUES[raw]
+    return raw
+
+
+def append_root_offset_mode(args: list[str], values: Mapping[str, object]) -> None:
+    value = normalize_root_offset_mode(values.get("root_offset_mode", ""))
+    if value:
+        args.extend(["--root-offset-mode", value])
 
 
 def split_lines(value: object) -> list[str]:
@@ -93,7 +118,7 @@ def build_pipeline_args(values: Mapping[str, object]) -> list[str]:
     append_flag(
         args, values, "--no-root-offset-correction", "no_root_offset_correction"
     )
-    append_value(args, values, "--root-offset-mode", "root_offset_mode")
+    append_root_offset_mode(args, values)
     append_flag(args, values, "--no-fbx-mesh", "no_fbx_mesh")
     append_value(args, values, "--max-fbx-mesh-points", "max_fbx_mesh_points")
 
@@ -190,9 +215,22 @@ def append_p6_common_args(args: list[str], values: Mapping[str, object]) -> None
     append_value(args, values, "--time-start", "p6_time_start")
     append_value(args, values, "--time-end", "p6_time_end")
     append_value(args, values, "--model-source", "p6_model_source")
-    append_value(args, values, "--root-offset-mode", "root_offset_mode")
+    append_root_offset_mode(args, values)
     append_value(args, values, "--model-to-c3d-axis", "p6_model_to_c3d_axis")
     append_value(args, values, "--c3d-angle-unit", "c3d_angle_unit")
+    append_value(args, values, "--segment-reference", "p6_segment_reference")
+    append_flag(
+        args,
+        values,
+        "--disable-static-model-alignment",
+        "p6_disable_static_model_alignment",
+    )
+    append_flag(
+        args,
+        values,
+        "--disable-motive-marker-alignment",
+        "p6_disable_motive_marker_alignment",
+    )
 
 
 def build_p6_occlusions_args(values: Mapping[str, object], trial: str) -> list[str]:

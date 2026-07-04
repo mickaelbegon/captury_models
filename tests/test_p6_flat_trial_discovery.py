@@ -21,6 +21,7 @@ try:
         occlusion_rows_from_points,
         required_trial_outputs,
         resolve_cut_window,
+        rotation_deviation_vector,
         root_alignment_score_mm,
         sanitize_channel_name,
         static_transform_from_report,
@@ -41,6 +42,7 @@ except ImportError as exc:  # pragma: no cover - depends on optional scientific 
     occlusion_rows_from_points = None
     required_trial_outputs = None
     resolve_cut_window = None
+    rotation_deviation_vector = None
     root_alignment_score_mm = None
     sanitize_channel_name = None
     static_transform_from_report = None
@@ -77,8 +79,27 @@ class FlatTrialDiscoveryTests(unittest.TestCase):
         self.assertIn("kinematics_q_timeseries.npz", outputs)
         self.assertIn("captury_c3d_angle_metrics.csv", outputs)
         self.assertIn("captury_c3d_angle_timeseries.npz", outputs)
+        self.assertIn("segment_rotation_metrics.csv", outputs)
+        self.assertIn("segment_rotation_timeseries.npz", outputs)
         self.assertNotIn("joint_centre_timeseries.csv", outputs)
         self.assertNotIn("kinematics_q_timeseries.csv", outputs)
+        self.assertNotIn("segment_rotation_timeseries.csv", outputs)
+
+    def test_rotation_deviation_vector_reports_axis_angle_components(self) -> None:
+        assert rotation_deviation_vector is not None
+
+        angle = np.deg2rad(10.0)
+        rotation_x = np.asarray(
+            [
+                [1.0, 0.0, 0.0],
+                [0.0, np.cos(angle), -np.sin(angle)],
+                [0.0, np.sin(angle), np.cos(angle)],
+            ]
+        )
+
+        vector = rotation_deviation_vector(np.eye(3), rotation_x)
+
+        np.testing.assert_allclose(vector, [angle, 0.0, 0.0], atol=1e-10)
 
     def test_c3d_angle_scale_to_deg_handles_rad_and_deg(self) -> None:
         assert c3d_angle_scale_to_deg is not None
@@ -206,6 +227,9 @@ class FlatTrialDiscoveryTests(unittest.TestCase):
                 root_offset_mode="auto",
                 angle_label_regex="angle",
                 c3d_angle_unit="deg",
+                segment_reference="biobuddy",
+                disable_static_model_alignment=False,
+                disable_motive_marker_alignment=False,
                 joint_filter=[],
                 no_mesh=True,
                 max_mesh_points=0,
