@@ -413,6 +413,7 @@ class TkC3DTrialCanvas(tk.Canvas):
         self.camera = default_camera_matrix()
         self.zoom = 1.0
         self.selected_label: str | None = None
+        self.selected_markers: dict[str, set[str]] = {}
         self.marker_source = "motive"
         self.chain_data: JointCentreChainData | None = None
         self.visible_cor_layers: set[str] = {"captury", "motive"}
@@ -439,6 +440,7 @@ class TkC3DTrialCanvas(tk.Canvas):
         self.marker_layers = {self.marker_source: data} if data is not None else {}
         self.frame = 0
         self.selected_label = None
+        self.selected_markers = {}
         self.reset_camera()
 
     def set_marker_layers(self, layers: dict[str, C3DMarkerData]) -> None:
@@ -449,6 +451,7 @@ class TkC3DTrialCanvas(tk.Canvas):
         self.data = next(iter(normalized_layers.values()), None)
         self.frame = 0
         self.selected_label = None
+        self.selected_markers = {}
         self.reset_camera()
 
     def set_marker_source(self, source: str | None) -> None:
@@ -470,6 +473,13 @@ class TkC3DTrialCanvas(tk.Canvas):
     def set_visible_marker_sources(self, sources: Iterable[str]) -> None:
         self.visible_marker_sources = {
             str(source).strip().lower() for source in sources
+        }
+        self.redraw()
+
+    def set_selected_markers(self, markers: dict[str, Iterable[str]]) -> None:
+        self.selected_markers = {
+            str(source).strip().lower(): {str(label) for label in labels}
+            for source, labels in markers.items()
         }
         self.redraw()
 
@@ -721,10 +731,13 @@ class TkC3DTrialCanvas(tk.Canvas):
             if not np.all(np.isfinite(point)):
                 continue
             label = data.labels[index]
-            selected = label == self.selected_label
+            selected = (
+                label == self.selected_label
+                or label in self.selected_markers.get(source, set())
+            )
             x = float(screen[0, index])
             y = float(screen[1, index])
-            radius = 5 if selected else 3
+            radius = 7 if selected else 3
             color = data_source_marker_color(source)
             self.create_oval(
                 x - radius,

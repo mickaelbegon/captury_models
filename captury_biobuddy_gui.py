@@ -68,6 +68,13 @@ from gui_graphs import (
     segment_rotation_boxplot_series,
     values_for_display,
 )
+from gui_marker_correspondence import (
+    marker_pair_key,
+    marker_pair_to_payload,
+    payload_to_tree_values,
+    save_marker_correspondence_payload,
+    tree_values_to_payload,
+)
 from gui_trial_viewer import (
     COR_LAYER_LABELS,
     DATA_SOURCE_COLORS,
@@ -300,6 +307,7 @@ class CapturyBioBuddyGui(tk.Tk):
         self.viewer_play_after_id: str | None = None
         self.occlusion_sort_column = "marker_order"
         self.occlusion_sort_descending = False
+        self.pending_auto_analysis = False
         self.motive57_c3d_files: list[str] = []
         self.motive57_role_combos: dict[str, ttk.Combobox] = {}
         self.motive57_inventory_tree: ttk.Treeview | None = None
@@ -381,6 +389,8 @@ class CapturyBioBuddyGui(tk.Tk):
             "p6_model_source": "bvh",
             "p6_model_to_c3d_axis": "auto",
             "p6_segment_reference": "biobuddy",
+            "p6_captury_reorient_thigh_y_from_cor": False,
+            "p6_rotate_body_segments_180_x": False,
             "p6_disable_static_model_alignment": False,
             "p6_disable_motive_marker_alignment": False,
             "p6_no_mesh": False,
@@ -845,6 +855,7 @@ class CapturyBioBuddyGui(tk.Tk):
     def _build_skin_markers_tab(self, notebook: ttk.Notebook) -> None:
         tab = self._tab(notebook, "Marqueurs")
         tab.rowconfigure(2, weight=1)
+        tab.rowconfigure(3, weight=1)
         panel = ttk.LabelFrame(tab, text="Marqueurs cutanés correspondants")
         panel.grid(row=0, column=0, sticky="ew")
         panel.columnconfigure(1, weight=1)
@@ -855,8 +866,76 @@ class CapturyBioBuddyGui(tk.Tk):
             "compare_landmark_map",
             [("JSON", "*.json"), ("Tous les fichiers", "*")],
         )
-        self._analysis_action_row(tab, 1)
-        self._build_graph_panel(tab, 2, "skin_markers")
+        ttk.Button(
+            panel,
+            text="Charger JSON",
+            command=self._load_marker_correspondence_json,
+        ).grid(row=1, column=0, sticky="ew", padx=(10, 4), pady=(0, 10))
+        ttk.Button(
+            panel,
+            text="Enregistrer JSON",
+            command=self._save_marker_correspondence_json,
+        ).grid(row=1, column=1, sticky="ew", padx=4, pady=(0, 10))
+        ttk.Button(
+            panel,
+            text="Calculer métriques",
+            command=self._save_marker_pairs_and_run_analysis,
+        ).grid(row=1, column=2, sticky="ew", padx=(4, 10), pady=(0, 10))
+
+        mapping = ttk.LabelFrame(tab, text="Mise en correspondance")
+        mapping.grid(row=1, column=0, sticky="nsew", pady=(12, 0))
+        for column in range(3):
+            mapping.columnconfigure(column, weight=1)
+        mapping.rowconfigure(1, weight=1)
+
+        ttk.Label(mapping, text="Motive").grid(
+            row=0, column=0, sticky="w", padx=10, pady=(8, 2)
+        )
+        ttk.Label(mapping, text="Captury").grid(
+            row=0, column=1, sticky="w", padx=10, pady=(8, 2)
+        )
+        self.marker_motive_list = tk.Listbox(mapping, exportselection=False, height=8)
+        self.marker_captury_list = tk.Listbox(mapping, exportselection=False, height=8)
+        self.marker_motive_list.grid(row=1, column=0, sticky="nsew", padx=(10, 4))
+        self.marker_captury_list.grid(row=1, column=1, sticky="nsew", padx=4)
+        self.marker_motive_list.bind(
+            "<<ListboxSelect>>", lambda _event: self._highlight_marker_pair_selection()
+        )
+        self.marker_captury_list.bind(
+            "<<ListboxSelect>>", lambda _event: self._highlight_marker_pair_selection()
+        )
+        actions = ttk.Frame(mapping)
+        actions.grid(row=1, column=2, sticky="nsew", padx=(4, 10))
+        actions.columnconfigure(0, weight=1)
+        ttk.Button(
+            actions,
+            text="Associer",
+            command=self._add_marker_correspondence_pair,
+        ).grid(row=0, column=0, sticky="ew", pady=(0, 6))
+        ttk.Button(
+            actions,
+            text="Supprimer",
+            command=self._remove_selected_marker_correspondence_pair,
+        ).grid(row=1, column=0, sticky="ew")
+
+        self.marker_pair_tree = ttk.Treeview(
+            mapping,
+            columns=("name", "motive", "captury"),
+            show="headings",
+            height=5,
+        )
+        for column, label in (
+            ("name", "Nom"),
+            ("motive", "Motive"),
+            ("captury", "Captury"),
+        ):
+            self.marker_pair_tree.heading(column, text=label)
+            self.marker_pair_tree.column(column, width=160, stretch=True)
+        self.marker_pair_tree.grid(
+            row=2, column=0, columnspan=3, sticky="nsew", padx=10, pady=(8, 10)
+        )
+        self._analysis_action_row(tab, 2)
+        self._build_graph_panel(tab, 3, "skin_markers")
 
     def _build_kinematics_compare_tab(self, notebook: ttk.Notebook) -> None:
         tab = self._tab(notebook, "Cinématiques")
@@ -1025,8 +1104,20 @@ class CapturyBioBuddyGui(tk.Tk):
             "root_offset_mode",
             ROOT_OFFSET_MODE_CHOICES,
         )
-        self._check(chain_compare, 3, "Ne pas extraire les meshes FBX", "p6_no_mesh")
-        self._entry_row(chain_compare, 4, "Max points mesh", "p6_max_mesh_points")
+        self._check(
+            chain_compare,
+            3,
+            "Captury: axe Y cuisse = hanche -> genou",
+            "p6_captury_reorient_thigh_y_from_cor",
+        )
+        self._check(
+            chain_compare,
+            4,
+            "Captury/Motive: rotation segments 180 deg autour de X",
+            "p6_rotate_body_segments_180_x",
+        )
+        self._check(chain_compare, 5, "Ne pas extraire les meshes FBX", "p6_no_mesh")
+        self._entry_row(chain_compare, 6, "Max points mesh", "p6_max_mesh_points")
         ttk.Label(
             chain_compare,
             text=(
@@ -1036,7 +1127,7 @@ class CapturyBioBuddyGui(tk.Tk):
             ),
             style="Status.TLabel",
             wraplength=760,
-        ).grid(row=5, column=0, columnspan=3, sticky="w", padx=10, pady=(4, 10))
+        ).grid(row=7, column=0, columnspan=3, sticky="w", padx=10, pady=(4, 10))
 
         explorer = ttk.LabelFrame(tab, text="Explorateur BioBuddy")
         explorer.grid(row=3, column=0, sticky="ew", pady=(12, 0))
@@ -1566,6 +1657,156 @@ class CapturyBioBuddyGui(tk.Tk):
         self._refresh_graphs()
         self._update_embedded_joint_chain()
 
+    def _refresh_marker_correspondence_lists(self) -> None:
+        if not hasattr(self, "marker_motive_list"):
+            return
+        c3d_paths = self._selected_trial_c3d_paths()
+        self.marker_list_label_lookup = {"motive": {}, "captury": {}}
+        for source, listbox in (
+            ("motive", self.marker_motive_list),
+            ("captury", self.marker_captury_list),
+        ):
+            listbox.delete(0, tk.END)
+            path = c3d_paths.get(source.title())
+            if path is None:
+                continue
+            try:
+                data = self._load_cached_c3d_marker_data(path)
+            except Exception as exc:
+                self._append_log(f"\nListe marqueurs impossible pour {path}: {exc}\n")
+                continue
+            display_labels = sorted(
+                {display_marker_name(label): label for label in data.labels}
+            )
+            raw_by_display = {
+                display_marker_name(label): label for label in data.labels
+            }
+            self.marker_list_label_lookup[source] = raw_by_display
+            for display_label in display_labels:
+                listbox.insert(tk.END, display_label)
+        if hasattr(self, "embedded_viewer"):
+            self.embedded_viewer.set_selected_markers({})
+
+    def _selected_listbox_value(self, listbox: tk.Listbox) -> str | None:
+        selection = listbox.curselection()
+        if not selection:
+            return None
+        return str(listbox.get(selection[0]))
+
+    def _selected_marker_raw_label(self, source: str, display_label: str) -> str:
+        lookup = getattr(self, "marker_list_label_lookup", {})
+        return str(lookup.get(source, {}).get(display_label, display_label))
+
+    def _highlight_marker_pair_selection(self) -> None:
+        if not hasattr(self, "embedded_viewer"):
+            return
+        motive_label = self._selected_listbox_value(self.marker_motive_list)
+        captury_label = self._selected_listbox_value(self.marker_captury_list)
+        selected: dict[str, list[str]] = {}
+        if motive_label:
+            selected["motive"] = [
+                self._selected_marker_raw_label("motive", motive_label)
+            ]
+        if captury_label:
+            selected["captury"] = [
+                self._selected_marker_raw_label("captury", captury_label)
+            ]
+        self.embedded_viewer.set_selected_markers(selected)
+
+    def _marker_pair_rows_from_tree(self) -> list[dict[str, object]]:
+        if not hasattr(self, "marker_pair_tree"):
+            return []
+        rows: list[dict[str, object]] = []
+        for item_id in self.marker_pair_tree.get_children():
+            rows.append(
+                tree_values_to_payload(self.marker_pair_tree.item(item_id, "values"))
+            )
+        return rows
+
+    def _set_marker_pair_rows(self, rows: Iterable[dict[str, object]]) -> None:
+        if not hasattr(self, "marker_pair_tree"):
+            return
+        self.marker_pair_tree.delete(*self.marker_pair_tree.get_children())
+        for row in rows:
+            self.marker_pair_tree.insert(
+                "",
+                tk.END,
+                values=payload_to_tree_values(row),
+            )
+
+    def _add_marker_correspondence_pair(self) -> None:
+        motive_label = self._selected_listbox_value(self.marker_motive_list)
+        captury_label = self._selected_listbox_value(self.marker_captury_list)
+        if not motive_label or not captury_label:
+            messagebox.showerror(
+                "Marqueurs manquants",
+                "Choisir un marqueur Motive et un marqueur Captury.",
+            )
+            return
+        existing = {
+            key
+            for row in self._marker_pair_rows_from_tree()
+            if (key := marker_pair_key(row)) is not None
+        }
+        pair = (motive_label, captury_label)
+        if pair in existing:
+            return
+        self.marker_pair_tree.insert(
+            "",
+            tk.END,
+            values=payload_to_tree_values(
+                marker_pair_to_payload(motive_label, captury_label)
+            ),
+        )
+        self.status_var.set(f"Paire ajoutée: {motive_label} / {captury_label}")
+
+    def _remove_selected_marker_correspondence_pair(self) -> None:
+        if not hasattr(self, "marker_pair_tree"):
+            return
+        selection = self.marker_pair_tree.selection()
+        if selection:
+            self.marker_pair_tree.delete(*selection)
+
+    def _marker_correspondence_json_path(self) -> Path:
+        raw_path = str(self.vars["compare_landmark_map"].get()).strip()
+        if not raw_path:
+            raw_path = "motive_captury_landmark_map.json"
+            self.vars["compare_landmark_map"].set(raw_path)
+        return self._resolve(raw_path)
+
+    def _save_marker_correspondence_json(self) -> Path | None:
+        rows = self._marker_pair_rows_from_tree()
+        if not rows:
+            messagebox.showerror(
+                "Liste vide", "Ajouter au moins une correspondance marqueur."
+            )
+            return None
+        path = self._marker_correspondence_json_path()
+        save_marker_correspondence_payload(path, rows)
+        self.status_var.set(f"Correspondances enregistrées: {path.name}")
+        return path
+
+    def _load_marker_correspondence_json(self) -> None:
+        path = self._marker_correspondence_json_path()
+        if not path.exists():
+            messagebox.showerror("JSON introuvable", str(path))
+            return
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+        except json.JSONDecodeError as exc:
+            messagebox.showerror("JSON invalide", str(exc))
+            return
+        if not isinstance(payload, list):
+            messagebox.showerror("JSON invalide", "Le fichier doit contenir une liste.")
+            return
+        self._set_marker_pair_rows(payload)
+        self.status_var.set(f"Correspondances chargées: {path.name}")
+
+    def _save_marker_pairs_and_run_analysis(self) -> None:
+        if self._save_marker_correspondence_json() is None:
+            return
+        self._run_selected_trial_auto_analysis()
+
     def _c3d_cache_key(self, path: Path) -> tuple[str, int, int, str]:
         resolved = path.expanduser().resolve()
         stat = resolved.stat()
@@ -1641,6 +1882,7 @@ class CapturyBioBuddyGui(tk.Tk):
             self.viewer_path_var.set("Aucun C3D pour l'essai sélectionné")
             self.embedded_viewer.set_marker_layers({})
             self.embedded_viewer.set_joint_centre_chains(None)
+            self._refresh_marker_correspondence_lists()
             self.viewer_frame_slider.configure(from_=0, to=0)
             self.viewer_frame_var.set(0)
             self.viewer_frame_label_var.set("0 / 0")
@@ -1692,6 +1934,7 @@ class CapturyBioBuddyGui(tk.Tk):
         if failed:
             display_parts.append(f"Échec: {', '.join(failed)}")
         self.viewer_path_var.set(" | ".join(display_parts))
+        self._refresh_marker_correspondence_lists()
         self._apply_embedded_view()
 
     def _update_embedded_joint_chain(self) -> None:
@@ -2113,6 +2356,8 @@ class CapturyBioBuddyGui(tk.Tk):
             return
         if graph_kind == "segments" and self._draw_segment_graph(payloads):
             return
+        if graph_kind == "skin_markers" and self._draw_skin_marker_graph(payloads):
+            return
         series = self._metric_series_from_payloads(dataframe, payloads, config)
         axes.clear()
         if not series:
@@ -2193,6 +2438,13 @@ class CapturyBioBuddyGui(tk.Tk):
             self._graph_output_root()
             / safe_trial_dir_name(trial)
             / "segment_rotation_timeseries.npz"
+        )
+
+    def _skin_marker_timeseries_path(self, trial: str) -> Path:
+        return (
+            self._graph_output_root()
+            / safe_trial_dir_name(trial)
+            / "skin_marker_correspondence_timeseries.npz"
         )
 
     def _legacy_kinematics_timeseries_csv_path(self, trial: str) -> Path:
@@ -2317,6 +2569,57 @@ class CapturyBioBuddyGui(tk.Tk):
                     axes.set_ylabel("Déviation absolue (deg)")
                 else:
                     axes.set_title("Aucune rotation segmentaire")
+        panel["figure"].tight_layout()
+        canvas.draw_idle()
+        return True
+
+    def _draw_skin_marker_graph(self, payloads: list[dict[str, object]]) -> bool:
+        if not payloads:
+            return False
+        metrics = {str(payload["metric"]) for payload in payloads}
+        if len(metrics) != 1:
+            return False
+        metric = next(iter(metrics))
+        filters = dict(payloads[0]["filters"])
+        trial = str(filters.get("trial", ""))
+        if not trial:
+            return False
+        path = self._skin_marker_timeseries_path(trial)
+        if not path.exists() or not path.stat().st_size:
+            return False
+        dataframe = read_table_npz(path)
+        if dataframe.empty or "landmark" not in dataframe.columns:
+            return False
+        selected_landmarks = [
+            str(dict(payload["filters"]).get("landmark", ""))
+            for payload in payloads
+            if str(dict(payload["filters"]).get("landmark", ""))
+        ]
+        values = dataframe.copy()
+        if selected_landmarks:
+            values = values[values["landmark"].astype(str).isin(selected_landmarks)]
+        if values.empty or "distance_mm" not in values.columns:
+            return False
+        series = []
+        for landmark, landmark_df in values.groupby(values["landmark"].astype(str)):
+            distances = landmark_df["distance_mm"].astype(float).dropna().to_numpy()
+            if distances.size:
+                series.append(
+                    {
+                        "metric": metric,
+                        "label": str(landmark),
+                        "values": distances,
+                        "dataframe": landmark_df,
+                    }
+                )
+        if not series:
+            return False
+        panel = self.graph_panels["skin_markers"]
+        axes = panel["axes"]
+        canvas = panel["canvas"]
+        axes.clear()
+        self._draw_metric_boxplot(axes, series, f"Marqueurs cutanés - {metric}")
+        axes.set_ylabel("Distance (mm)")
         panel["figure"].tight_layout()
         canvas.draw_idle()
         return True
@@ -2843,6 +3146,8 @@ class CapturyBioBuddyGui(tk.Tk):
             "p6_model_to_c3d_axis",
             "root_offset_mode",
             "p6_segment_reference",
+            "p6_captury_reorient_thigh_y_from_cor",
+            "p6_rotate_body_segments_180_x",
             "p6_disable_static_model_alignment",
             "p6_disable_motive_marker_alignment",
         ):
@@ -3136,6 +3441,7 @@ class CapturyBioBuddyGui(tk.Tk):
 
     def _run_selected_trial_auto_analysis(self) -> None:
         if self.process is not None:
+            self.pending_auto_analysis = True
             return
         if not bool(self.vars["p6_auto_analyze"].get()):
             return
@@ -3147,9 +3453,16 @@ class CapturyBioBuddyGui(tk.Tk):
             return
         if selected not in self.trial_inventory:
             return
+        self.pending_auto_analysis = False
         self._run_args(self._p6_auto_analysis_args(selected))
 
     def _on_p6_auto_analysis_option_changed(self) -> None:
+        self._run_selected_trial_auto_analysis()
+
+    def _run_pending_auto_analysis_if_needed(self) -> None:
+        if not self.pending_auto_analysis:
+            return
+        self.pending_auto_analysis = False
         self._run_selected_trial_auto_analysis()
 
     def _load_p6_debug_preset(self) -> None:
@@ -3327,6 +3640,7 @@ class CapturyBioBuddyGui(tk.Tk):
                     )
                     if return_code == 0:
                         self._refresh_results()
+                    self._run_pending_auto_analysis_if_needed()
                 else:
                     self._append_log(str(item))
         except queue.Empty:

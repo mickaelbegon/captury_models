@@ -41,6 +41,7 @@ from bvh_c3d_biobuddy_pyorerun_compare import (
 from compare_capture_systems import (
     DEFAULT_LANDMARK_MAP,
     detect_angle_indices,
+    load_landmark_map,
     unit_scale_to_mm,
 )
 from model_comparison_metrics import joint_center_error_xyz, waveform_metrics
@@ -141,7 +142,14 @@ def trial_cache_fingerprint(
             "root_offset_mode": args.root_offset_mode,
             "angle_label_regex": args.angle_label_regex,
             "c3d_angle_unit": args.c3d_angle_unit,
+            "landmark_map": (
+                file_fingerprint(args.landmark_map) if args.landmark_map else None
+            ),
             "segment_reference": args.segment_reference,
+            "captury_reorient_thigh_y_from_cor": bool(
+                args.captury_reorient_thigh_y_from_cor
+            ),
+            "rotate_body_segments_180_x": bool(args.rotate_body_segments_180_x),
             "disable_static_model_alignment": bool(args.disable_static_model_alignment),
             "disable_motive_marker_alignment": bool(
                 args.disable_motive_marker_alignment
@@ -181,6 +189,7 @@ def required_trial_outputs(trial_dir: Path, trial_name: str) -> list[Path]:
         trial_dir / "model_dimensions.csv",
         trial_dir / "motive_marker_occlusions.csv",
         trial_dir / "skin_marker_correspondence_metrics.csv",
+        trial_dir / "skin_marker_correspondence_timeseries.npz",
         trial_dir / "trial_events_contacts.csv",
         trial_dir / "run_report.json",
     ]
@@ -556,6 +565,191 @@ def trim_rotations(
     rotations: dict[str, np.ndarray], mask: np.ndarray
 ) -> dict[str, np.ndarray]:
     return {name: values[:, :, mask] for name, values in rotations.items()}
+
+
+ROTATION_180_AROUND_LOCAL_X = np.diag([1.0, -1.0, -1.0])
+
+
+def rotate_segment_frames_180_x(
+    rotations: dict[str, np.ndarray],
+) -> dict[str, np.ndarray]:
+    """Rotate every segment frame by 180 degrees around its local X axis.
+
+    Segment rotation matrices are stored as columns expressing local axes in the
+    C3D/global frame. Right multiplication therefore changes the segment-local
+    basis while preserving the global trajectory of the segment origin.
+    """
+
+    return {
+        name: np.einsum("ijf,jk->ikf", values, ROTATION_180_AROUND_LOCAL_X)
+        for name, values in rotations.items()
+    }
+
+
+def _safe_unit_vector(vector: np.ndarray, fallback: np.ndarray) -> np.ndarray:
+    norm = float(np.linalg.norm(vector))
+    if norm > 1e-12:
+        return vector / norm
+    fallback_norm = float(np.linalg.norm(fallback))
+    if fallback_norm > 1e-12:
+        return fallback / fallback_norm
+    return np.asarray([0.0, 1.0, 0.0], dtype=float)
+
+
+def orient_segment_y_from_cor(
+    rotations: dict[str, np.ndarray],
+    centres_mm: dict[str, np.ndarray],
+    segment: str,
+    proximal_joint: str,
+    distal_joint: str,
+) -> dict[str, np.ndarray]:
+    """Return rotations where ``segment`` Y axis follows proximal -> distal CoR.
+
+    The X axis keeps the original segment orientation as much as possible by
+    projecting the previous X axis onto the plane orthogonal to the corrected Y.
+    This yields a right-handed orthonormal frame per frame.
+    """
+
+    if (
+        segment not in rotations
+        or proximal_joint not in centres_mm
+        or distal_joint not in centres_mm
+    ):
+        return rotations
+
+    corrected = dict(rotations)
+    original = np.asarray(rotations[segment], dtype=float)
+    proximal = np.asarray(centres_mm[proximal_joint], dtype=float)
+    distal = np.asarray(centres_mm[distal_joint], dtype=float)
+    n_frames = min(original.shape[2], proximal.shape[1], distal.shape[1])
+    if n_frames <= 0:
+        return rotations
+
+    frames = original.copy()
+    for frame in range(n_frames):
+        y_axis = _safe_unit_vector(
+            distal[:, frame] - proximal[:, frame], original[:, 1, frame]
+        )
+        x_axis = original[:, 0, frame]
+        x_axis = x_axis - np.dot(x_axis, y_axis) * y_axis
+        if np.linalg.norm(x_axis) <= 1e-12:
+            x_axis = np.cross(original[:, 2, frame], y_axis)
+        if np.linalg.norm(x_axis) <= 1e-12:
+            helper = (
+                np.asarray([1.0, 0.0, 0.0])
+                if abs(y_axis[0]) < 0.9
+                else np.asarray([0.0, 0.0, 1.0])
+            )
+            x_axis = np.cross(helper, y_axis)
+        x_axis = _safe_unit_vector(x_axis, original[:, 0, frame])
+        z_axis = _safe_unit_vector(np.cross(x_axis, y_axis), original[:, 2, frame])
+        x_axis = _safe_unit_vector(np.cross(y_axis, z_axis), x_axis)
+        frames[:, :, frame] = np.column_stack((x_axis, y_axis, z_axis))
+
+    corrected[segment] = frames
+    return corrected
+
+
+def correct_captury_thigh_y_from_cor(
+    rotations: dict[str, np.ndarray], centres_mm: dict[str, np.ndarray]
+) -> dict[str, np.ndarray]:
+    """Orient Captury thigh Y axes from hip CoR toward knee CoR."""
+
+    corrected = rotations
+    for segment, proximal, distal in (
+        ("LeftUpLeg", "LeftUpLeg", "LeftLeg"),
+        ("RightUpLeg", "RightUpLeg", "RightLeg"),
+    ):
+        corrected = orient_segment_y_from_cor(
+            corrected, centres_mm, segment, proximal, distal
+        )
+    return corrected
+
+
+SEGMENT_RELATIVE_ROTATION_PAIRS = (
+    ("SegRel_HipsSpine", "Hips", "Spine"),
+    ("SegRel_LeftHip", "Hips", "LeftUpLeg"),
+    ("SegRel_RightHip", "Hips", "RightUpLeg"),
+    ("SegRel_LeftKnee", "LeftUpLeg", "LeftLeg"),
+    ("SegRel_RightKnee", "RightUpLeg", "RightLeg"),
+    ("SegRel_LeftAnkle", "LeftLeg", "LeftFoot"),
+    ("SegRel_RightAnkle", "RightLeg", "RightFoot"),
+    ("SegRel_LeftShoulder", "Spine3", "LeftArm"),
+    ("SegRel_RightShoulder", "Spine3", "RightArm"),
+    ("SegRel_LeftElbow", "LeftArm", "LeftForeArm"),
+    ("SegRel_RightElbow", "RightArm", "RightForeArm"),
+)
+
+
+def segment_relative_rotation_curves(
+    rotations: dict[str, np.ndarray],
+) -> dict[str, np.ndarray]:
+    """Extract segment-relative rotation-vector curves in radians."""
+
+    curves: dict[str, np.ndarray] = {}
+    for joint, proximal, distal in SEGMENT_RELATIVE_ROTATION_PAIRS:
+        if proximal not in rotations or distal not in rotations:
+            continue
+        n_frames = min(rotations[proximal].shape[2], rotations[distal].shape[2])
+        if n_frames <= 0:
+            continue
+        values = np.zeros((3, n_frames), dtype=float)
+        for frame in range(n_frames):
+            values[:, frame] = rotation_deviation_vector(
+                rotations[proximal][:, :, frame],
+                rotations[distal][:, :, frame],
+            )
+        curves[joint] = values
+    return curves
+
+
+def segment_relative_q_metric_rows(
+    trial: str,
+    captury_rotations: dict[str, np.ndarray],
+    motive_rotations: dict[str, np.ndarray],
+    captury_time: np.ndarray,
+    motive_time: np.ndarray,
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    """Compare derived joint angles from corrected segment coordinate systems."""
+
+    summary_rows: list[dict[str, Any]] = []
+    timeseries_rows: list[dict[str, Any]] = []
+    captury_curves = segment_relative_rotation_curves(captury_rotations)
+    motive_curves = segment_relative_rotation_curves(motive_rotations)
+    component_names = ("x", "y", "z")
+    for joint in sorted(set(captury_curves).intersection(motive_curves)):
+        cap_curve = interpolate_array(captury_curves[joint], captury_time, motive_time)
+        mot_curve = motive_curves[joint]
+        n_frames = min(cap_curve.shape[1], mot_curve.shape[1], motive_time.shape[0])
+        if n_frames <= 0:
+            continue
+        cap_curve = cap_curve[:, :n_frames]
+        mot_curve = mot_curve[:, :n_frames]
+        for component_index, component in enumerate(component_names):
+            q_name = f"{joint}_{component}"
+            reference = mot_curve[component_index]
+            test = cap_curve[component_index]
+            summary_rows.append(
+                {
+                    "trial": trial,
+                    "q_name": q_name,
+                    "unit": "rad",
+                    "source": "segment_relative_rotation",
+                    **waveform_metrics(reference, test, "rad"),
+                }
+            )
+            for frame, time_value in enumerate(motive_time[:n_frames]):
+                timeseries_rows.append(
+                    {
+                        "trial": trial,
+                        "time": float(time_value),
+                        "q_name": q_name,
+                        "motive": float(reference[frame]),
+                        "captury": float(test[frame]),
+                        "difference": float(test[frame] - reference[frame]),
+                    }
+                )
+    return summary_rows, timeseries_rows
 
 
 def nearest_time_indices(
@@ -1672,7 +1866,8 @@ def marker_correspondence_rows(
     captury_c3d: Path,
     rotation: np.ndarray,
     translation: np.ndarray,
-) -> list[dict[str, Any]]:
+    landmark_map: list[dict[str, Any]],
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
     motive_labels, motive_points, _motive_residuals, motive_time = read_c3d_points_mm(
         motive_c3d
     )
@@ -1682,7 +1877,8 @@ def marker_correspondence_rows(
     motive_lookup = marker_indices_by_clean_label(motive_labels)
     captury_lookup = marker_indices_by_clean_label(captury_labels)
     rows: list[dict[str, Any]] = []
-    for item in DEFAULT_LANDMARK_MAP:
+    timeseries_rows: list[dict[str, Any]] = []
+    for item in landmark_map:
         name = str(item["name"])
         motive_indices = [
             index
@@ -1727,7 +1923,22 @@ def marker_correspondence_rows(
                 ),
             }
         )
-    return rows
+        difference = captury_on_motive - motive_rows
+        for frame, time_value in enumerate(motive_time):
+            timeseries_rows.append(
+                {
+                    "trial": trial,
+                    "time": float(time_value),
+                    "landmark": name,
+                    "motive_labels": ";".join(item["reference"]),
+                    "captury_labels": ";".join(item["test"]),
+                    "error_x_mm": float(difference[frame, 0]),
+                    "error_y_mm": float(difference[frame, 1]),
+                    "error_z_mm": float(difference[frame, 2]),
+                    "distance_mm": float(distance[frame]),
+                }
+            )
+    return rows, timeseries_rows
 
 
 def vertical_amplitude_report(enriched_c3d: Path) -> dict[str, Any]:
@@ -2087,6 +2298,26 @@ def compare_trial(
         args.model_to_c3d_axis,
         model_marker_rotation,
     )
+    segment_orientation_report: dict[str, Any] = {
+        "captury_reorient_thigh_y_from_cor": bool(
+            args.captury_reorient_thigh_y_from_cor
+        ),
+        "rotate_body_segments_180_x": bool(args.rotate_body_segments_180_x),
+        "applied": [],
+    }
+    if args.captury_reorient_thigh_y_from_cor:
+        cap_rotations_c3d = correct_captury_thigh_y_from_cor(
+            cap_rotations_c3d, cap_aligned_mm
+        )
+        segment_orientation_report["applied"].append(
+            "captury_thigh_y_axis_from_hip_to_knee_cor"
+        )
+    if args.rotate_body_segments_180_x:
+        cap_rotations_c3d = rotate_segment_frames_180_x(cap_rotations_c3d)
+        mot_rotations_c3d = rotate_segment_frames_180_x(mot_rotations_c3d)
+        segment_orientation_report["applied"].append(
+            "captury_and_motive_segment_frames_rotated_180_deg_about_local_x"
+        )
     alignment_report["motive_model_to_c3d_markers"] = model_marker_report
     enriched_c3d = append_centres_to_motive_c3d(
         bundle.motive_c3d,
@@ -2136,6 +2367,15 @@ def compare_trial(
     mot_rotation_metrics = trim_rotations(
         mot_rotations_c3d, time_window_mask(motive.time, cut_start_s, cut_end_s)
     )
+    segment_q_rows, segment_q_ts_rows = segment_relative_q_metric_rows(
+        bundle.name,
+        cap_rotation_metrics,
+        mot_rotation_metrics,
+        captury_metrics.time,
+        motive_metrics.time,
+    )
+    q_rows.extend(segment_q_rows)
+    q_ts_rows.extend(segment_q_ts_rows)
     segment_rows, segment_ts_rows, segment_report = segment_rotation_metric_rows(
         bundle.name,
         {
@@ -2164,8 +2404,14 @@ def compare_trial(
         time_end_s=cut_end_s,
     )
     dimension_rows = model_dimension_rows(bundle.name, [captury, motive])
-    marker_rows = marker_correspondence_rows(
-        bundle.name, bundle.motive_c3d, bundle.captury_c3d, rotation, translation
+    landmark_map = load_landmark_map(args.landmark_map)
+    marker_rows, marker_ts_rows = marker_correspondence_rows(
+        bundle.name,
+        bundle.motive_c3d,
+        bundle.captury_c3d,
+        rotation,
+        translation,
+        landmark_map,
     )
     write_rows(trial_dir / "joint_centre_metrics.csv", centre_rows)
     write_table_npz(trial_dir / "joint_centre_timeseries.npz", centre_ts_rows)
@@ -2177,6 +2423,9 @@ def compare_trial(
     write_table_npz(trial_dir / "segment_rotation_timeseries.npz", segment_ts_rows)
     write_rows(trial_dir / "model_dimensions.csv", dimension_rows)
     write_rows(trial_dir / "skin_marker_correspondence_metrics.csv", marker_rows)
+    write_table_npz(
+        trial_dir / "skin_marker_correspondence_timeseries.npz", marker_ts_rows
+    )
     plot_metric_barh(
         pd.DataFrame(dimension_rows),
         category="dimension",
@@ -2256,9 +2505,13 @@ def compare_trial(
             "skin_marker_correspondence_metrics": str(
                 trial_dir / "skin_marker_correspondence_metrics.csv"
             ),
+            "skin_marker_correspondence_timeseries": str(
+                trial_dir / "skin_marker_correspondence_timeseries.npz"
+            ),
         },
         "trial_events": event_report,
         "segment_rotations": segment_report,
+        "segment_orientation_corrections": segment_orientation_report,
         "occlusion_figure": str(occlusion_figure) if occlusion_figure else None,
         "occlusion_marker_count": len(occlusion_rows),
         "angle_inventory": {
@@ -2355,6 +2608,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--motive-unit-scale-to-m", type=float, default=None)
     parser.add_argument("--angle-label-regex", default=ANGLE_LABEL_REGEX)
     parser.add_argument(
+        "--landmark-map",
+        type=Path,
+        default=None,
+        help="Optional JSON map for non-joint-centre Motive/Captury marker pairs.",
+    )
+    parser.add_argument(
         "--c3d-angle-unit",
         choices=["deg", "rad"],
         default="deg",
@@ -2365,6 +2624,22 @@ def parse_args() -> argparse.Namespace:
         choices=["biobuddy", "motive", "captury"],
         default="biobuddy",
         help="Reference source for segment rotation deviation metrics.",
+    )
+    parser.add_argument(
+        "--captury-reorient-thigh-y-from-cor",
+        action="store_true",
+        help=(
+            "Correct Captury thigh segment frames by orienting the local Y axis "
+            "from hip CoR to knee CoR before segment-angle metrics."
+        ),
+    )
+    parser.add_argument(
+        "--rotate-body-segments-180-x",
+        action="store_true",
+        help=(
+            "Rotate Captury and Motive segment frames by 180 degrees around each "
+            "segment local X axis before segment-angle metrics."
+        ),
     )
     parser.add_argument(
         "--no-mesh", action="store_true", help="Skip FBX visual mesh extraction."

@@ -19,11 +19,14 @@ try:
         model_to_c3d_matrix,
         motive_flat_trial_name,
         occlusion_rows_from_points,
+        orient_segment_y_from_cor,
         required_trial_outputs,
         resolve_cut_window,
         rotation_deviation_vector,
+        rotate_segment_frames_180_x,
         root_alignment_score_mm,
         sanitize_channel_name,
+        segment_relative_rotation_curves,
         static_transform_from_report,
         time_window_mask,
         trial_cache_fingerprint,
@@ -40,11 +43,14 @@ except ImportError as exc:  # pragma: no cover - depends on optional scientific 
     model_to_c3d_matrix = None
     motive_flat_trial_name = None
     occlusion_rows_from_points = None
+    orient_segment_y_from_cor = None
     required_trial_outputs = None
     resolve_cut_window = None
     rotation_deviation_vector = None
+    rotate_segment_frames_180_x = None
     root_alignment_score_mm = None
     sanitize_channel_name = None
+    segment_relative_rotation_curves = None
     static_transform_from_report = None
     time_window_mask = None
     trial_cache_fingerprint = None
@@ -81,6 +87,7 @@ class FlatTrialDiscoveryTests(unittest.TestCase):
         self.assertIn("captury_c3d_angle_timeseries.npz", outputs)
         self.assertIn("segment_rotation_metrics.csv", outputs)
         self.assertIn("segment_rotation_timeseries.npz", outputs)
+        self.assertIn("skin_marker_correspondence_timeseries.npz", outputs)
         self.assertNotIn("joint_centre_timeseries.csv", outputs)
         self.assertNotIn("kinematics_q_timeseries.csv", outputs)
         self.assertNotIn("segment_rotation_timeseries.csv", outputs)
@@ -100,6 +107,56 @@ class FlatTrialDiscoveryTests(unittest.TestCase):
         vector = rotation_deviation_vector(np.eye(3), rotation_x)
 
         np.testing.assert_allclose(vector, [angle, 0.0, 0.0], atol=1e-10)
+
+    def test_rotate_segment_frames_180_x_changes_local_y_and_z_axes(self) -> None:
+        assert rotate_segment_frames_180_x is not None
+
+        corrected = rotate_segment_frames_180_x({"Thigh": np.eye(3)[:, :, None]})[
+            "Thigh"
+        ]
+
+        np.testing.assert_allclose(corrected[:, :, 0], np.diag([1.0, -1.0, -1.0]))
+
+    def test_orient_segment_y_from_cor_uses_proximal_to_distal_direction(
+        self,
+    ) -> None:
+        assert orient_segment_y_from_cor is not None
+
+        rotations = {"LeftUpLeg": np.eye(3)[:, :, None]}
+        centres = {
+            "LeftUpLeg": np.asarray([[0.0], [0.0], [0.0]]),
+            "LeftLeg": np.asarray([[0.0], [0.0], [2.0]]),
+        }
+
+        corrected = orient_segment_y_from_cor(
+            rotations, centres, "LeftUpLeg", "LeftUpLeg", "LeftLeg"
+        )
+
+        np.testing.assert_allclose(
+            corrected["LeftUpLeg"][:, 1, 0], [0.0, 0.0, 1.0], atol=1e-10
+        )
+
+    def test_segment_relative_rotation_curves_extract_joint_rotation(self) -> None:
+        assert segment_relative_rotation_curves is not None
+
+        angle = np.deg2rad(15.0)
+        rotation_z = np.asarray(
+            [
+                [np.cos(angle), -np.sin(angle), 0.0],
+                [np.sin(angle), np.cos(angle), 0.0],
+                [0.0, 0.0, 1.0],
+            ]
+        )
+        curves = segment_relative_rotation_curves(
+            {
+                "LeftUpLeg": np.eye(3)[:, :, None],
+                "LeftLeg": rotation_z[:, :, None],
+            }
+        )
+
+        np.testing.assert_allclose(
+            curves["SegRel_LeftKnee"][:, 0], [0.0, 0.0, angle], atol=1e-10
+        )
 
     def test_c3d_angle_scale_to_deg_handles_rad_and_deg(self) -> None:
         assert c3d_angle_scale_to_deg is not None
@@ -227,7 +284,10 @@ class FlatTrialDiscoveryTests(unittest.TestCase):
                 root_offset_mode="auto",
                 angle_label_regex="angle",
                 c3d_angle_unit="deg",
+                landmark_map=None,
                 segment_reference="biobuddy",
+                captury_reorient_thigh_y_from_cor=False,
+                rotate_body_segments_180_x=False,
                 disable_static_model_alignment=False,
                 disable_motive_marker_alignment=False,
                 joint_filter=[],
@@ -242,6 +302,9 @@ class FlatTrialDiscoveryTests(unittest.TestCase):
             )
 
             first = trial_cache_fingerprint(bundle, args)
+            args.captury_reorient_thigh_y_from_cor = True
+            fourth = trial_cache_fingerprint(bundle, args)
+            args.captury_reorient_thigh_y_from_cor = False
             args.root_offset_mode = "keep"
             third = trial_cache_fingerprint(bundle, args)
             args.root_offset_mode = "auto"
@@ -250,6 +313,7 @@ class FlatTrialDiscoveryTests(unittest.TestCase):
 
             self.assertNotEqual(first["digest"], second["digest"])
             self.assertNotEqual(first["digest"], third["digest"])
+            self.assertNotEqual(first["digest"], fourth["digest"])
 
     def test_file_fingerprint_records_missing_files(self) -> None:
         assert file_fingerprint is not None

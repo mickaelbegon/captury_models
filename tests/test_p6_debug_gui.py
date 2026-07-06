@@ -57,6 +57,8 @@ class P6DebugGuiTests(unittest.TestCase):
             "p6_model_source",
             "p6_model_to_c3d_axis",
             "p6_segment_reference",
+            "p6_captury_reorient_thigh_y_from_cor",
+            "p6_rotate_body_segments_180_x",
             "p6_disable_static_model_alignment",
             "p6_disable_motive_marker_alignment",
             "root_offset_mode",
@@ -80,6 +82,8 @@ class P6DebugGuiTests(unittest.TestCase):
         gui.vars["p6_auto_analyze"].set(True)
         gui.vars["p6_no_cache"].set(False)
         gui.vars["p6_segment_reference"].set("biobuddy")
+        gui.vars["p6_captury_reorient_thigh_y_from_cor"].set(False)
+        gui.vars["p6_rotate_body_segments_180_x"].set(False)
         gui.vars["p6_disable_static_model_alignment"].set(False)
         gui.vars["p6_disable_motive_marker_alignment"].set(False)
         gui.vars["p6_no_mesh"].set(False)
@@ -90,6 +94,7 @@ class P6DebugGuiTests(unittest.TestCase):
         gui.occlusion_sort_column = "marker_order"
         gui.occlusion_sort_descending = False
         gui.process = None
+        gui.pending_auto_analysis = False
         gui.trial_inventory = {}
         gui.status_var = FakeVar()
         return gui
@@ -157,6 +162,17 @@ class P6DebugGuiTests(unittest.TestCase):
         self.assertIn("--segment-reference", args)
         option_index = args.index("--segment-reference")
         self.assertEqual(args[option_index + 1], "motive")
+
+    def test_p6_debug_command_sets_segment_orientation_corrections(self) -> None:
+        gui = self.make_gui_stub()
+        CapturyBioBuddyGui._load_p6_debug_preset(gui)
+        gui.vars["p6_captury_reorient_thigh_y_from_cor"].set(True)
+        gui.vars["p6_rotate_body_segments_180_x"].set(True)
+
+        args = CapturyBioBuddyGui._p6_args(gui)
+
+        self.assertIn("--captury-reorient-thigh-y-from-cor", args)
+        self.assertIn("--rotate-body-segments-180-x", args)
 
     def test_manual_phase_bounds_are_sorted_and_set_manual_cut_mode(self) -> None:
         gui = self.make_gui_stub()
@@ -256,6 +272,27 @@ class P6DebugGuiTests(unittest.TestCase):
         CapturyBioBuddyGui._run_selected_trial_auto_analysis(gui)
 
         self.assertEqual(calls, [])
+        self.assertTrue(gui.pending_auto_analysis)
+
+    def test_pending_auto_analysis_runs_after_current_process_finishes(self) -> None:
+        gui = self.make_gui_stub()
+        gui.pending_auto_analysis = True
+        gui.vars["p6_data_root"].set("local_trials/2026-06-30_P6_flat")
+        gui.vars["p6_out_dir"].set("out_p6_motive_captury_debug")
+        gui.vars["selected_trial"].set("Static")
+        gui.vars["p6_static_trial"].set("Static")
+        gui.vars["p6_segment_reference"].set("captury")
+        gui.trial_inventory = {"Static": {"Motive": {}, "Captury": {}}}
+        calls = []
+        gui._resolve = lambda value: Path(".")  # type: ignore[method-assign]
+        gui._run_args = lambda args: calls.append(args)  # type: ignore[method-assign]
+
+        CapturyBioBuddyGui._run_pending_auto_analysis_if_needed(gui)
+
+        self.assertEqual(len(calls), 1)
+        option_index = calls[0].index("--segment-reference")
+        self.assertEqual(calls[0][option_index + 1], "captury")
+        self.assertFalse(gui.pending_auto_analysis)
 
     def test_selected_trial_can_disable_auto_analysis(self) -> None:
         gui = self.make_gui_stub()

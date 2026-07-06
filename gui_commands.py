@@ -218,7 +218,20 @@ def append_p6_common_args(args: list[str], values: Mapping[str, object]) -> None
     append_root_offset_mode(args, values)
     append_value(args, values, "--model-to-c3d-axis", "p6_model_to_c3d_axis")
     append_value(args, values, "--c3d-angle-unit", "c3d_angle_unit")
+    append_value(args, values, "--landmark-map", "compare_landmark_map")
     append_value(args, values, "--segment-reference", "p6_segment_reference")
+    append_flag(
+        args,
+        values,
+        "--captury-reorient-thigh-y-from-cor",
+        "p6_captury_reorient_thigh_y_from_cor",
+    )
+    append_flag(
+        args,
+        values,
+        "--rotate-body-segments-180-x",
+        "p6_rotate_body_segments_180_x",
+    )
     append_flag(
         args,
         values,
