@@ -401,7 +401,7 @@ class CapturyBioBuddyGui(tk.Tk):
             "p6_visualize_trial": "",
             "p6_headless": False,
             "p6_rerun_wait_seconds": "1",
-            "biobuddy_c3d_folder": "/Users/mickaelbegon/Downloads/data/Motive",
+            "biobuddy_c3d_folder": "",
             "biobuddy_c3d_preset": "motive_57",
             "biobuddy_c3d_output": "/tmp/motive_57.bioMod",
             "biobuddy_c3d_mapping_json": "",
@@ -610,7 +610,7 @@ class CapturyBioBuddyGui(tk.Tk):
         self._path_row(
             creation,
             0,
-            "Dossier C3D",
+            "Dossier C3D (vide = P6/Motive)",
             "biobuddy_c3d_folder",
             directory=True,
         )
@@ -3180,7 +3180,13 @@ class CapturyBioBuddyGui(tk.Tk):
         return build_p6_auto_analysis_args(self._var_values(), trial)
 
     def _biobuddy_c3d_model_args(self) -> list[str]:
-        return build_biobuddy_c3d_model_args(self._var_values())
+        values = self._var_values()
+        values["biobuddy_c3d_folder"] = str(self._biobuddy_c3d_folder_path())
+        if not str(values.get("biobuddy_c3d_mapping_json", "")).strip():
+            values["biobuddy_c3d_mapping_json"] = str(
+                motive57_mapping_path(values["biobuddy_c3d_folder"])
+            )
+        return build_biobuddy_c3d_model_args(values)
 
     def _split_var_lines(self, var_name: str) -> list[str]:
         return split_lines(self.vars[var_name].get())
@@ -3404,11 +3410,7 @@ class CapturyBioBuddyGui(tk.Tk):
         return True
 
     def _validate_biobuddy_c3d_model(self) -> bool:
-        c3d_folder = str(self.vars["biobuddy_c3d_folder"].get()).strip()
-        if not c3d_folder:
-            messagebox.showerror("Champ manquant", "Le dossier C3D est requis.")
-            return False
-        c3d_path = self._resolve(c3d_folder)
+        c3d_path = self._biobuddy_c3d_folder_path()
         if not c3d_path.exists() or not c3d_path.is_dir():
             messagebox.showerror("Dossier C3D introuvable", str(c3d_path))
             return False
@@ -3705,7 +3707,15 @@ class CapturyBioBuddyGui(tk.Tk):
         self.status_var.set("Commande BioBuddy copiée")
 
     def _biobuddy_c3d_folder_path(self) -> Path:
-        return self._resolve(str(self.vars["biobuddy_c3d_folder"].get()).strip())
+        raw_path = str(self.vars["biobuddy_c3d_folder"].get()).strip()
+        if raw_path:
+            return self._resolve(raw_path)
+        data_root = self._resolve(str(self.vars["p6_data_root"].get()).strip())
+        if data_root.exists() and data_root.is_dir():
+            for candidate in data_root.iterdir():
+                if candidate.is_dir() and candidate.name.lower() == "motive":
+                    return candidate
+        return data_root / "Motive"
 
     def _motive57_mapping_json_path(self) -> Path:
         raw_path = str(self.vars["biobuddy_c3d_mapping_json"].get()).strip()

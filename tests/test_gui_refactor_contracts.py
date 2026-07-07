@@ -175,6 +175,32 @@ class GuiRefactorContracts(unittest.TestCase):
         )
         self.assertNotIn("--with-mesh", args)
 
+    def test_biobuddy_c3d_folder_defaults_to_p6_motive_folder(self) -> None:
+        gui = make_gui_stub()
+        with tempfile.TemporaryDirectory() as tmp:
+            data_root = Path(tmp) / "2026-06-30_P6_flat"
+            motive = data_root / "Motive"
+            motive.mkdir(parents=True)
+            gui.vars["p6_data_root"].set(str(data_root))
+            gui.vars["biobuddy_c3d_folder"].set("")
+
+            args = CapturyBioBuddyGui._biobuddy_c3d_model_args(gui)
+
+            self.assertEqual(args[2], str(motive))
+
+    def test_biobuddy_c3d_folder_accepts_lowercase_motive_folder(self) -> None:
+        gui = make_gui_stub()
+        with tempfile.TemporaryDirectory() as tmp:
+            data_root = Path(tmp) / "2026-06-30_P6_flat"
+            motive = data_root / "motive"
+            motive.mkdir(parents=True)
+            gui.vars["p6_data_root"].set(str(data_root))
+            gui.vars["biobuddy_c3d_folder"].set("")
+
+            folder = CapturyBioBuddyGui._biobuddy_c3d_folder_path(gui)
+
+            self.assertEqual(folder, motive)
+
     def test_critical_method_notes_cover_main_risks(self) -> None:
         titles = " ".join(note["title"] for note in CRITICAL_METHOD_NOTES)
 
