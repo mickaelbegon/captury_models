@@ -120,6 +120,8 @@ class GuiRefactorContracts(unittest.TestCase):
         self.assertIn("0.5", args)
         self.assertIn("--c3d-angle-unit", args)
         self.assertIn("deg", args)
+        self.assertIn("--biobuddy-biomod", args)
+        self.assertIn("/tmp/motive_57.bioMod", args)
         self.assertIn("--joint-filter", args)
         self.assertIn("Hip|Knee", args)
         self.assertIn("Ankle", args)
@@ -154,6 +156,8 @@ class GuiRefactorContracts(unittest.TestCase):
         self.assertIn("--no-figures", args)
         self.assertIn("--no-mesh", args)
         self.assertIn("--max-mesh-points", args)
+        self.assertIn("--biobuddy-biomod", args)
+        self.assertIn("/tmp/motive_57.bioMod", args)
         self.assertNotIn("--visualize", args)
         self.assertNotIn("--run-ik-batch", args)
 

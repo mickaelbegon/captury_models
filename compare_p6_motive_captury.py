@@ -13,7 +13,7 @@ import subprocess
 import sys
 from dataclasses import dataclass, replace
 from pathlib import Path
-from typing import Any
+from typing import Any, Mapping
 
 import numpy as np
 import pandas as pd
@@ -133,12 +133,16 @@ def trial_cache_fingerprint(
             "motive_c3d": file_fingerprint(bundle.motive_c3d),
             "motive_bvh": file_fingerprint(bundle.motive_bvh),
             "motive_fbx": file_fingerprint(bundle.motive_fbx),
+            "biobuddy_biomod": (
+                file_fingerprint(args.biobuddy_biomod) if args.biobuddy_biomod else None
+            ),
         },
         "options": {
             "model_source": args.model_source,
             "model_to_c3d_axis": args.model_to_c3d_axis,
             "captury_unit_scale_to_m": args.captury_unit_scale_to_m,
             "motive_unit_scale_to_m": args.motive_unit_scale_to_m,
+            "biobuddy_unit_scale_to_m": args.biobuddy_unit_scale_to_m,
             "root_offset_mode": args.root_offset_mode,
             "angle_label_regex": args.angle_label_regex,
             "c3d_angle_unit": args.c3d_angle_unit,
@@ -1822,19 +1826,109 @@ def detect_trial_events_and_contacts(
     return report, rows
 
 
-SEGMENT_LENGTH_PAIRS = [
-    ("pelvis_to_spine", "Hips", "Spine"),
-    ("left_thigh", "LeftUpLeg", "LeftLeg"),
-    ("left_shank", "LeftLeg", "LeftFoot"),
-    ("left_foot", "LeftFoot", "LeftToeBase"),
-    ("right_thigh", "RightUpLeg", "RightLeg"),
-    ("right_shank", "RightLeg", "RightFoot"),
-    ("right_foot", "RightFoot", "RightToeBase"),
-    ("left_upper_arm", "LeftArm", "LeftForeArm"),
-    ("left_forearm", "LeftForeArm", "LeftHand"),
-    ("right_upper_arm", "RightArm", "RightForeArm"),
-    ("right_forearm", "RightForeArm", "RightHand"),
+SEGMENT_LENGTH_PAIR_CANDIDATES = [
+    (
+        "pelvis_to_spine",
+        [("Hips", "Spine"), ("pelvis", "spine_01"), ("Pelvis", "Thorax")],
+    ),
+    (
+        "left_thigh",
+        [("LeftUpLeg", "LeftLeg"), ("thigh_l", "calf_l"), ("LThigh", "LShank")],
+    ),
+    (
+        "left_shank",
+        [("LeftLeg", "LeftFoot"), ("calf_l", "foot_l"), ("LShank", "LFoot")],
+    ),
+    ("left_foot", [("LeftFoot", "LeftToeBase"), ("foot_l", "ball_l")]),
+    (
+        "right_thigh",
+        [("RightUpLeg", "RightLeg"), ("thigh_r", "calf_r"), ("RThigh", "RShank")],
+    ),
+    (
+        "right_shank",
+        [("RightLeg", "RightFoot"), ("calf_r", "foot_r"), ("RShank", "RFoot")],
+    ),
+    ("right_foot", [("RightFoot", "RightToeBase"), ("foot_r", "ball_r")]),
+    (
+        "left_upper_arm",
+        [
+            ("LeftArm", "LeftForeArm"),
+            ("upperarm_l", "lowerarm_l"),
+            ("LUpperArm", "LForearm"),
+        ],
+    ),
+    (
+        "left_forearm",
+        [("LeftForeArm", "LeftHand"), ("lowerarm_l", "hand_l"), ("LForearm", "LHand")],
+    ),
+    (
+        "right_upper_arm",
+        [
+            ("RightArm", "RightForeArm"),
+            ("upperarm_r", "lowerarm_r"),
+            ("RUpperArm", "RForearm"),
+        ],
+    ),
+    (
+        "right_forearm",
+        [
+            ("RightForeArm", "RightHand"),
+            ("lowerarm_r", "hand_r"),
+            ("RForearm", "RHand"),
+        ],
+    ),
 ]
+SEGMENT_LENGTH_PAIRS = [
+    (name, candidates[0][0], candidates[0][1])
+    for name, candidates in SEGMENT_LENGTH_PAIR_CANDIDATES
+]
+
+
+def segment_length_pair_for_centres(
+    centres_mm: Mapping[str, np.ndarray], candidates: list[tuple[str, str]]
+) -> tuple[str, str] | None:
+    """Choose the first segment-name pair available in a centre dictionary."""
+
+    for proximal, distal in candidates:
+        if proximal in centres_mm and distal in centres_mm:
+            return proximal, distal
+    return None
+
+
+def dimension_rows_from_centres(
+    trial: str,
+    system: str,
+    source_kind: str,
+    centres_mm: Mapping[str, np.ndarray],
+) -> list[dict[str, Any]]:
+    """Summarize segment lengths from joint-centre positions in millimetres.
+
+    The comparison GUI presents model dimensions as one row per anatomical
+    segment and source. Captury/Motive dimensions come from animated model
+    centres over time, while the BioBuddy template currently contributes a
+    neutral-pose model. Both cases share this helper: arrays can contain one
+    frame or many frames, and the median/standard deviation are computed over
+    the available samples.
+    """
+
+    rows: list[dict[str, Any]] = []
+    for name, candidates in SEGMENT_LENGTH_PAIR_CANDIDATES:
+        pair = segment_length_pair_for_centres(centres_mm, candidates)
+        if pair is None:
+            continue
+        proximal, distal = pair
+        length = np.linalg.norm(centres_mm[distal] - centres_mm[proximal], axis=0)
+        rows.append(
+            {
+                "trial": trial,
+                "system": system,
+                "source_kind": source_kind,
+                "dimension": name,
+                "median_length_mm": float(np.nanmedian(length)),
+                "sd_length_mm": float(np.nanstd(length)),
+            }
+        )
+    return rows
 
 
 def model_dimension_rows(trial: str, runs: list[ModelRun]) -> list[dict[str, Any]]:
@@ -1843,21 +1937,61 @@ def model_dimension_rows(trial: str, runs: list[ModelRun]) -> list[dict[str, Any
         centres_mm = centres_to_c3d_mm(
             run.centres_native, run.unit_scale_to_m, "identity"
         )
-        for name, proximal, distal in SEGMENT_LENGTH_PAIRS:
-            if proximal not in centres_mm or distal not in centres_mm:
-                continue
-            length = np.linalg.norm(centres_mm[distal] - centres_mm[proximal], axis=0)
-            rows.append(
-                {
-                    "trial": trial,
-                    "system": run.system,
-                    "source_kind": run.source_kind,
-                    "dimension": name,
-                    "median_length_mm": float(np.nanmedian(length)),
-                    "sd_length_mm": float(np.nanstd(length)),
-                }
-            )
+        rows.extend(
+            dimension_rows_from_centres(trial, run.system, run.source_kind, centres_mm)
+        )
     return rows
+
+
+def biomod_neutral_centres_mm(
+    biomod_path: Path, unit_scale_to_m: float
+) -> dict[str, np.ndarray]:
+    """Return neutral-pose segment origins from a biorbd/BioBuddy model.
+
+    BioBuddy models generated from the Motive 57 template do not yet provide an
+    analysed q(t) in this pipeline. For model dimensions, the neutral segment
+    origins are enough because the template lengths are static. Values are
+    returned in millimetres with shape ``(3, 1)`` to match animated centre
+    arrays used by Captury and Motive.
+    """
+
+    biorbd = require_biorbd()
+    model = biorbd.Model(str(biomod_path))
+    q = np.zeros(model.nbQ())
+    centres_mm: dict[str, np.ndarray] = {}
+    for index, name in enumerate(biorbd_segment_names(model)):
+        rt = np.asarray(model.globalJCS(q, index).to_array(), dtype=float)
+        centres_mm[name] = (rt[:3, 3] * unit_scale_to_m * 1000.0).reshape(3, 1)
+    return centres_mm
+
+
+def biobuddy_dimension_rows(
+    trial: str,
+    biomod_path: Path | None,
+    unit_scale_to_m: float,
+) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    """Load an optional BioBuddy model and expose it as a dimensions source."""
+
+    if biomod_path is None:
+        return [], {
+            "status": "missing",
+            "reason": "no_biobuddy_biomod_argument",
+        }
+    if not biomod_path.exists():
+        return [], {
+            "status": "missing",
+            "path": str(biomod_path),
+            "reason": "biobuddy_biomod_not_found",
+        }
+    centres_mm = biomod_neutral_centres_mm(biomod_path, unit_scale_to_m)
+    rows = dimension_rows_from_centres(trial, "biobuddy", "motive_57", centres_mm)
+    return rows, {
+        "status": "ok",
+        "path": str(biomod_path),
+        "unit_scale_to_m": unit_scale_to_m,
+        "segments": len(centres_mm),
+        "dimensions": len(rows),
+    }
 
 
 def marker_correspondence_rows(
@@ -2404,6 +2538,10 @@ def compare_trial(
         time_end_s=cut_end_s,
     )
     dimension_rows = model_dimension_rows(bundle.name, [captury, motive])
+    biobuddy_dimension_extra_rows, biobuddy_dimension_report = biobuddy_dimension_rows(
+        bundle.name, args.biobuddy_biomod, args.biobuddy_unit_scale_to_m
+    )
+    dimension_rows.extend(biobuddy_dimension_extra_rows)
     landmark_map = load_landmark_map(args.landmark_map)
     marker_rows, marker_ts_rows = marker_correspondence_rows(
         bundle.name,
@@ -2472,6 +2610,7 @@ def compare_trial(
                 "n_frames": int(motive.q.shape[1]),
                 "root_offset_policy": motive.root_offset_policy,
             },
+            "biobuddy": biobuddy_dimension_report,
         },
         "axis_conversion": args.model_to_c3d_axis,
         "time_window": {
@@ -2606,6 +2745,24 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--captury-unit-scale-to-m", type=float, default=None)
     parser.add_argument("--motive-unit-scale-to-m", type=float, default=None)
+    parser.add_argument(
+        "--biobuddy-biomod",
+        type=Path,
+        default=None,
+        help=(
+            "Optional BioBuddy/Biorbd model to include as a third source in "
+            "model-dimension comparisons."
+        ),
+    )
+    parser.add_argument(
+        "--biobuddy-unit-scale-to-m",
+        type=float,
+        default=1.0,
+        help=(
+            "Scale applied to neutral BioBuddy model coordinates before "
+            "dimension reporting. Default assumes the bioMod is in metres."
+        ),
+    )
     parser.add_argument("--angle-label-regex", default=ANGLE_LABEL_REGEX)
     parser.add_argument(
         "--landmark-map",

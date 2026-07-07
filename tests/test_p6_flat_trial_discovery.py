@@ -14,6 +14,7 @@ try:
         c3d_angle_scale_to_deg,
         centre_metric_rows,
         discover_flat_trials,
+        dimension_rows_from_centres,
         file_fingerprint,
         marker_proxy_centres_from_c3d,
         model_to_c3d_matrix,
@@ -38,6 +39,7 @@ except ImportError as exc:  # pragma: no cover - depends on optional scientific 
     c3d_angle_scale_to_deg = None
     centre_metric_rows = None
     discover_flat_trials = None
+    dimension_rows_from_centres = None
     file_fingerprint = None
     marker_proxy_centres_from_c3d = None
     model_to_c3d_matrix = None
@@ -91,6 +93,24 @@ class FlatTrialDiscoveryTests(unittest.TestCase):
         self.assertNotIn("joint_centre_timeseries.csv", outputs)
         self.assertNotIn("kinematics_q_timeseries.csv", outputs)
         self.assertNotIn("segment_rotation_timeseries.csv", outputs)
+
+    def test_dimension_rows_from_centres_supports_biobuddy_source(self) -> None:
+        assert dimension_rows_from_centres is not None
+
+        centres_mm = {
+            "LThigh": np.asarray([[0.0], [0.0], [0.0]]),
+            "LShank": np.asarray([[0.0], [400.0], [0.0]]),
+        }
+
+        rows = dimension_rows_from_centres(
+            "Static", "biobuddy", "motive_57", centres_mm
+        )
+
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["system"], "biobuddy")
+        self.assertEqual(rows[0]["source_kind"], "motive_57")
+        self.assertEqual(rows[0]["dimension"], "left_thigh")
+        self.assertAlmostEqual(rows[0]["median_length_mm"], 400.0)
 
     def test_rotation_deviation_vector_reports_axis_angle_components(self) -> None:
         assert rotation_deviation_vector is not None
@@ -281,6 +301,8 @@ class FlatTrialDiscoveryTests(unittest.TestCase):
                 model_to_c3d_axis="auto",
                 captury_unit_scale_to_m=None,
                 motive_unit_scale_to_m=None,
+                biobuddy_biomod=None,
+                biobuddy_unit_scale_to_m=1.0,
                 root_offset_mode="auto",
                 angle_label_regex="angle",
                 c3d_angle_unit="deg",
