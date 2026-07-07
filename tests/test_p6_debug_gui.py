@@ -95,6 +95,7 @@ class P6DebugGuiTests(unittest.TestCase):
         gui.occlusion_sort_descending = False
         gui.process = None
         gui.pending_auto_analysis = False
+        gui.auto_analysis_after_id = None
         gui.trial_inventory = {}
         gui.status_var = FakeVar()
         return gui
@@ -318,10 +319,16 @@ class P6DebugGuiTests(unittest.TestCase):
         gui.vars["p6_model_to_c3d_axis"].set("auto")
         gui.trial_inventory = {"Static": {"Motive": {}, "Captury": {}}}
         calls = []
+        scheduled = []
         gui._resolve = lambda value: Path(".")  # type: ignore[method-assign]
         gui._run_args = lambda args: calls.append(args)  # type: ignore[method-assign]
+        gui.after = lambda _ms, callback: scheduled.append(callback) or "after-1"  # type: ignore[method-assign]
 
         CapturyBioBuddyGui._on_p6_auto_analysis_option_changed(gui)
+
+        self.assertEqual(calls, [])
+        self.assertEqual(gui.auto_analysis_after_id, "after-1")
+        scheduled[0]()
 
         self.assertEqual(len(calls), 1)
         self.assertIn("--model-source", calls[0])
@@ -338,14 +345,37 @@ class P6DebugGuiTests(unittest.TestCase):
         gui.vars["root_offset_mode"].set("conserver les translations root du fichier")
         gui.trial_inventory = {"Static": {"Motive": {}, "Captury": {}}}
         calls = []
+        scheduled = []
         gui._resolve = lambda value: Path(".")  # type: ignore[method-assign]
         gui._run_args = lambda args: calls.append(args)  # type: ignore[method-assign]
+        gui.after = lambda _ms, callback: scheduled.append(callback) or "after-1"  # type: ignore[method-assign]
 
         CapturyBioBuddyGui._on_p6_auto_analysis_option_changed(gui)
+
+        scheduled[0]()
 
         self.assertEqual(len(calls), 1)
         option_index = calls[0].index("--root-offset-mode")
         self.assertEqual(calls[0][option_index + 1], "keep")
+
+    def test_auto_analysis_option_changes_are_debounced(self) -> None:
+        gui = self.make_gui_stub()
+        gui.vars["p6_data_root"].set("local_trials/2026-06-30_P6_flat")
+        gui.vars["selected_trial"].set("Static")
+        gui.trial_inventory = {"Static": {"Motive": {}, "Captury": {}}}
+        scheduled = []
+        cancelled = []
+        gui._resolve = lambda value: Path(".")  # type: ignore[method-assign]
+        gui.after = lambda _ms, callback: scheduled.append(callback) or f"after-{len(scheduled)}"  # type: ignore[method-assign]
+        gui.after_cancel = lambda after_id: cancelled.append(after_id)  # type: ignore[method-assign]
+        gui._run_args = lambda _args: None  # type: ignore[method-assign]
+
+        CapturyBioBuddyGui._on_p6_auto_analysis_option_changed(gui)
+        CapturyBioBuddyGui._on_p6_auto_analysis_option_changed(gui)
+
+        self.assertEqual(cancelled, ["after-1"])
+        self.assertEqual(gui.auto_analysis_after_id, "after-2")
+        self.assertEqual(gui.status_var.get(), "Analyse P6 planifiée: option modifiée")
 
     def test_inventory_p6_dataset_collects_flat_files_for_trial_dropdown(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

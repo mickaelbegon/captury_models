@@ -75,6 +75,7 @@ from gui_marker_correspondence import (
     save_marker_correspondence_payload,
     tree_values_to_payload,
 )
+from gui_run_report import summarize_run_report
 from gui_trial_viewer import (
     COR_LAYER_LABELS,
     DATA_SOURCE_COLORS,
@@ -116,6 +117,7 @@ except Exception:  # pragma: no cover - optional GUI plotting dependency
     EMBEDDED_GRAPHS_AVAILABLE = False
 
 ALL_TRIALS_LABEL = "Tous les essais"
+P6_AUTO_ANALYSIS_DEBOUNCE_MS = 600
 CRITICAL_METHOD_NOTES = (
     {
         "title": "Recalage FBX/BVH -> C3D",
@@ -308,6 +310,7 @@ class CapturyBioBuddyGui(tk.Tk):
         self.occlusion_sort_column = "marker_order"
         self.occlusion_sort_descending = False
         self.pending_auto_analysis = False
+        self.auto_analysis_after_id: str | None = None
         self.motive57_c3d_files: list[str] = []
         self.motive57_role_combos: dict[str, ttk.Combobox] = {}
         self.motive57_inventory_tree: ttk.Treeview | None = None
@@ -967,10 +970,27 @@ class CapturyBioBuddyGui(tk.Tk):
 
     def _build_critical_methods_tab(self, notebook: ttk.Notebook) -> None:
         tab = self._tab(notebook, "Critique")
-        tab.rowconfigure(0, weight=1)
+        tab.rowconfigure(1, weight=1)
+
+        report_panel = ttk.LabelFrame(tab, text="Dernier rapport d'analyse")
+        report_panel.grid(row=0, column=0, sticky="ew")
+        report_panel.columnconfigure(0, weight=1)
+        self.run_report_summary_var = tk.StringVar(value="Aucun rapport sélectionné.")
+        ttk.Label(
+            report_panel,
+            textvariable=self.run_report_summary_var,
+            style="Status.TLabel",
+            justify=tk.LEFT,
+            wraplength=900,
+        ).grid(row=0, column=0, sticky="ew", padx=10, pady=8)
+        ttk.Button(
+            report_panel,
+            text="Actualiser",
+            command=self._update_run_report_summary,
+        ).grid(row=0, column=1, sticky="ne", padx=(0, 10), pady=8)
 
         panel = ttk.LabelFrame(tab, text="Algorithmes sensibles et contrôles")
-        panel.grid(row=0, column=0, sticky="nsew")
+        panel.grid(row=1, column=0, sticky="nsew", pady=(12, 0))
         panel.rowconfigure(0, weight=1)
         panel.columnconfigure(0, weight=1)
 
@@ -1656,6 +1676,7 @@ class CapturyBioBuddyGui(tk.Tk):
         self._populate_occlusion_table()
         self._refresh_graphs()
         self._update_embedded_joint_chain()
+        self._update_run_report_summary()
 
     def _refresh_marker_correspondence_lists(self) -> None:
         if not hasattr(self, "marker_motive_list"):
@@ -1835,6 +1856,20 @@ class CapturyBioBuddyGui(tk.Tk):
             / "run_report.json"
         )
         return path if path.exists() else None
+
+    def _update_run_report_summary(self) -> None:
+        if not hasattr(self, "run_report_summary_var"):
+            return
+        report_path = self._selected_trial_report_path()
+        if report_path is None:
+            self.run_report_summary_var.set("Aucun rapport pour l'essai sélectionné.")
+            return
+        try:
+            report = json.loads(report_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as exc:
+            self.run_report_summary_var.set(f"Rapport illisible: {exc}")
+            return
+        self.run_report_summary_var.set(summarize_run_report(report))
 
     def _captury_marker_display_transform(self) -> tuple[np.ndarray, np.ndarray] | None:
         report_path = self._selected_trial_report_path()
@@ -3218,6 +3253,7 @@ class CapturyBioBuddyGui(tk.Tk):
         self._update_inventory_table()
         self._populate_occlusion_table()
         self._update_embedded_trial_viewer()
+        self._update_run_report_summary()
         self._run_selected_trial_auto_analysis()
 
     def _update_inventory_table(self) -> None:
@@ -3444,6 +3480,7 @@ class CapturyBioBuddyGui(tk.Tk):
     def _run_selected_trial_auto_analysis(self) -> None:
         if self.process is not None:
             self.pending_auto_analysis = True
+            self.status_var.set("Analyse P6 différée: exécution en cours")
             return
         if not bool(self.vars["p6_auto_analyze"].get()):
             return
@@ -3456,9 +3493,28 @@ class CapturyBioBuddyGui(tk.Tk):
         if selected not in self.trial_inventory:
             return
         self.pending_auto_analysis = False
+        self.status_var.set(f"Analyse P6 en cours: {selected}")
         self._run_args(self._p6_auto_analysis_args(selected))
 
     def _on_p6_auto_analysis_option_changed(self) -> None:
+        self._schedule_p6_auto_analysis("option modifiée")
+
+    def _schedule_p6_auto_analysis(self, reason: str) -> None:
+        if self.process is not None:
+            self.pending_auto_analysis = True
+            self.status_var.set(f"Analyse P6 différée: {reason}")
+            return
+        if self.auto_analysis_after_id is not None:
+            self.after_cancel(self.auto_analysis_after_id)
+        self.status_var.set(f"Analyse P6 planifiée: {reason}")
+        self.auto_analysis_after_id = self.after(
+            P6_AUTO_ANALYSIS_DEBOUNCE_MS,
+            lambda: self._run_scheduled_p6_auto_analysis(reason),
+        )
+
+    def _run_scheduled_p6_auto_analysis(self, reason: str) -> None:
+        self.auto_analysis_after_id = None
+        self.status_var.set(f"Analyse P6 relancée: {reason}")
         self._run_selected_trial_auto_analysis()
 
     def _run_pending_auto_analysis_if_needed(self) -> None:
