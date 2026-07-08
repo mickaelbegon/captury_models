@@ -17,6 +17,7 @@ try:
         dimension_rows_from_centres,
         file_fingerprint,
         marker_proxy_centres_from_c3d,
+        marker_indices_by_clean_label,
         model_to_c3d_matrix,
         motive_flat_trial_name,
         occlusion_rows_from_points,
@@ -42,6 +43,7 @@ except ImportError as exc:  # pragma: no cover - depends on optional scientific 
     dimension_rows_from_centres = None
     file_fingerprint = None
     marker_proxy_centres_from_c3d = None
+    marker_indices_by_clean_label = None
     model_to_c3d_matrix = None
     motive_flat_trial_name = None
     occlusion_rows_from_points = None
@@ -111,6 +113,15 @@ class FlatTrialDiscoveryTests(unittest.TestCase):
         self.assertEqual(rows[0]["source_kind"], "motive_57")
         self.assertEqual(rows[0]["dimension"], "left_thigh")
         self.assertAlmostEqual(rows[0]["median_length_mm"], 400.0)
+
+    def test_marker_indices_support_duplicate_number_suffixes(self) -> None:
+        assert marker_indices_by_clean_label is not None
+
+        lookup = marker_indices_by_clean_label(["Q_Hip", "Q_Knee", "Q_Hip"])
+
+        self.assertEqual(lookup["Q_Hip"], [0, 2])
+        self.assertEqual(lookup["Q_Hip#1"], [0])
+        self.assertEqual(lookup["Q_Hip#2"], [2])
 
     def test_rotation_deviation_vector_reports_axis_angle_components(self) -> None:
         assert rotation_deviation_vector is not None

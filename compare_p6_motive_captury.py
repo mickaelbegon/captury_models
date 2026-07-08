@@ -1551,8 +1551,16 @@ def clean_marker_label(label: str) -> str:
 
 def marker_indices_by_clean_label(labels: list[str]) -> dict[str, list[int]]:
     lookup: dict[str, list[int]] = {}
-    for i, label in enumerate(labels):
-        lookup.setdefault(clean_marker_label(label), []).append(i)
+    clean_labels = [clean_marker_label(label) for label in labels]
+    totals: dict[str, int] = {}
+    for label in clean_labels:
+        totals[label] = totals.get(label, 0) + 1
+    seen: dict[str, int] = {}
+    for i, label in enumerate(clean_labels):
+        seen[label] = seen.get(label, 0) + 1
+        lookup.setdefault(label, []).append(i)
+        if totals[label] > 1:
+            lookup.setdefault(f"{label}#{seen[label]}", []).append(i)
     return lookup
 
 

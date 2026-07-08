@@ -52,6 +52,27 @@ class C3DTrialViewerCoreTests(unittest.TestCase):
         self.assertEqual(camera_matrix_for_plane("XZ").shape, (3, 3))
         self.assertEqual(camera_matrix_for_subject_view("face", points).shape, (3, 3))
 
+    def test_xz_plane_uses_z_as_screen_vertical_axis(self) -> None:
+        points = np.asarray(
+            [
+                [0.0, 100.0, 0.0],
+                [0.0, 0.0, 0.0],
+                [0.0, 0.0, 100.0],
+            ]
+        )
+
+        screen, _depth = project_points(
+            points,
+            camera_matrix_for_plane("XZ"),
+            np.zeros(3),
+            scale=1.0,
+            width=800,
+            height=600,
+        )
+
+        self.assertGreater(screen[0, 1], screen[0, 0])
+        self.assertLess(screen[1, 2], screen[1, 0])
+
     def test_subject_view_pca_has_deterministic_axis_sign(self) -> None:
         points = np.asarray(
             [

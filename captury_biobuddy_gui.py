@@ -90,6 +90,7 @@ from gui_trial_viewer import (
     display_marker_name,
     joint_chain_edges,
     load_joint_centre_chain_data,
+    marker_display_labels,
     transformed_marker_data,
     vertical_axis_label,
 )
@@ -291,6 +292,7 @@ class CapturyBioBuddyGui(tk.Tk):
         self.minsize(980, 680)
 
         self.process: subprocess.Popen[str] | None = None
+        self.running_command_mode: str | None = None
         self.output_queue: queue.Queue[str | tuple[str, int]] = queue.Queue()
         self.analysis_buttons: list[ttk.Button] = []
         self.trial_inventory: dict[str, dict[str, dict[str, Path]]] = {}
@@ -323,6 +325,14 @@ class CapturyBioBuddyGui(tk.Tk):
         self._update_command_preview()
         self._update_embedded_trial_viewer()
         self.after(100, self._drain_output_queue)
+
+    def _register_analysis_button(self, button: ttk.Button) -> ttk.Button:
+        """Track buttons that start subprocess-backed analysis commands."""
+
+        self.analysis_buttons.append(button)
+        if self.process is not None:
+            button.configure(state=tk.DISABLED)
+        return button
 
     def _create_variables(self) -> None:
         defaults: dict[str, str | bool] = {
@@ -514,14 +524,15 @@ class CapturyBioBuddyGui(tk.Tk):
         actions.grid(row=row, column=0, sticky="ew", pady=(12, 0))
         for column in range(2):
             actions.columnconfigure(column, weight=1)
-        run_button = ttk.Button(
-            actions,
-            text="Lancer analyse",
-            style="Primary.TButton",
-            command=self._run_p6_analysis,
+        run_button = self._register_analysis_button(
+            ttk.Button(
+                actions,
+                text="Lancer analyse",
+                style="Primary.TButton",
+                command=self._run_p6_analysis,
+            )
         )
         run_button.grid(row=0, column=0, sticky="ew", padx=(0, 6))
-        self.analysis_buttons.append(run_button)
         ttk.Button(actions, text="Copier commande", command=self._copy_p6_command).grid(
             row=0, column=1, sticky="ew", padx=(6, 0)
         )
@@ -551,6 +562,18 @@ class CapturyBioBuddyGui(tk.Tk):
             "Offset racine",
             "root_offset_mode",
             ROOT_OFFSET_MODE_CHOICES,
+        )
+        self._check(
+            data,
+            7,
+            "Désactiver recalage statique Captury -> Motive",
+            "p6_disable_static_model_alignment",
+        )
+        self._check(
+            data,
+            8,
+            "Désactiver recalage Motive -> marqueurs C3D",
+            "p6_disable_motive_marker_alignment",
         )
         inventory = ttk.LabelFrame(tab, text="Fichiers détectés")
         inventory.grid(row=1, column=0, sticky="nsew", pady=(12, 0))
@@ -613,7 +636,7 @@ class CapturyBioBuddyGui(tk.Tk):
         self._path_row(
             creation,
             0,
-            "Dossier C3D (vide = P6/Motive)",
+            "Dossier C3D (vide = Motive)",
             "biobuddy_c3d_folder",
             directory=True,
         )
@@ -731,14 +754,15 @@ class CapturyBioBuddyGui(tk.Tk):
         actions.grid(row=2, column=0, sticky="ew", pady=(12, 0))
         for column in range(4):
             actions.columnconfigure(column, weight=1)
-        run_button = ttk.Button(
-            actions,
-            text="Créer modèle",
-            style="Primary.TButton",
-            command=self._run_biobuddy_c3d_model_creation,
+        run_button = self._register_analysis_button(
+            ttk.Button(
+                actions,
+                text="Créer modèle",
+                style="Primary.TButton",
+                command=self._run_biobuddy_c3d_model_creation,
+            )
         )
         run_button.grid(row=0, column=0, sticky="ew", padx=(0, 6))
-        self.analysis_buttons.append(run_button)
         ttk.Button(
             actions,
             text="Dossier Motive",
@@ -879,11 +903,16 @@ class CapturyBioBuddyGui(tk.Tk):
             text="Enregistrer JSON",
             command=self._save_marker_correspondence_json,
         ).grid(row=1, column=1, sticky="ew", padx=4, pady=(0, 10))
-        ttk.Button(
-            panel,
-            text="Calculer métriques",
-            command=self._save_marker_pairs_and_run_analysis,
-        ).grid(row=1, column=2, sticky="ew", padx=(4, 10), pady=(0, 10))
+        self.marker_metrics_button = self._register_analysis_button(
+            ttk.Button(
+                panel,
+                text="Calculer métriques",
+                command=self._save_marker_pairs_and_run_analysis,
+            )
+        )
+        self.marker_metrics_button.grid(
+            row=1, column=2, sticky="ew", padx=(4, 10), pady=(0, 10)
+        )
 
         mapping = ttk.LabelFrame(tab, text="Mise en correspondance")
         mapping.grid(row=1, column=0, sticky="nsew", pady=(12, 0))
@@ -1127,17 +1156,29 @@ class CapturyBioBuddyGui(tk.Tk):
         self._check(
             chain_compare,
             3,
+            "Désactiver recalage statique Captury -> Motive",
+            "p6_disable_static_model_alignment",
+        )
+        self._check(
+            chain_compare,
+            4,
+            "Désactiver recalage Motive -> marqueurs C3D",
+            "p6_disable_motive_marker_alignment",
+        )
+        self._check(
+            chain_compare,
+            5,
             "Captury: axe Y cuisse = hanche -> genou",
             "p6_captury_reorient_thigh_y_from_cor",
         )
         self._check(
             chain_compare,
-            4,
+            6,
             "Captury/Motive: rotation segments 180 deg autour de X",
             "p6_rotate_body_segments_180_x",
         )
-        self._check(chain_compare, 5, "Ne pas extraire les meshes FBX", "p6_no_mesh")
-        self._entry_row(chain_compare, 6, "Max points mesh", "p6_max_mesh_points")
+        self._check(chain_compare, 7, "Ne pas extraire les meshes FBX", "p6_no_mesh")
+        self._entry_row(chain_compare, 8, "Max points mesh", "p6_max_mesh_points")
         ttk.Label(
             chain_compare,
             text=(
@@ -1147,7 +1188,7 @@ class CapturyBioBuddyGui(tk.Tk):
             ),
             style="Status.TLabel",
             wraplength=760,
-        ).grid(row=7, column=0, columnspan=3, sticky="w", padx=10, pady=(4, 10))
+        ).grid(row=9, column=0, columnspan=3, sticky="w", padx=10, pady=(4, 10))
 
         explorer = ttk.LabelFrame(tab, text="Explorateur BioBuddy")
         explorer.grid(row=3, column=0, sticky="ew", pady=(12, 0))
@@ -1357,11 +1398,13 @@ class CapturyBioBuddyGui(tk.Tk):
         actions.columnconfigure(1, weight=1)
         actions.columnconfigure(2, weight=1)
         actions.columnconfigure(3, weight=1)
-        self.compare_button = ttk.Button(
-            actions,
-            text="Lancer la comparaison",
-            style="Primary.TButton",
-            command=self._run_comparison,
+        self.compare_button = self._register_analysis_button(
+            ttk.Button(
+                actions,
+                text="Lancer la comparaison",
+                style="Primary.TButton",
+                command=self._run_comparison,
+            )
         )
         self.compare_button.grid(row=0, column=0, sticky="ew", padx=(0, 6))
         ttk.Button(
@@ -1369,11 +1412,13 @@ class CapturyBioBuddyGui(tk.Tk):
             text="Copier commande comparaison",
             command=self._copy_comparison_command,
         ).grid(row=0, column=1, sticky="ew", padx=6)
-        self.p6_button = ttk.Button(
-            actions,
-            text="Lancer analyse cinématique",
-            style="Primary.TButton",
-            command=self._run_p6_analysis,
+        self.p6_button = self._register_analysis_button(
+            ttk.Button(
+                actions,
+                text="Lancer analyse cinématique",
+                style="Primary.TButton",
+                command=self._run_p6_analysis,
+            )
         )
         self.p6_button.grid(row=0, column=2, sticky="ew", padx=6)
         ttk.Button(
@@ -1431,11 +1476,13 @@ class CapturyBioBuddyGui(tk.Tk):
         for column in range(3):
             actions.columnconfigure(column, weight=1)
 
-        self.run_button = ttk.Button(
-            actions,
-            text="Lancer",
-            style="Primary.TButton",
-            command=self._run_selected_command,
+        self.run_button = self._register_analysis_button(
+            ttk.Button(
+                actions,
+                text="Lancer",
+                style="Primary.TButton",
+                command=self._run_selected_command,
+            )
         )
         self.run_button.grid(row=0, column=0, sticky="ew", padx=(8, 4), pady=(8, 8))
         self.stop_button = ttk.Button(
@@ -1507,16 +1554,19 @@ class CapturyBioBuddyGui(tk.Tk):
             row=1, column=0, sticky="w", pady=(4, 0)
         )
         self.viewer_cor_layer_vars: dict[str, tk.BooleanVar] = {}
+        self.viewer_cor_layer_checks: dict[str, ttk.Checkbutton] = {}
         for column, layer in enumerate(("captury", "motive", "biobuddy"), start=1):
             var = tk.BooleanVar(value=layer in {"captury", "motive"})
             self.viewer_cor_layer_vars[layer] = var
-            ttk.Checkbutton(
+            checkbutton = ttk.Checkbutton(
                 layer_controls,
                 text=COR_LAYER_LABELS[layer],
                 variable=var,
                 command=self._update_visible_cor_layers,
                 style=f"{layer.title()}.TCheckbutton",
-            ).grid(row=1, column=column, sticky="w", padx=(8, 0), pady=(4, 0))
+            )
+            checkbutton.grid(row=1, column=column, sticky="w", padx=(8, 0), pady=(4, 0))
+            self.viewer_cor_layer_checks[layer] = checkbutton
         self.viewer_chain_axes_var = tk.BooleanVar(value=False)
         ttk.Checkbutton(
             layer_controls,
@@ -1696,12 +1746,8 @@ class CapturyBioBuddyGui(tk.Tk):
             except Exception as exc:
                 self._append_log(f"\nListe marqueurs impossible pour {path}: {exc}\n")
                 continue
-            display_labels = sorted(
-                {display_marker_name(label): label for label in data.labels}
-            )
-            raw_by_display = {
-                display_marker_name(label): label for label in data.labels
-            }
+            display_labels = sorted(marker_display_labels(data.labels))
+            raw_by_display = {label: label for label in display_labels}
             self.marker_list_label_lookup[source] = raw_by_display
             for display_label in display_labels:
                 listbox.insert(tk.END, display_label)
@@ -1978,21 +2024,50 @@ class CapturyBioBuddyGui(tk.Tk):
         chain_path = self._selected_trial_joint_chain_path()
         if chain_path is None:
             self.embedded_viewer.set_joint_centre_chains(None)
+            self._update_cor_layer_check_states()
             return
         try:
             chain_data = self._load_cached_joint_chain_data(chain_path)
         except Exception as exc:
             self.embedded_viewer.set_joint_centre_chains(None)
+            self._update_cor_layer_check_states()
             self._append_log(f"\nChaîne CoR impossible pour {chain_path}: {exc}\n")
             return
         self.embedded_viewer.set_joint_centre_chains(chain_data)
+        self._update_cor_layer_check_states()
         self._update_visible_cor_layers()
+
+    def _available_viewer_cor_layers(self) -> set[str]:
+        if not hasattr(self, "embedded_viewer"):
+            return set()
+        chain_data = getattr(self.embedded_viewer, "chain_data", None)
+        if chain_data is None:
+            return set()
+        return {
+            str(layer).strip().lower()
+            for layer, joints in chain_data.layers.items()
+            if joints
+        }
+
+    def _update_cor_layer_check_states(self) -> None:
+        if not hasattr(self, "viewer_cor_layer_checks") or not hasattr(
+            self, "viewer_cor_layer_vars"
+        ):
+            return
+        available_layers = self._available_viewer_cor_layers()
+        for layer, checkbutton in self.viewer_cor_layer_checks.items():
+            if layer in available_layers:
+                checkbutton.configure(state=tk.NORMAL)
+            else:
+                self.viewer_cor_layer_vars[layer].set(False)
+                checkbutton.configure(state=tk.DISABLED)
 
     def _update_visible_cor_layers(self) -> None:
         if not hasattr(self, "embedded_viewer") or not hasattr(
             self, "viewer_cor_layer_vars"
         ):
             return
+        self._update_cor_layer_check_states()
         layers = [
             layer
             for layer, var in self.viewer_cor_layer_vars.items()
@@ -2987,12 +3062,15 @@ class CapturyBioBuddyGui(tk.Tk):
         actions.grid(row=2, column=0, sticky="ew")
         for column in range(4):
             actions.columnconfigure(column, weight=1)
-        ttk.Button(
-            actions,
-            text="Lancer",
-            style="Primary.TButton",
-            command=self._run_selected_command,
-        ).grid(row=0, column=0, sticky="ew", padx=(0, 4))
+        command_run_button = self._register_analysis_button(
+            ttk.Button(
+                actions,
+                text="Lancer",
+                style="Primary.TButton",
+                command=self._run_selected_command,
+            )
+        )
+        command_run_button.grid(row=0, column=0, sticky="ew", padx=(0, 4))
         ttk.Button(actions, text="Copier", command=self._copy_command).grid(
             row=0, column=1, sticky="ew", padx=4
         )
@@ -3241,6 +3319,7 @@ class CapturyBioBuddyGui(tk.Tk):
         else:
             self._update_inventory_table()
             self._update_embedded_trial_viewer()
+        self._refresh_default_motive57_c3d_mapping_if_needed()
 
     def _sync_selected_trial(self) -> None:
         selected = str(self.vars["selected_trial"].get()).strip()
@@ -3494,7 +3573,7 @@ class CapturyBioBuddyGui(tk.Tk):
             return
         self.pending_auto_analysis = False
         self.status_var.set(f"Analyse P6 en cours: {selected}")
-        self._run_args(self._p6_auto_analysis_args(selected))
+        self._run_args(self._p6_auto_analysis_args(selected), command_mode="kinematic")
 
     def _on_p6_auto_analysis_option_changed(self) -> None:
         self._schedule_p6_auto_analysis("option modifiée")
@@ -3610,7 +3689,8 @@ class CapturyBioBuddyGui(tk.Tk):
             return
         self._run_args(self._current_args())
 
-    def _run_args(self, args: list[str]) -> None:
+    def _run_args(self, args: list[str], command_mode: str | None = None) -> None:
+        self.running_command_mode = command_mode or self._command_mode()
         self._set_running(True)
         self._clear_log()
         self._append_log("$ " + " ".join(shlex.quote(part) for part in args) + "\n\n")
@@ -3645,7 +3725,7 @@ class CapturyBioBuddyGui(tk.Tk):
             return
         if not self._validate_comparison():
             return
-        self._run_args(self._comparison_args())
+        self._run_args(self._comparison_args(), command_mode="comparison")
 
     def _run_p6_analysis(self) -> None:
         if self.process is not None:
@@ -3653,7 +3733,7 @@ class CapturyBioBuddyGui(tk.Tk):
             return
         if not self._validate_p6_analysis():
             return
-        self._run_args(self._p6_args())
+        self._run_args(self._p6_args(), command_mode="kinematic")
 
     def _run_biobuddy_c3d_model_creation(self) -> None:
         if self.process is not None:
@@ -3663,7 +3743,9 @@ class CapturyBioBuddyGui(tk.Tk):
             return
         self._save_motive57_mapping_json()
         self.vars["command_mode"].set(COMMAND_MODES["biobuddy_c3d_model"])
-        self._run_args(self._biobuddy_c3d_model_args())
+        self._run_args(
+            self._biobuddy_c3d_model_args(), command_mode="biobuddy_c3d_model"
+        )
 
     def _stop_pipeline(self) -> None:
         if self.process is None:
@@ -3672,13 +3754,15 @@ class CapturyBioBuddyGui(tk.Tk):
         self.status_var.set("Arrêt demandé")
 
     def _set_running(self, running: bool) -> None:
-        self.run_button.configure(state=tk.DISABLED if running else tk.NORMAL)
-        if hasattr(self, "compare_button"):
-            self.compare_button.configure(state=tk.DISABLED if running else tk.NORMAL)
-        if hasattr(self, "p6_button"):
-            self.p6_button.configure(state=tk.DISABLED if running else tk.NORMAL)
+        state = tk.DISABLED if running else tk.NORMAL
+        active_buttons: list[ttk.Button] = []
         for button in self.analysis_buttons:
-            button.configure(state=tk.DISABLED if running else tk.NORMAL)
+            try:
+                button.configure(state=state)
+            except tk.TclError:
+                continue
+            active_buttons.append(button)
+        self.analysis_buttons = active_buttons
         self.stop_button.configure(state=tk.NORMAL if running else tk.DISABLED)
         self.status_var.set("Exécution en cours" if running else "Prêt")
 
@@ -3688,7 +3772,9 @@ class CapturyBioBuddyGui(tk.Tk):
                 item = self.output_queue.get_nowait()
                 if isinstance(item, tuple) and item[0] == "__return_code__":
                     return_code = item[1]
+                    finished_mode = self.running_command_mode
                     self.process = None
+                    self.running_command_mode = None
                     self._set_running(False)
                     self.status_var.set(
                         "Terminé" if return_code == 0 else f"Échec ({return_code})"
@@ -3698,6 +3784,8 @@ class CapturyBioBuddyGui(tk.Tk):
                     )
                     if return_code == 0:
                         self._refresh_results()
+                    if finished_mode == "biobuddy_c3d_model":
+                        self._notify_biobuddy_c3d_model_creation_finished(return_code)
                     self._run_pending_auto_analysis_if_needed()
                 else:
                     self._append_log(str(item))
@@ -3762,6 +3850,53 @@ class CapturyBioBuddyGui(tk.Tk):
         self.clipboard_append(command)
         self.status_var.set("Commande BioBuddy copiée")
 
+    def _biobuddy_c3d_model_creation_message(
+        self, return_code: int
+    ) -> tuple[str, str, str]:
+        output_path = self._resolve(str(self.vars["biobuddy_c3d_output"].get()).strip())
+        if return_code != 0:
+            return (
+                "error",
+                "Création BioBuddy échouée",
+                (
+                    f"La commande s'est terminée avec le code {return_code}.\n\n"
+                    "Consulte le log pour voir l'erreur BioBuddy/Python complète."
+                ),
+            )
+        if not output_path.exists():
+            return (
+                "error",
+                "Modèle BioBuddy introuvable",
+                (
+                    "La commande s'est terminée sans erreur, mais le fichier attendu "
+                    f"n'existe pas:\n{output_path}\n\n"
+                    "Vérifie le dossier de sortie et le log de création."
+                ),
+            )
+        size = output_path.stat().st_size
+        return (
+            "info",
+            "Modèle BioBuddy créé",
+            (
+                f"Le modèle a été écrit ici:\n{output_path}\n\n"
+                f"Taille: {size} octets.\n\n"
+                "Si la case BioBuddy de la chaîne CoR reste grisée, relance "
+                "l'analyse P6: elle se débloque seulement quand les résultats "
+                "de centres articulaires contiennent une couche BioBuddy."
+            ),
+        )
+
+    def _notify_biobuddy_c3d_model_creation_finished(self, return_code: int) -> None:
+        level, title, message = self._biobuddy_c3d_model_creation_message(return_code)
+        output_path = self._resolve(str(self.vars["biobuddy_c3d_output"].get()).strip())
+        if level == "info" and output_path.exists():
+            self.vars["model_explorer_path"].set(str(output_path))
+            self.status_var.set(f"Modèle BioBuddy créé: {output_path.name}")
+            messagebox.showinfo(title, message)
+        else:
+            self.status_var.set(title)
+            messagebox.showerror(title, message)
+
     def _biobuddy_c3d_folder_path(self) -> Path:
         raw_path = str(self.vars["biobuddy_c3d_folder"].get()).strip()
         if raw_path:
@@ -3772,6 +3907,17 @@ class CapturyBioBuddyGui(tk.Tk):
                 if candidate.is_dir() and candidate.name.lower() == "motive":
                     return candidate
         return data_root / "Motive"
+
+    def _refresh_default_motive57_c3d_mapping_if_needed(self) -> None:
+        if "biobuddy_c3d_folder" not in self.vars:
+            return
+        if str(self.vars["biobuddy_c3d_folder"].get()).strip():
+            return
+        if "motive57_role_combos" not in self.__dict__:
+            return
+        folder = self._biobuddy_c3d_folder_path()
+        if folder.exists() and folder.is_dir():
+            self._refresh_motive57_c3d_mapping()
 
     def _motive57_mapping_json_path(self) -> Path:
         raw_path = str(self.vars["biobuddy_c3d_mapping_json"].get()).strip()

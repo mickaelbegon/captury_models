@@ -132,6 +132,31 @@ def display_marker_name(label: str) -> str:
     return str(label).replace("Skeleton_001_", "").strip()
 
 
+def marker_display_labels(labels: Iterable[str]) -> list[str]:
+    """Return unique GUI labels while preserving the C3D marker order.
+
+    Some Captury exports contain several POINT entries with the same label.  A
+    plain listbox would collapse these names conceptually, making it impossible
+    to map a specific duplicate marker to a Motive marker.  Duplicated display
+    names are therefore numbered as ``Name#1``, ``Name#2``; unique names are
+    left unchanged.
+    """
+
+    base_labels = [display_marker_name(str(label)) for label in labels]
+    totals: dict[str, int] = {}
+    for base_label in base_labels:
+        totals[base_label] = totals.get(base_label, 0) + 1
+    seen: dict[str, int] = {}
+    display_labels: list[str] = []
+    for base_label in base_labels:
+        seen[base_label] = seen.get(base_label, 0) + 1
+        if totals[base_label] > 1:
+            display_labels.append(f"{base_label}#{seen[base_label]}")
+        else:
+            display_labels.append(base_label)
+    return display_labels
+
+
 def data_source_color(source: str) -> str:
     key = str(source).strip().lower()
     if key in {"bio_buddy", "biorbd"}:
@@ -196,8 +221,10 @@ def captury_marker_transform_from_report(
 
 def marker_indices_by_display_label(labels: list[str]) -> dict[str, list[int]]:
     lookup: dict[str, list[int]] = {}
-    for index, label in enumerate(labels):
+    unique_labels = marker_display_labels(labels)
+    for index, (label, unique_label) in enumerate(zip(labels, unique_labels)):
         lookup.setdefault(display_marker_name(label), []).append(index)
+        lookup.setdefault(unique_label, []).append(index)
     return lookup
 
 
@@ -726,14 +753,18 @@ class TkC3DTrialCanvas(tk.Canvas):
         screen, depth = project_points(
             points, self.camera, center, scale, width, height
         )
+        display_labels = marker_display_labels(data.labels)
         for index in np.argsort(depth):
             point = points[:, index]
             if not np.all(np.isfinite(point)):
                 continue
             label = data.labels[index]
+            display_label = display_labels[index]
             selected = (
                 label == self.selected_label
+                or display_label == self.selected_label
                 or label in self.selected_markers.get(source, set())
+                or display_label in self.selected_markers.get(source, set())
             )
             x = float(screen[0, index])
             y = float(screen[1, index])
@@ -752,7 +783,7 @@ class TkC3DTrialCanvas(tk.Canvas):
                 self.create_text(
                     x + 6,
                     y - 6,
-                    text=display_marker_name(label),
+                    text=display_label,
                     anchor="sw",
                     fill="#334155",
                     font=("TkDefaultFont", 8),

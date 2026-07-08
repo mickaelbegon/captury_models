@@ -4,6 +4,7 @@ import unittest
 
 import tempfile
 from pathlib import Path
+from types import SimpleNamespace
 
 import numpy as np
 import pandas as pd
@@ -26,6 +27,8 @@ from captury_biobuddy_gui import (
     transformed_marker_data,
     vertical_axis_label,
 )
+from gui_trial_viewer import marker_display_labels
+from gui_trial_viewer import JointCentreChainData
 
 
 class FakeVar:
@@ -37,6 +40,15 @@ class FakeVar:
 
     def set(self, value: object) -> None:
         self.value = value
+
+
+class FakeButton:
+    def __init__(self) -> None:
+        self.state = "normal"
+
+    def configure(self, **kwargs: object) -> None:
+        if "state" in kwargs:
+            self.state = str(kwargs["state"])
 
 
 class P6DebugGuiTests(unittest.TestCase):
@@ -73,7 +85,10 @@ class P6DebugGuiTests(unittest.TestCase):
             "p6_visualize_trial",
             "p6_headless",
             "p6_rerun_wait_seconds",
+            "biobuddy_c3d_folder",
             "biobuddy_c3d_mapping_json",
+            "biobuddy_c3d_output",
+            "model_explorer_path",
         ]
         gui.vars = {key: FakeVar("") for key in keys}
         gui.vars["p6_no_figures"].set(False)
@@ -90,7 +105,10 @@ class P6DebugGuiTests(unittest.TestCase):
         gui.vars["p6_run_ik_batch"].set(False)
         gui.vars["p6_visualize"].set(False)
         gui.vars["p6_headless"].set(False)
+        gui.vars["biobuddy_c3d_folder"].set("")
         gui.vars["biobuddy_c3d_mapping_json"].set("")
+        gui.vars["biobuddy_c3d_output"].set("/tmp/motive_57.bioMod")
+        gui.vars["model_explorer_path"].set("")
         gui.occlusion_sort_column = "marker_order"
         gui.occlusion_sort_descending = False
         gui.process = None
@@ -99,6 +117,126 @@ class P6DebugGuiTests(unittest.TestCase):
         gui.trial_inventory = {}
         gui.status_var = FakeVar()
         return gui
+
+    def test_running_state_disables_all_analysis_buttons(self) -> None:
+        gui = self.make_gui_stub()
+        first = FakeButton()
+        second = FakeButton()
+        stop = FakeButton()
+        gui.analysis_buttons = [first, second]  # type: ignore[list-item]
+        gui.stop_button = stop  # type: ignore[assignment]
+
+        CapturyBioBuddyGui._set_running(gui, True)
+
+        self.assertEqual(first.state, "disabled")
+        self.assertEqual(second.state, "disabled")
+        self.assertEqual(stop.state, "normal")
+        self.assertEqual(gui.status_var.get(), "Exécution en cours")
+
+        CapturyBioBuddyGui._set_running(gui, False)
+
+        self.assertEqual(first.state, "normal")
+        self.assertEqual(second.state, "normal")
+        self.assertEqual(stop.state, "disabled")
+        self.assertEqual(gui.status_var.get(), "Prêt")
+
+    def test_new_analysis_button_is_disabled_when_process_is_running(self) -> None:
+        gui = self.make_gui_stub()
+        gui.process = object()
+        gui.analysis_buttons = []
+        button = FakeButton()
+
+        tracked = CapturyBioBuddyGui._register_analysis_button(gui, button)  # type: ignore[arg-type]
+
+        self.assertIs(tracked, button)
+        self.assertEqual(button.state, "disabled")
+        self.assertEqual(gui.analysis_buttons, [button])
+
+    def test_biobuddy_cor_checkbox_is_disabled_until_layer_exists(self) -> None:
+        gui = self.make_gui_stub()
+        gui.viewer_cor_layer_vars = {
+            "captury": FakeVar(True),
+            "motive": FakeVar(True),
+            "biobuddy": FakeVar(True),
+        }
+        captury_button = FakeButton()
+        motive_button = FakeButton()
+        biobuddy_button = FakeButton()
+        gui.viewer_cor_layer_checks = {
+            "captury": captury_button,
+            "motive": motive_button,
+            "biobuddy": biobuddy_button,
+        }
+        gui.embedded_viewer = SimpleNamespace(
+            chain_data=JointCentreChainData(
+                layers={
+                    "captury": {"Hips": np.zeros((1, 3))},
+                    "motive": {"Hips": np.zeros((1, 3))},
+                },
+                edges=[],
+            )
+        )
+
+        CapturyBioBuddyGui._update_cor_layer_check_states(gui)
+
+        self.assertEqual(captury_button.state, "normal")
+        self.assertEqual(motive_button.state, "normal")
+        self.assertEqual(biobuddy_button.state, "disabled")
+        self.assertFalse(gui.viewer_cor_layer_vars["biobuddy"].get())
+
+        gui.embedded_viewer.chain_data = JointCentreChainData(
+            layers={
+                "captury": {"Hips": np.zeros((1, 3))},
+                "motive": {"Hips": np.zeros((1, 3))},
+                "biobuddy": {"Hips": np.zeros((1, 3))},
+            },
+            edges=[],
+        )
+
+        CapturyBioBuddyGui._update_cor_layer_check_states(gui)
+
+        self.assertEqual(biobuddy_button.state, "normal")
+
+    def test_biobuddy_c3d_model_message_reports_failed_process(self) -> None:
+        gui = self.make_gui_stub()
+
+        level, title, message = CapturyBioBuddyGui._biobuddy_c3d_model_creation_message(
+            gui, 2
+        )
+
+        self.assertEqual(level, "error")
+        self.assertEqual(title, "Création BioBuddy échouée")
+        self.assertIn("code 2", message)
+
+    def test_biobuddy_c3d_model_message_reports_missing_output(self) -> None:
+        gui = self.make_gui_stub()
+        with tempfile.TemporaryDirectory() as tmp:
+            output = Path(tmp) / "missing.bioMod"
+            gui.vars["biobuddy_c3d_output"].set(str(output))
+
+            level, title, message = (
+                CapturyBioBuddyGui._biobuddy_c3d_model_creation_message(gui, 0)
+            )
+
+        self.assertEqual(level, "error")
+        self.assertEqual(title, "Modèle BioBuddy introuvable")
+        self.assertIn("n'existe pas", message)
+
+    def test_biobuddy_c3d_model_message_reports_created_model(self) -> None:
+        gui = self.make_gui_stub()
+        with tempfile.TemporaryDirectory() as tmp:
+            output = Path(tmp) / "motive_57.bioMod"
+            output.write_text("BioBuddy model\n")
+            gui.vars["biobuddy_c3d_output"].set(str(output))
+
+            level, title, message = (
+                CapturyBioBuddyGui._biobuddy_c3d_model_creation_message(gui, 0)
+            )
+
+        self.assertEqual(level, "info")
+        self.assertEqual(title, "Modèle BioBuddy créé")
+        self.assertIn("motive_57.bioMod", message)
+        self.assertIn("case BioBuddy", message)
 
     def test_p6_debug_preset_populates_fast_static_analysis(self) -> None:
         gui = self.make_gui_stub()
@@ -124,6 +262,30 @@ class P6DebugGuiTests(unittest.TestCase):
         self.assertIs(gui.vars["p6_headless"].get(), True)
         self.assertEqual(gui.vars["p6_rerun_wait_seconds"].get(), "0")
         self.assertEqual(gui.status_var.get(), "Preset P6 debug chargé")
+
+    def test_trial_inventory_refresh_loads_default_motive_folder_when_empty(
+        self,
+    ) -> None:
+        gui = self.make_gui_stub()
+        gui.trial_combobox = FakeButton()  # type: ignore[assignment]
+        gui._update_inventory_table = lambda: None  # type: ignore[method-assign]
+        gui._update_embedded_trial_viewer = lambda: None  # type: ignore[method-assign]
+        with tempfile.TemporaryDirectory() as tmp:
+            data_root = Path(tmp)
+            motive_dir = data_root / "Motive"
+            motive_dir.mkdir()
+            gui.vars["p6_data_root"].set(str(data_root))
+            gui.vars["biobuddy_c3d_folder"].set("")
+            gui.motive57_role_combos = {}
+            calls = []
+            gui._resolve = lambda value: Path(value)  # type: ignore[method-assign]
+            gui._refresh_motive57_c3d_mapping = lambda: calls.append(  # type: ignore[method-assign]
+                CapturyBioBuddyGui._biobuddy_c3d_folder_path(gui)
+            )
+
+            CapturyBioBuddyGui._refresh_trial_inventory(gui)
+
+        self.assertEqual(calls, [motive_dir])
 
     def test_p6_debug_command_targets_kinematic_cli(self) -> None:
         gui = self.make_gui_stub()
@@ -254,7 +416,7 @@ class P6DebugGuiTests(unittest.TestCase):
         gui.trial_inventory = {"Static": {"Motive": {}}}
         calls = []
         gui._resolve = lambda value: Path(".")  # type: ignore[method-assign]
-        gui._run_args = lambda args: calls.append(args)  # type: ignore[method-assign]
+        gui._run_args = lambda args, **_kwargs: calls.append(args)  # type: ignore[method-assign]
 
         CapturyBioBuddyGui._run_selected_trial_auto_analysis(gui)
 
@@ -268,7 +430,7 @@ class P6DebugGuiTests(unittest.TestCase):
         gui.vars["selected_trial"].set("Static")
         gui.trial_inventory = {"Static": {"Motive": {}}}
         calls = []
-        gui._run_args = lambda args: calls.append(args)  # type: ignore[method-assign]
+        gui._run_args = lambda args, **_kwargs: calls.append(args)  # type: ignore[method-assign]
 
         CapturyBioBuddyGui._run_selected_trial_auto_analysis(gui)
 
@@ -286,7 +448,7 @@ class P6DebugGuiTests(unittest.TestCase):
         gui.trial_inventory = {"Static": {"Motive": {}, "Captury": {}}}
         calls = []
         gui._resolve = lambda value: Path(".")  # type: ignore[method-assign]
-        gui._run_args = lambda args: calls.append(args)  # type: ignore[method-assign]
+        gui._run_args = lambda args, **_kwargs: calls.append(args)  # type: ignore[method-assign]
 
         CapturyBioBuddyGui._run_pending_auto_analysis_if_needed(gui)
 
@@ -303,7 +465,7 @@ class P6DebugGuiTests(unittest.TestCase):
         gui.trial_inventory = {"Static": {"Motive": {}}}
         calls = []
         gui._resolve = lambda value: Path(".")  # type: ignore[method-assign]
-        gui._run_args = lambda args: calls.append(args)  # type: ignore[method-assign]
+        gui._run_args = lambda args, **_kwargs: calls.append(args)  # type: ignore[method-assign]
 
         CapturyBioBuddyGui._run_selected_trial_auto_analysis(gui)
 
@@ -321,7 +483,7 @@ class P6DebugGuiTests(unittest.TestCase):
         calls = []
         scheduled = []
         gui._resolve = lambda value: Path(".")  # type: ignore[method-assign]
-        gui._run_args = lambda args: calls.append(args)  # type: ignore[method-assign]
+        gui._run_args = lambda args, **_kwargs: calls.append(args)  # type: ignore[method-assign]
         gui.after = lambda _ms, callback: scheduled.append(callback) or "after-1"  # type: ignore[method-assign]
 
         CapturyBioBuddyGui._on_p6_auto_analysis_option_changed(gui)
@@ -347,7 +509,7 @@ class P6DebugGuiTests(unittest.TestCase):
         calls = []
         scheduled = []
         gui._resolve = lambda value: Path(".")  # type: ignore[method-assign]
-        gui._run_args = lambda args: calls.append(args)  # type: ignore[method-assign]
+        gui._run_args = lambda args, **_kwargs: calls.append(args)  # type: ignore[method-assign]
         gui.after = lambda _ms, callback: scheduled.append(callback) or "after-1"  # type: ignore[method-assign]
 
         CapturyBioBuddyGui._on_p6_auto_analysis_option_changed(gui)
@@ -582,6 +744,16 @@ class P6DebugGuiTests(unittest.TestCase):
 
     def test_display_marker_name_removes_motive_skeleton_prefix(self) -> None:
         self.assertEqual(display_marker_name("Skeleton_001_LIAS"), "LIAS")
+
+    def test_marker_display_labels_number_duplicate_names(self) -> None:
+        self.assertEqual(
+            marker_display_labels(["Q_Hip", "Q_Knee", "Q_Hip"]),
+            ["Q_Hip#1", "Q_Knee", "Q_Hip#2"],
+        )
+        self.assertEqual(
+            marker_display_labels(["Skeleton_001_LIAS", "Skeleton_001_LIAS"]),
+            ["LIAS#1", "LIAS#2"],
+        )
 
     def test_occlusion_sort_can_rank_by_missing_percent_descending(self) -> None:
         gui = self.make_gui_stub()

@@ -17,6 +17,7 @@ from motive57_c3d_mapping import prepared_motive57_c3d_folder
 DEFAULT_C3D_FOLDER = Path("/Users/mickaelbegon/Downloads/data/Motive")
 DEFAULT_OUTPUT = Path("/tmp/motive_57.bioMod")
 DEFAULT_PRESET = "motive_57"
+DEFAULT_MOTIVE_57_MARKER_PREFIXES_TO_STRIP = ("Skeleton_001_",)
 
 
 def _load_biobuddy_c3d_api() -> dict[str, Any]:
@@ -105,7 +106,29 @@ def build_arg_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Write mesh entries in the generated bioMod.",
     )
+    parser.add_argument(
+        "--strip-marker-prefix",
+        action="append",
+        default=None,
+        help=(
+            "Marker label prefix to strip before BioBuddy template matching. "
+            "Can be repeated. By default, motive_57 strips Skeleton_001_."
+        ),
+    )
     return parser
+
+
+def marker_prefixes_to_strip_for_preset(
+    preset: str, explicit_prefixes: list[str] | tuple[str, ...] | None = None
+) -> tuple[str, ...]:
+    """Return marker-name prefixes that should be removed before template matching."""
+
+    if explicit_prefixes is not None:
+        return tuple(prefix for prefix in explicit_prefixes if prefix)
+    normalized = str(preset).strip().lower().replace("-", "_")
+    if normalized == "motive_57":
+        return DEFAULT_MOTIVE_57_MARKER_PREFIXES_TO_STRIP
+    return ()
 
 
 def create_biobuddy_c3d_model(
@@ -116,6 +139,7 @@ def create_biobuddy_c3d_model(
     add_default_virtual_points: bool = True,
     with_mesh: bool = False,
     motive_57_mapping_json: str | Path | None = None,
+    marker_name_prefixes_to_strip: list[str] | tuple[str, ...] | None = None,
 ) -> Path:
     """Create a BioBuddy model from calibration C3D files and write a bioMod.
 
@@ -128,6 +152,9 @@ def create_biobuddy_c3d_model(
     * ``with_mesh`` maps directly to the ``to_biomod`` option.
     * ``motive_57_mapping_json`` can explicitly map Motive 57 static and
       functional trials when the source files do not match BioBuddy glob names.
+    * ``marker_name_prefixes_to_strip`` removes acquisition-system prefixes
+      such as ``Skeleton_001_`` before BioBuddy checks the Motive 57 template
+      marker names.
     """
     api = _load_biobuddy_c3d_api()
     folder_path = Path(c3d_folder).expanduser()
@@ -156,11 +183,16 @@ def create_biobuddy_c3d_model(
         if add_default_virtual_points
         else ()
     )
+    marker_prefixes = marker_prefixes_to_strip_for_preset(
+        str(getattr(preset_value, "value", preset)),
+        marker_name_prefixes_to_strip,
+    )
     try:
         result = api["create_model"](
             effective_folder,
             preset=preset_value,
             static_virtual_points=static_virtual_points,
+            marker_name_prefixes_to_strip=marker_prefixes,
         )
         output_path.parent.mkdir(parents=True, exist_ok=True)
         result.model.to_biomod(str(output_path), with_mesh=with_mesh)
@@ -183,6 +215,7 @@ def main(argv: list[str] | None = None) -> int:
             add_default_virtual_points=not args.no_default_virtual_points,
             with_mesh=args.with_mesh,
             motive_57_mapping_json=args.motive_57_mapping_json,
+            marker_name_prefixes_to_strip=args.strip_marker_prefix,
         )
     except Exception as exc:
         parser.exit(status=1, message=f"error: {exc}\n")
