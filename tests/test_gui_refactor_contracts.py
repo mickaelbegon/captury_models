@@ -378,7 +378,7 @@ class GuiRefactorContracts(unittest.TestCase):
             ("captury", "motive"),
         )
 
-    def test_rotate_body_segments_180_x_flips_captury_motive_local_yz_axes(
+    def test_rotate_body_segments_180_x_flips_captury_motive_local_xy_axes(
         self,
     ) -> None:
         viewer = object.__new__(TkC3DTrialCanvas)
@@ -401,9 +401,9 @@ class GuiRefactorContracts(unittest.TestCase):
 
         assert captury_axes is not None
         assert biobuddy_axes is not None
-        np.testing.assert_allclose(captury_axes["X"], biobuddy_axes["X"])
+        np.testing.assert_allclose(captury_axes["X"], -biobuddy_axes["X"])
         np.testing.assert_allclose(captury_axes["Y"], -biobuddy_axes["Y"])
-        np.testing.assert_allclose(captury_axes["Z"], -biobuddy_axes["Z"])
+        np.testing.assert_allclose(captury_axes["Z"], biobuddy_axes["Z"])
 
     def test_all_trials_label_remains_stable_for_callbacks(self) -> None:
         self.assertEqual(ALL_TRIALS_LABEL, "Tous les essais")

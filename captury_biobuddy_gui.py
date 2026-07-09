@@ -325,6 +325,7 @@ class CapturyBioBuddyGui(tk.Tk):
         self._configure_style()
         self._build_layout()
         self._bind_command_preview()
+        self._update_biobuddy_biomod_status()
         self._update_command_preview()
         self._update_embedded_trial_viewer()
         self.after(100, self._drain_output_queue)
@@ -387,7 +388,7 @@ class CapturyBioBuddyGui(tk.Tk):
             "compare_participant_filter": "",
             "compare_trial_filter": "",
             "compare_out_dir": "out_capture_system_comparison",
-            "compare_landmark_map": "motive_captury_landmark_map.json",
+            "compare_landmark_map": "",
             "compare_resample_points": "101",
             "compare_alignment": "global_rigid",
             "p6_data_root": "local_trials/2026-06-30_P6_flat",
@@ -549,40 +550,52 @@ class CapturyBioBuddyGui(tk.Tk):
         data.columnconfigure(1, weight=1)
         self._path_row(data, 0, "Dossier racine", "p6_data_root", directory=True)
         self._path_row(data, 1, "Sortie", "p6_out_dir", directory=True)
-        self._entry_row(data, 2, "Essais", "p6_trials")
-        self._entry_row(data, 3, "Essai statique", "p6_static_trial")
+        self._path_row(
+            data,
+            2,
+            "Modèle biorbd",
+            "biobuddy_c3d_output",
+            [("Modèles biorbd", "*.bioMod *.bioModx"), ("Tous les fichiers", "*")],
+        )
+        self.biobuddy_biomod_status_var = tk.StringVar(value="")
+        ttk.Label(
+            data,
+            textvariable=self.biobuddy_biomod_status_var,
+            style="Status.TLabel",
+        ).grid(row=3, column=1, columnspan=2, sticky="w", padx=10, pady=(0, 6))
+        self._entry_row(data, 4, "Essai statique", "p6_static_trial")
         self._combo_row(
-            data, 4, "Source modèle", "p6_model_source", ("bvh", "fbx", "auto")
+            data, 5, "Source modèle", "p6_model_source", ("bvh", "fbx", "auto")
         )
         self._combo_row(
             data,
-            5,
+            6,
             "Axes modèle -> C3D",
             "p6_model_to_c3d_axis",
             ("auto", "y_up_to_z_up", "identity"),
         )
         self._combo_row(
             data,
-            6,
-            "Offset racine",
+            7,
+            "Offset trans. racine",
             "root_offset_mode",
             ROOT_OFFSET_MODE_CHOICES,
         )
         self._check(
             data,
-            7,
-            "R(x,180°)",
+            8,
+            "R(x,180°)R(y,180°)",
             "p6_rotate_body_segments_180_x",
         )
         self._check(
             data,
-            8,
+            9,
             "Désactiver recalage statique Captury -> Motive",
             "p6_disable_static_model_alignment",
         )
         self._check(
             data,
-            9,
+            10,
             "Désactiver recalage Motive -> marqueurs C3D",
             "p6_disable_motive_marker_alignment",
         )
@@ -904,6 +917,8 @@ class CapturyBioBuddyGui(tk.Tk):
         panel = ttk.LabelFrame(tab, text="Marqueurs cutanés correspondants")
         panel.grid(row=0, column=0, sticky="ew")
         panel.columnconfigure(1, weight=1)
+        panel.columnconfigure(2, weight=1)
+        panel.columnconfigure(3, weight=1)
         self._path_row(
             panel,
             0,
@@ -921,6 +936,11 @@ class CapturyBioBuddyGui(tk.Tk):
             text="Enregistrer JSON",
             command=self._save_marker_correspondence_json,
         ).grid(row=1, column=1, sticky="ew", padx=4, pady=(0, 10))
+        ttk.Button(
+            panel,
+            text="Charger proposition",
+            command=self._load_marker_correspondence_proposal_json,
+        ).grid(row=1, column=2, sticky="ew", padx=4, pady=(0, 10))
         self.marker_metrics_button = self._register_analysis_button(
             ttk.Button(
                 panel,
@@ -929,7 +949,7 @@ class CapturyBioBuddyGui(tk.Tk):
             )
         )
         self.marker_metrics_button.grid(
-            row=1, column=2, sticky="ew", padx=(4, 10), pady=(0, 10)
+            row=1, column=3, sticky="ew", padx=(4, 10), pady=(0, 10)
         )
 
         mapping = ttk.LabelFrame(tab, text="Mise en correspondance")
@@ -1102,8 +1122,7 @@ class CapturyBioBuddyGui(tk.Tk):
         kinematic.grid(row=2, column=0, sticky="ew", pady=(12, 0))
         kinematic.columnconfigure(1, weight=1)
         self._path_row(kinematic, 0, "Dossier racine", "p6_data_root", directory=True)
-        self._entry_row(kinematic, 1, "Essais", "p6_trials")
-        self._entry_row(kinematic, 2, "Essai statique", "p6_static_trial")
+        self._entry_row(kinematic, 1, "Essai statique", "p6_static_trial")
 
     def _build_model_tab(self, notebook: ttk.Notebook) -> None:
         tab = self._tab(notebook, "Modèles")
@@ -1129,7 +1148,7 @@ class CapturyBioBuddyGui(tk.Tk):
         self._combo_row(
             generation,
             0,
-            "Offset racine",
+            "Offset trans. racine",
             "root_offset_mode",
             ROOT_OFFSET_MODE_CHOICES,
         )
@@ -1168,7 +1187,7 @@ class CapturyBioBuddyGui(tk.Tk):
         self._combo_row(
             chain_compare,
             2,
-            "Offset racine",
+            "Offset trans. racine",
             "root_offset_mode",
             ROOT_OFFSET_MODE_CHOICES,
         )
@@ -1193,7 +1212,7 @@ class CapturyBioBuddyGui(tk.Tk):
         self._check(
             chain_compare,
             6,
-            "R(x,180°)",
+            "R(x,180°)R(y,180°)",
             "p6_rotate_body_segments_180_x",
         )
         self._check(chain_compare, 7, "Ne pas extraire les meshes FBX", "p6_no_mesh")
@@ -1893,6 +1912,35 @@ class CapturyBioBuddyGui(tk.Tk):
         if not path.exists():
             messagebox.showerror("JSON introuvable", str(path))
             return
+        self._load_marker_correspondence_payload_from_path(path)
+
+    def _selected_marker_correspondence_proposal_path(self) -> Path | None:
+        selected = str(self.vars["selected_trial"].get()).strip()
+        if not selected or selected == ALL_TRIALS_LABEL:
+            return None
+        return (
+            self._graph_output_root()
+            / safe_trial_dir_name(selected)
+            / "skin_marker_correspondence_proposal.json"
+        )
+
+    def _load_marker_correspondence_proposal_json(self) -> None:
+        path = self._selected_marker_correspondence_proposal_path()
+        if path is None:
+            messagebox.showerror(
+                "Essai non sélectionné",
+                "Choisir un essai précis pour charger sa proposition.",
+            )
+            return
+        if not path.exists():
+            messagebox.showerror(
+                "Proposition introuvable",
+                f"Lancer l'analyse de l'essai avant de charger:\n{path}",
+            )
+            return
+        self._load_marker_correspondence_payload_from_path(path)
+
+    def _load_marker_correspondence_payload_from_path(self, path: Path) -> None:
         try:
             payload = json.loads(path.read_text(encoding="utf-8"))
         except json.JSONDecodeError as exc:
@@ -3364,6 +3412,9 @@ class CapturyBioBuddyGui(tk.Tk):
         self.vars["p6_joint_centre_reference"].trace_add(
             "write", lambda *_: self._draw_selected_graph("centres")
         )
+        self.vars["biobuddy_c3d_output"].trace_add(
+            "write", lambda *_: self._update_biobuddy_biomod_status()
+        )
         self.vars["biobuddy_c3d_folder"].trace_add(
             "write", lambda *_: self._refresh_motive57_c3d_mapping()
         )
@@ -3555,6 +3606,24 @@ class CapturyBioBuddyGui(tk.Tk):
     def _resolve(self, value: str) -> Path:
         path = Path(value).expanduser()
         return path if path.is_absolute() else PROJECT_DIR / path
+
+    def _update_biobuddy_biomod_status(self) -> None:
+        status_var = getattr(self, "biobuddy_biomod_status_var", None)
+        if status_var is None:
+            return
+        raw_path = str(self.vars["biobuddy_c3d_output"].get()).strip()
+        if not raw_path:
+            status_var.set(
+                "Aucun modèle biorbd sélectionné: créer le modèle dans l'onglet BioBuddy."
+            )
+            return
+        path = self._resolve(raw_path)
+        if path.exists():
+            status_var.set(f"Modèle biorbd disponible: {path.name}")
+        else:
+            status_var.set(
+                "Modèle biorbd introuvable: créer le modèle dans l'onglet BioBuddy."
+            )
 
     def _run_pipeline(self) -> None:
         if self.process is not None:

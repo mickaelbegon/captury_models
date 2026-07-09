@@ -970,7 +970,7 @@ class TkC3DTrialCanvas(tk.Canvas):
         if axes is None:
             return None
         if self.rotate_body_segments_180_x and layer in {"captury", "motive"}:
-            return {"X": axes["X"], "Y": -axes["Y"], "Z": -axes["Z"]}
+            return {"X": -axes["X"], "Y": -axes["Y"], "Z": axes["Z"]}
         return axes
 
     def _draw_empty_message(self, width: int, height: int, message: str) -> None:

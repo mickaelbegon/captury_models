@@ -13,6 +13,7 @@ try:
         captury_flat_trial_name,
         c3d_angle_scale_to_deg,
         centre_metric_rows,
+        compose_row_alignment,
         discover_flat_trials,
         dimension_rows_from_centres,
         euler_matrix_from_sequence,
@@ -24,6 +25,7 @@ try:
         motive_flat_trial_name,
         occlusion_rows_from_points,
         orient_segment_y_from_cor,
+        propose_marker_correspondences_from_points,
         reexpress_rotational_q_from_segment_rotations,
         required_trial_outputs,
         resolve_cut_window,
@@ -42,6 +44,7 @@ except ImportError as exc:  # pragma: no cover - depends on optional scientific 
     captury_flat_trial_name = None
     c3d_angle_scale_to_deg = None
     centre_metric_rows = None
+    compose_row_alignment = None
     discover_flat_trials = None
     dimension_rows_from_centres = None
     euler_matrix_from_sequence = None
@@ -53,6 +56,7 @@ except ImportError as exc:  # pragma: no cover - depends on optional scientific 
     motive_flat_trial_name = None
     occlusion_rows_from_points = None
     orient_segment_y_from_cor = None
+    propose_marker_correspondences_from_points = None
     reexpress_rotational_q_from_segment_rotations = None
     required_trial_outputs = None
     resolve_cut_window = None
@@ -129,6 +133,62 @@ class FlatTrialDiscoveryTests(unittest.TestCase):
         self.assertEqual(lookup["Q_Hip#1"], [0])
         self.assertEqual(lookup["Q_Hip#2"], [2])
 
+    def test_compose_row_alignment_matches_sequential_transforms(self) -> None:
+        assert compose_row_alignment is not None
+
+        first_rotation = np.asarray(
+            [[0.0, 1.0, 0.0], [-1.0, 0.0, 0.0], [0.0, 0.0, 1.0]]
+        )
+        first_translation = np.asarray([10.0, 20.0, 30.0])
+        second_rotation = np.asarray(
+            [[1.0, 0.0, 0.0], [0.0, 0.0, 1.0], [0.0, -1.0, 0.0]]
+        )
+        second_translation = np.asarray([-5.0, 2.0, 8.0])
+        points = np.asarray([[1.0, 2.0, 3.0], [4.0, 5.0, 6.0]])
+
+        rotation, translation = compose_row_alignment(
+            first_rotation, first_translation, second_rotation, second_translation
+        )
+
+        sequential = (
+            points @ first_rotation + first_translation
+        ) @ second_rotation + second_translation
+        composed = points @ rotation + translation
+        np.testing.assert_allclose(composed, sequential)
+
+    def test_marker_correspondence_proposal_pairs_nearest_aligned_skin_markers(
+        self,
+    ) -> None:
+        assert propose_marker_correspondences_from_points is not None
+
+        time = np.asarray([0.0, 1.0])
+        motive_points = np.asarray(
+            [
+                [[0.0, 0.0], [100.0, 100.0], [200.0, 200.0], [300.0, 300.0]],
+                [[0.0, 0.0], [0.0, 0.0], [0.0, 0.0], [0.0, 0.0]],
+                [[0.0, 0.0], [0.0, 0.0], [0.0, 0.0], [0.0, 0.0]],
+            ]
+        )
+        captury_points = motive_points[:, [0, 1, 3], :].copy()
+        captury_points[:, 0, :] += 500.0
+        pairs, report = propose_marker_correspondences_from_points(
+            ["Skeleton_001_LIAS", "Skeleton_001_RIAS", "CAPJC_Hips", "LANK"],
+            motive_points,
+            time,
+            ["Q_A", "Q_B", "Q_C"],
+            captury_points,
+            time,
+            np.eye(3),
+            np.zeros(3),
+            max_median_error_mm=1.0,
+        )
+
+        self.assertEqual(report["selected_count"], 2)
+        self.assertEqual(
+            [(row["reference"][0], row["test"][0]) for row in pairs],
+            [("RIAS", "Q_B"), ("LANK", "Q_C")],
+        )
+
     def test_rotation_deviation_vector_reports_axis_angle_components(self) -> None:
         assert rotation_deviation_vector is not None
 
@@ -145,14 +205,14 @@ class FlatTrialDiscoveryTests(unittest.TestCase):
 
         np.testing.assert_allclose(vector, [angle, 0.0, 0.0], atol=1e-10)
 
-    def test_rotate_segment_frames_180_x_changes_local_y_and_z_axes(self) -> None:
+    def test_rotate_segment_frames_180_x_changes_local_x_and_y_axes(self) -> None:
         assert rotate_segment_frames_180_x is not None
 
         corrected = rotate_segment_frames_180_x({"Thigh": np.eye(3)[:, :, None]})[
             "Thigh"
         ]
 
-        np.testing.assert_allclose(corrected[:, :, 0], np.diag([1.0, -1.0, -1.0]))
+        np.testing.assert_allclose(corrected[:, :, 0], np.diag([-1.0, -1.0, 1.0]))
 
     def test_euler_zxy_roundtrip_from_rotation_matrix(self) -> None:
         assert euler_matrix_from_sequence is not None
@@ -177,7 +237,7 @@ class FlatTrialDiscoveryTests(unittest.TestCase):
         original_rotation = euler_matrix_from_sequence(
             np.deg2rad([5.0, 8.0, 11.0]), "ZXY"
         )
-        corrected_rotation = original_rotation @ np.diag([1.0, -1.0, -1.0])
+        corrected_rotation = original_rotation @ np.diag([-1.0, -1.0, 1.0])
 
         q, report = reexpress_rotational_q_from_segment_rotations(
             original_q,

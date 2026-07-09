@@ -466,8 +466,35 @@ class P6DebugGuiTests(unittest.TestCase):
     def test_loading_tab_exposes_rotate_body_segments_option(self) -> None:
         source = inspect.getsource(CapturyBioBuddyGui._build_loading_matching_tab)
 
-        self.assertIn('"R(x,180°)"', source)
+        self.assertIn('"R(x,180°)R(y,180°)"', source)
         self.assertIn('"p6_rotate_body_segments_180_x"', source)
+
+    def test_loading_tab_exposes_biorbd_model_without_manual_trial_field(self) -> None:
+        source = inspect.getsource(CapturyBioBuddyGui._build_loading_matching_tab)
+
+        self.assertIn('"Modèle biorbd"', source)
+        self.assertIn('"biobuddy_c3d_output"', source)
+        self.assertIn('"Offset trans. racine"', source)
+        self.assertNotIn('"Offset racine"', source)
+        self.assertNotIn('"Essais"', source)
+
+    def test_biorbd_model_status_reports_missing_and_existing_model(self) -> None:
+        gui = self.make_gui_stub()
+        gui.biobuddy_biomod_status_var = FakeVar("")
+
+        gui.vars["biobuddy_c3d_output"].set("/tmp/does_not_exist_for_captury.bioMod")
+        CapturyBioBuddyGui._update_biobuddy_biomod_status(gui)
+        self.assertIn("créer le modèle", str(gui.biobuddy_biomod_status_var.get()))
+
+        with tempfile.TemporaryDirectory() as directory:
+            biomod = Path(directory) / "motive_57.bioMod"
+            biomod.write_text("model\n", encoding="utf-8")
+            gui.vars["biobuddy_c3d_output"].set(str(biomod))
+            CapturyBioBuddyGui._update_biobuddy_biomod_status(gui)
+
+        self.assertIn(
+            "Modèle biorbd disponible", str(gui.biobuddy_biomod_status_var.get())
+        )
 
     def test_running_status_messages_are_specific_for_biobuddy_steps(self) -> None:
         gui = self.make_gui_stub()

@@ -195,6 +195,7 @@ def required_trial_outputs(trial_dir: Path, trial_name: str) -> list[Path]:
         trial_dir / "segment_rotation_timeseries.npz",
         trial_dir / "model_dimensions.csv",
         trial_dir / "motive_marker_occlusions.csv",
+        trial_dir / "skin_marker_correspondence_proposal.json",
         trial_dir / "skin_marker_correspondence_metrics.csv",
         trial_dir / "skin_marker_correspondence_timeseries.npz",
         trial_dir / "trial_events_contacts.csv",
@@ -574,13 +575,13 @@ def trim_rotations(
     return {name: values[:, :, mask] for name, values in rotations.items()}
 
 
-ROTATION_180_AROUND_LOCAL_X = np.diag([1.0, -1.0, -1.0])
+ROTATION_180_AROUND_LOCAL_X_THEN_Y = np.diag([-1.0, -1.0, 1.0])
 
 
 def rotate_segment_frames_180_x(
     rotations: dict[str, np.ndarray],
 ) -> dict[str, np.ndarray]:
-    """Rotate every segment frame by 180 degrees around its local X axis.
+    """Rotate every segment frame by local ``R(x, pi) @ R(y, pi)``.
 
     Segment rotation matrices are stored as columns expressing local axes in the
     C3D/global frame. Right multiplication therefore changes the segment-local
@@ -588,7 +589,7 @@ def rotate_segment_frames_180_x(
     """
 
     return {
-        name: np.einsum("ijf,jk->ikf", values, ROTATION_180_AROUND_LOCAL_X)
+        name: np.einsum("ijf,jk->ikf", values, ROTATION_180_AROUND_LOCAL_X_THEN_Y)
         for name, values in rotations.items()
     }
 
@@ -1160,6 +1161,28 @@ def apply_alignment(
         rows = values.T @ rotation + translation
         aligned[name] = rows.T
     return aligned
+
+
+def compose_row_alignment(
+    first_rotation: np.ndarray,
+    first_translation: np.ndarray,
+    second_rotation: np.ndarray,
+    second_translation: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Compose two row-vector rigid transforms.
+
+    Points are transformed as ``p @ R + t``.  Applying ``first`` then ``second``
+    is therefore ``p @ (R1 @ R2) + (t1 @ R2 + t2)``.
+    """
+
+    first_rotation = np.asarray(first_rotation, dtype=float)
+    first_translation = np.asarray(first_translation, dtype=float)
+    second_rotation = np.asarray(second_rotation, dtype=float)
+    second_translation = np.asarray(second_translation, dtype=float)
+    return (
+        first_rotation @ second_rotation,
+        first_translation @ second_rotation + second_translation,
+    )
 
 
 def yaw_rotation_rows(angle_rad: float) -> np.ndarray:
@@ -2303,6 +2326,136 @@ def run_biobuddy_ik_for_trial(
         return None, {"status": "error", "error": str(exc), "path": str(biomod_path)}
 
 
+def is_synthetic_joint_centre_label(label: str) -> bool:
+    clean = clean_marker_label(label).upper()
+    return clean.startswith(("CAPJC_", "MOTJC_", "BVHJC_", "FBXJC_"))
+
+
+def unique_marker_labels(labels: list[str]) -> list[str]:
+    clean_labels = [clean_marker_label(label) for label in labels]
+    totals: dict[str, int] = {}
+    for label in clean_labels:
+        totals[label] = totals.get(label, 0) + 1
+    seen: dict[str, int] = {}
+    unique: list[str] = []
+    for label in clean_labels:
+        seen[label] = seen.get(label, 0) + 1
+        unique.append(f"{label}#{seen[label]}" if totals[label] > 1 else label)
+    return unique
+
+
+def proposal_candidate_indices(labels: list[str]) -> list[int]:
+    return [
+        index
+        for index, label in enumerate(labels)
+        if clean_marker_label(label) and not is_synthetic_joint_centre_label(label)
+    ]
+
+
+def propose_marker_correspondences_from_points(
+    motive_labels: list[str],
+    motive_points: np.ndarray,
+    motive_time: np.ndarray,
+    captury_labels: list[str],
+    captury_points: np.ndarray,
+    captury_time: np.ndarray,
+    rotation: np.ndarray,
+    translation: np.ndarray,
+    *,
+    max_median_error_mm: float = 250.0,
+    max_pairs: int = 80,
+) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    """Propose one-to-one skin marker pairs after Captury -> Motive alignment."""
+
+    motive_unique = unique_marker_labels(motive_labels)
+    captury_unique = unique_marker_labels(captury_labels)
+    motive_indices = proposal_candidate_indices(motive_labels)
+    captury_indices = proposal_candidate_indices(captury_labels)
+    candidates: list[dict[str, Any]] = []
+    for motive_index in motive_indices:
+        motive_signal = motive_points[:, motive_index, :].T
+        motive_valid = np.all(np.isfinite(motive_signal), axis=1)
+        if not motive_valid.any():
+            continue
+        for captury_index in captury_indices:
+            captury_signal = captury_points[:, captury_index, :]
+            captury_on_motive = (
+                interpolate_array(captury_signal, captury_time, motive_time).T
+                @ rotation
+                + translation
+            )
+            valid = motive_valid & np.all(np.isfinite(captury_on_motive), axis=1)
+            if not valid.any():
+                continue
+            distance = np.linalg.norm(
+                captury_on_motive[valid] - motive_signal[valid], axis=1
+            )
+            if distance.size == 0:
+                continue
+            median_error = float(np.nanmedian(distance))
+            candidates.append(
+                {
+                    "name": (
+                        f"{motive_unique[motive_index]}_to_"
+                        f"{captury_unique[captury_index]}"
+                    ),
+                    "reference": [motive_unique[motive_index]],
+                    "test": [captury_unique[captury_index]],
+                    "median_error_mm": median_error,
+                    "p95_error_mm": float(np.nanpercentile(distance, 95)),
+                    "n_frames": int(valid.sum()),
+                }
+            )
+    selected: list[dict[str, Any]] = []
+    used_motive: set[str] = set()
+    used_captury: set[str] = set()
+    for candidate in sorted(candidates, key=lambda row: row["median_error_mm"]):
+        motive_label = str(candidate["reference"][0])
+        captury_label = str(candidate["test"][0])
+        if motive_label in used_motive or captury_label in used_captury:
+            continue
+        if float(candidate["median_error_mm"]) > max_median_error_mm:
+            continue
+        selected.append(candidate)
+        used_motive.add(motive_label)
+        used_captury.add(captury_label)
+        if len(selected) >= max_pairs:
+            break
+    report = {
+        "method": "greedy_min_median_distance_after_joint_centre_alignment",
+        "candidate_count": len(candidates),
+        "selected_count": len(selected),
+        "max_median_error_mm": max_median_error_mm,
+        "max_pairs": max_pairs,
+    }
+    return selected, report
+
+
+def propose_marker_correspondences(
+    motive_c3d: Path,
+    captury_c3d: Path,
+    rotation: np.ndarray,
+    translation: np.ndarray,
+    angle_label_regex: str,
+) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    motive_labels, motive_points, _motive_residuals, motive_time = read_c3d_points_mm(
+        motive_c3d, angle_label_regex
+    )
+    captury_labels, captury_points, _captury_residuals, captury_time = (
+        read_c3d_points_mm(captury_c3d, angle_label_regex)
+    )
+    return propose_marker_correspondences_from_points(
+        motive_labels,
+        motive_points,
+        motive_time,
+        captury_labels,
+        captury_points,
+        captury_time,
+        rotation,
+        translation,
+    )
+
+
 def marker_correspondence_rows(
     trial: str,
     motive_c3d: Path,
@@ -2725,6 +2878,9 @@ def compare_trial(
         model_marker_rotation, model_marker_translation, model_marker_report = (
             model_to_motive_marker_alignment(mot_c3d_mm, motive.time, bundle.motive_c3d)
         )
+    marker_rotation, marker_translation = compose_row_alignment(
+        rotation, translation, model_marker_rotation, model_marker_translation
+    )
     cap_aligned_mm = apply_alignment(
         cap_aligned_mm, model_marker_rotation, model_marker_translation
     )
@@ -2760,7 +2916,7 @@ def compare_trial(
         cap_rotations_c3d = rotate_segment_frames_180_x(cap_rotations_c3d)
         mot_rotations_c3d = rotate_segment_frames_180_x(mot_rotations_c3d)
         segment_orientation_report["applied"].append(
-            "captury_and_motive_segment_frames_rotated_180_deg_about_local_x"
+            "captury_and_motive_segment_frames_rotated_180_deg_about_local_x_then_local_y"
         )
     if args.reexpress_rotations_zxy:
         segment_orientation_report["applied"].append(
@@ -2918,13 +3074,29 @@ def compare_trial(
         bundle.name, args.biobuddy_biomod, args.biobuddy_unit_scale_to_m
     )
     dimension_rows.extend(biobuddy_dimension_extra_rows)
-    landmark_map = load_landmark_map(args.landmark_map)
+    marker_proposal, marker_proposal_report = propose_marker_correspondences(
+        bundle.motive_c3d,
+        bundle.captury_c3d,
+        marker_rotation,
+        marker_translation,
+        args.angle_label_regex,
+    )
+    marker_proposal_path = trial_dir / "skin_marker_correspondence_proposal.json"
+    marker_proposal_path.write_text(
+        json.dumps(marker_proposal, indent=2, ensure_ascii=False), encoding="utf-8"
+    )
+    if args.landmark_map is None:
+        landmark_map = marker_proposal
+        marker_map_source = "automatic_proposal"
+    else:
+        landmark_map = load_landmark_map(args.landmark_map)
+        marker_map_source = str(args.landmark_map)
     marker_rows, marker_ts_rows = marker_correspondence_rows(
         bundle.name,
         bundle.motive_c3d,
         bundle.captury_c3d,
-        rotation,
-        translation,
+        marker_rotation,
+        marker_translation,
         landmark_map,
     )
     write_rows(trial_dir / "joint_centre_metrics.csv", centre_rows)
@@ -3023,6 +3195,16 @@ def compare_trial(
             "skin_marker_correspondence_timeseries": str(
                 trial_dir / "skin_marker_correspondence_timeseries.npz"
             ),
+            "skin_marker_correspondence_proposal": str(marker_proposal_path),
+        },
+        "skin_marker_correspondence": {
+            "map_source": marker_map_source,
+            "proposal": marker_proposal_report,
+            "alignment": {
+                "method": "captury_to_motive_joint_centres_then_motive_model_to_c3d_markers",
+                "rotation": marker_rotation.tolist(),
+                "translation_mm": marker_translation.tolist(),
+            },
         },
         "trial_events": event_report,
         "segment_rotations": segment_report,
@@ -3172,8 +3354,8 @@ def parse_args() -> argparse.Namespace:
         "--rotate-body-segments-180-x",
         action="store_true",
         help=(
-            "Rotate Captury and Motive segment frames by 180 degrees around each "
-            "segment local X axis before segment-angle metrics."
+            "Rotate Captury and Motive segment frames by local R(x, 180 deg) "
+            "followed by local R(y, 180 deg) before segment-angle metrics."
         ),
     )
     parser.add_argument(
