@@ -15,6 +15,8 @@ try:
         centre_metric_rows,
         discover_flat_trials,
         dimension_rows_from_centres,
+        euler_matrix_from_sequence,
+        euler_zxy_from_matrix,
         file_fingerprint,
         marker_proxy_centres_from_c3d,
         marker_indices_by_clean_label,
@@ -22,6 +24,7 @@ try:
         motive_flat_trial_name,
         occlusion_rows_from_points,
         orient_segment_y_from_cor,
+        reexpress_rotational_q_from_segment_rotations,
         required_trial_outputs,
         resolve_cut_window,
         rotation_deviation_vector,
@@ -41,6 +44,8 @@ except ImportError as exc:  # pragma: no cover - depends on optional scientific 
     centre_metric_rows = None
     discover_flat_trials = None
     dimension_rows_from_centres = None
+    euler_matrix_from_sequence = None
+    euler_zxy_from_matrix = None
     file_fingerprint = None
     marker_proxy_centres_from_c3d = None
     marker_indices_by_clean_label = None
@@ -48,6 +53,7 @@ except ImportError as exc:  # pragma: no cover - depends on optional scientific 
     motive_flat_trial_name = None
     occlusion_rows_from_points = None
     orient_segment_y_from_cor = None
+    reexpress_rotational_q_from_segment_rotations = None
     required_trial_outputs = None
     resolve_cut_window = None
     rotation_deviation_vector = None
@@ -147,6 +153,46 @@ class FlatTrialDiscoveryTests(unittest.TestCase):
         ]
 
         np.testing.assert_allclose(corrected[:, :, 0], np.diag([1.0, -1.0, -1.0]))
+
+    def test_euler_zxy_roundtrip_from_rotation_matrix(self) -> None:
+        assert euler_matrix_from_sequence is not None
+        assert euler_zxy_from_matrix is not None
+
+        expected = np.deg2rad([20.0, -10.0, 35.0])
+        rotation = euler_matrix_from_sequence(expected, "ZXY")
+
+        actual = euler_zxy_from_matrix(rotation)
+
+        np.testing.assert_allclose(actual, expected, atol=1e-10)
+        np.testing.assert_allclose(
+            euler_matrix_from_sequence(actual, "ZXY"), rotation, atol=1e-10
+        )
+
+    def test_reexpress_rotational_q_uses_corrected_segment_matrix(self) -> None:
+        assert euler_matrix_from_sequence is not None
+        assert reexpress_rotational_q_from_segment_rotations is not None
+
+        q_names = ["Thigh_rotZ", "Thigh_rotX", "Thigh_rotY", "Thigh_transX"]
+        original_q = np.asarray([[0.0], [0.0], [0.0], [123.0]])
+        original_rotation = euler_matrix_from_sequence(
+            np.deg2rad([5.0, 8.0, 11.0]), "ZXY"
+        )
+        corrected_rotation = original_rotation @ np.diag([1.0, -1.0, -1.0])
+
+        q, report = reexpress_rotational_q_from_segment_rotations(
+            original_q,
+            q_names,
+            {"Thigh": corrected_rotation[:, :, None]},
+            "ZXY",
+        )
+
+        np.testing.assert_allclose(
+            euler_matrix_from_sequence(q[:3, 0], "ZXY"),
+            corrected_rotation,
+            atol=1e-10,
+        )
+        self.assertEqual(float(q[3, 0]), 123.0)
+        self.assertEqual(report["changed_segments"], ["Thigh"])
 
     def test_orient_segment_y_from_cor_uses_proximal_to_distal_direction(
         self,
@@ -321,6 +367,7 @@ class FlatTrialDiscoveryTests(unittest.TestCase):
                 segment_reference="biobuddy",
                 captury_reorient_thigh_y_from_cor=False,
                 rotate_body_segments_180_x=False,
+                reexpress_rotations_zxy=False,
                 disable_static_model_alignment=False,
                 disable_motive_marker_alignment=False,
                 joint_filter=[],
@@ -338,6 +385,9 @@ class FlatTrialDiscoveryTests(unittest.TestCase):
             args.captury_reorient_thigh_y_from_cor = True
             fourth = trial_cache_fingerprint(bundle, args)
             args.captury_reorient_thigh_y_from_cor = False
+            args.reexpress_rotations_zxy = True
+            fifth = trial_cache_fingerprint(bundle, args)
+            args.reexpress_rotations_zxy = False
             args.root_offset_mode = "keep"
             third = trial_cache_fingerprint(bundle, args)
             args.root_offset_mode = "auto"
@@ -347,6 +397,7 @@ class FlatTrialDiscoveryTests(unittest.TestCase):
             self.assertNotEqual(first["digest"], second["digest"])
             self.assertNotEqual(first["digest"], third["digest"])
             self.assertNotEqual(first["digest"], fourth["digest"])
+            self.assertNotEqual(first["digest"], fifth["digest"])
 
     def test_file_fingerprint_records_missing_files(self) -> None:
         assert file_fingerprint is not None

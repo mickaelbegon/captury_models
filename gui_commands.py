@@ -19,10 +19,12 @@ COMPARISON_SCRIPT = PROJECT_DIR / "compare_capture_systems.py"
 KINEMATIC_COMPARISON_SCRIPT = PROJECT_DIR / "compare_p6_motive_captury.py"
 C3D_VIEWER_SCRIPT = PROJECT_DIR / "c3d_trial_viewer.py"
 BIOBUDDY_C3D_MODEL_SCRIPT = PROJECT_DIR / "create_biobuddy_c3d_model.py"
+BIOBUDDY_C3D_IK_SCRIPT = PROJECT_DIR / "run_biobuddy_c3d_ik.py"
 
 COMMAND_MODES = {
     "kinematic": "Analyse Captury/Motive",
     "biobuddy_c3d_model": "Modèle BioBuddy C3D",
+    "biobuddy_c3d_ik": "IK BioBuddy C3D",
     "pipeline": "Pipeline BVH/FBX/C3D",
     "comparison": "Comparaison générique",
 }
@@ -236,6 +238,12 @@ def append_p6_common_args(args: list[str], values: Mapping[str, object]) -> None
     append_flag(
         args,
         values,
+        "--reexpress-rotations-zxy",
+        "p6_reexpress_rotations_zxy",
+    )
+    append_flag(
+        args,
+        values,
         "--disable-static-model-alignment",
         "p6_disable_static_model_alignment",
     )
@@ -298,4 +306,31 @@ def build_biobuddy_c3d_model_args(values: Mapping[str, object]) -> list[str]:
         "biobuddy_c3d_no_default_virtual_points",
     )
     append_flag(args, values, "--with-mesh", "biobuddy_c3d_with_mesh")
+    return args
+
+
+def build_biobuddy_c3d_ik_args(
+    values: Mapping[str, object],
+    c3d_path: str,
+    *,
+    source_name: str = "biobuddy_static",
+) -> list[str]:
+    args = [
+        sys.executable,
+        str(BIOBUDDY_C3D_IK_SCRIPT),
+        "--biomod",
+        value_of(values, "biobuddy_c3d_output"),
+        "--c3d",
+        c3d_path,
+        "--out-dir",
+        str(Path(value_of(values, "p6_out_dir")) / "biobuddy_ik" / source_name),
+        "--source-name",
+        source_name,
+        "--biomod-unit-scale-to-m",
+        "1.0",
+        "--strip-marker-prefix",
+        "Skeleton_001_",
+    ]
+    append_value(args, values, "--angle-label-regex", "angle_label_regex")
+    append_value(args, values, "--max-frames", "p6_ik_max_frames")
     return args

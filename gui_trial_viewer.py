@@ -132,6 +132,13 @@ def display_marker_name(label: str) -> str:
     return str(label).replace("Skeleton_001_", "").strip()
 
 
+def is_joint_centre_marker_label(label: str) -> bool:
+    """Return True for synthetic joint-centre point labels, not skin markers."""
+
+    clean_label = display_marker_name(label).upper()
+    return clean_label.startswith(("CAPJC_", "MOTJC_", "BVHJC_", "FBXJC_"))
+
+
 def marker_display_labels(labels: Iterable[str]) -> list[str]:
     """Return unique GUI labels while preserving the C3D marker order.
 
@@ -445,6 +452,7 @@ class TkC3DTrialCanvas(tk.Canvas):
         self.chain_data: JointCentreChainData | None = None
         self.visible_cor_layers: set[str] = {"captury", "motive"}
         self.show_chain_axes = False
+        self.rotate_body_segments_180_x = False
         self._is_dragging = False
         self._last_mouse_xy: tuple[float, float] | None = None
         self._redraw_after_id: str | None = None
@@ -495,6 +503,10 @@ class TkC3DTrialCanvas(tk.Canvas):
 
     def set_show_chain_axes(self, show: bool) -> None:
         self.show_chain_axes = bool(show)
+        self.redraw()
+
+    def set_rotate_body_segments_180_x(self, enabled: bool) -> None:
+        self.rotate_body_segments_180_x = bool(enabled)
         self.redraw()
 
     def set_visible_marker_sources(self, sources: Iterable[str]) -> None:
@@ -792,7 +804,7 @@ class TkC3DTrialCanvas(tk.Canvas):
     def _draw_joint_centre_chains(
         self, center: np.ndarray, scale: float, width: int, height: int
     ) -> None:
-        if self.chain_data is None or not self.visible_cor_layers:
+        if self.chain_data is None:
             return
         for layer in ("captury", "motive", "biobuddy"):
             if layer not in self.visible_cor_layers:
@@ -803,9 +815,27 @@ class TkC3DTrialCanvas(tk.Canvas):
             color = COR_LAYER_COLORS.get(layer, "#111827")
             frame_points = self._chain_frame_points(joints)
             self._draw_chain_edges(frame_points, color, center, scale, width, height)
-            if self.show_chain_axes:
-                self._draw_chain_axes(frame_points, center, scale, width, height)
             self._draw_chain_points(frame_points, color, center, scale, width, height)
+        if self.show_chain_axes:
+            for layer in self._visible_chain_axis_layers():
+                joints = self.chain_data.layers.get(layer) if self.chain_data else None
+                if not joints:
+                    continue
+                frame_points = self._chain_frame_points(joints)
+                self._draw_chain_axes(layer, frame_points, center, scale, width, height)
+
+    def _visible_chain_axis_layers(self) -> tuple[str, ...]:
+        if self.chain_data is None:
+            return ()
+        available = tuple(
+            layer
+            for layer in ("captury", "motive", "biobuddy")
+            if self.chain_data.layers.get(layer)
+        )
+        visible = tuple(
+            layer for layer in available if layer in self.visible_cor_layers
+        )
+        return visible or available
 
     def _chain_frame_points(
         self, joints: dict[str, np.ndarray]
@@ -899,6 +929,7 @@ class TkC3DTrialCanvas(tk.Canvas):
 
     def _draw_chain_axes(
         self,
+        layer: str,
         points: dict[str, np.ndarray],
         center: np.ndarray,
         scale: float,
@@ -909,7 +940,7 @@ class TkC3DTrialCanvas(tk.Canvas):
             return
         axis_length = max(25.0 / max(scale, 1e-9), 25.0)
         for joint, origin in points.items():
-            axes = local_chain_axes(joint, points, self.chain_data.edges)
+            axes = self._chain_axes_for_layer(layer, joint, points)
             if axes is None:
                 continue
             for label, direction in axes.items():
@@ -929,6 +960,18 @@ class TkC3DTrialCanvas(tk.Canvas):
                     fill=VIEWER_AXIS_COLORS[label],
                     width=2,
                 )
+
+    def _chain_axes_for_layer(
+        self, layer: str, joint: str, points: dict[str, np.ndarray]
+    ) -> dict[str, np.ndarray] | None:
+        if self.chain_data is None:
+            return None
+        axes = local_chain_axes(joint, points, self.chain_data.edges)
+        if axes is None:
+            return None
+        if self.rotate_body_segments_180_x and layer in {"captury", "motive"}:
+            return {"X": axes["X"], "Y": -axes["Y"], "Z": -axes["Z"]}
+        return axes
 
     def _draw_empty_message(self, width: int, height: int, message: str) -> None:
         self.create_text(

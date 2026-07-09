@@ -155,15 +155,23 @@ def values_for_display(
 def joint_centre_error_timeseries(
     dataframe: "pd.DataFrame", joint: str
 ) -> "pd.DataFrame":
+    return joint_centre_error_timeseries_between(dataframe, joint, "motive", "captury")
+
+
+def joint_centre_error_timeseries_between(
+    dataframe: "pd.DataFrame", joint: str, reference: str, source: str
+) -> "pd.DataFrame":
+    reference = str(reference).strip().lower()
+    source = str(source).strip().lower()
     required = {
         "time",
         "joint",
-        "captury_x_mm",
-        "captury_y_mm",
-        "captury_z_mm",
-        "motive_x_mm",
-        "motive_y_mm",
-        "motive_z_mm",
+        f"{reference}_x_mm",
+        f"{reference}_y_mm",
+        f"{reference}_z_mm",
+        f"{source}_x_mm",
+        f"{source}_y_mm",
+        f"{source}_z_mm",
     }
     if not required.issubset(dataframe.columns):
         return pd.DataFrame() if pd is not None else dataframe
@@ -171,15 +179,14 @@ def joint_centre_error_timeseries(
     if values.empty:
         return values
     for axis in ("x", "y", "z"):
-        values[f"error_{axis}_mm"] = values[f"captury_{axis}_mm"].astype(
+        values[f"error_{axis}_mm"] = values[f"{source}_{axis}_mm"].astype(
             float
-        ) - values[f"motive_{axis}_mm"].astype(float)
+        ) - values[f"{reference}_{axis}_mm"].astype(float)
         values[f"abs_error_{axis}_mm"] = values[f"error_{axis}_mm"].abs()
-    if "distance_mm" not in values.columns:
-        values["distance_mm"] = np.linalg.norm(
-            values[["error_x_mm", "error_y_mm", "error_z_mm"]].to_numpy(dtype=float),
-            axis=1,
-        )
+    values["distance_mm"] = np.linalg.norm(
+        values[["error_x_mm", "error_y_mm", "error_z_mm"]].to_numpy(dtype=float),
+        axis=1,
+    )
     values["time"] = values["time"].astype(float)
     return values.sort_values("time")
 
@@ -187,9 +194,22 @@ def joint_centre_error_timeseries(
 def draw_joint_centre_error_timeseries(
     axes: object, dataframe: "pd.DataFrame", trial: str, joint: str
 ) -> bool:
-    values = joint_centre_error_timeseries(dataframe, joint)
+    return draw_joint_centre_error_timeseries_between(
+        axes, dataframe, trial, joint, "motive", "captury"
+    )
+
+
+def draw_joint_centre_error_timeseries_between(
+    axes: object,
+    dataframe: "pd.DataFrame",
+    trial: str,
+    joint: str,
+    reference: str,
+    source: str,
+) -> bool:
+    values = joint_centre_error_timeseries_between(dataframe, joint, reference, source)
     if values.empty:
-        axes.set_title(f"Aucune erreur temporelle: {joint}")
+        axes.set_title(f"Aucune erreur temporelle: {source} vs {reference} / {joint}")
         return False
     curves = (
         ("distance_mm", "distance", "#111827"),
@@ -202,7 +222,7 @@ def draw_joint_centre_error_timeseries(
             axes.plot(
                 values["time"], values[column].astype(float), label=label, color=color
             )
-    axes.set_title(f"{trial} - {joint} - erreur centres")
+    axes.set_title(f"{trial} - {source} vs {reference} - {joint}")
     axes.set_xlabel("Temps (s)")
     axes.set_ylabel("Erreur (mm)")
     axes.legend()
@@ -309,6 +329,25 @@ def joint_centre_error_boxplot_series(
     trial: str | None = None,
     joints: Iterable[str] | None = None,
 ) -> list[dict[str, object]]:
+    return joint_centre_error_boxplot_series_between(
+        dataframe,
+        metric,
+        trial=trial,
+        joints=joints,
+        reference="motive",
+        source="captury",
+    )
+
+
+def joint_centre_error_boxplot_series_between(
+    dataframe: "pd.DataFrame",
+    metric: str,
+    *,
+    trial: str | None = None,
+    joints: Iterable[str] | None = None,
+    reference: str = "motive",
+    source: str = "captury",
+) -> list[dict[str, object]]:
     if pd is None or dataframe.empty:
         return []
     values = dataframe
@@ -326,7 +365,9 @@ def joint_centre_error_boxplot_series(
     for joint in sorted(values["joint"].astype(str).unique()):
         if requested_joints and joint not in requested_joints:
             continue
-        joint_values = joint_centre_error_timeseries(values, joint)
+        joint_values = joint_centre_error_timeseries_between(
+            values, joint, reference, source
+        )
         if joint_values.empty or metric_column not in joint_values.columns:
             continue
         joint_errors = (
@@ -339,6 +380,8 @@ def joint_centre_error_boxplot_series(
             {
                 "metric": metric,
                 "label": joint,
+                "source": source,
+                "reference": reference,
                 "dataframe": joint_values,
                 "values": joint_errors,
             }

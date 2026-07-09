@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import io
 import tempfile
 import unittest
+from contextlib import redirect_stdout
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -46,12 +48,40 @@ class CreateBioBuddyC3dModelTests(unittest.TestCase):
             with patch(
                 "create_biobuddy_c3d_model._load_biobuddy_c3d_api",
                 return_value=fake_api,
-            ):
+            ), redirect_stdout(io.StringIO()):
                 create_biobuddy_c3d_model(folder, preset="motive_57", output=output)
 
         self.assertEqual(
             calls["kwargs"]["marker_name_prefixes_to_strip"], ("Skeleton_001_",)
         )
+
+    def test_create_model_prints_progress_messages(self) -> None:
+        fake_api = {
+            "preset_from_cli": lambda value: SimpleNamespace(value=value),
+            "create_model": lambda *args, **kwargs: SimpleNamespace(
+                model=_FakeModel(),
+                preset=SimpleNamespace(value="motive_57"),
+            ),
+            "default_static_virtual_points": lambda _preset: ("HipCenter",),
+        }
+        with tempfile.TemporaryDirectory() as tmp:
+            folder = Path(tmp) / "Motive"
+            folder.mkdir()
+            (folder / "P6_Static.c3d").write_bytes(b"dummy")
+            output = Path(tmp) / "motive_57.bioMod"
+            stream = io.StringIO()
+            with patch(
+                "create_biobuddy_c3d_model._load_biobuddy_c3d_api",
+                return_value=fake_api,
+            ), redirect_stdout(stream):
+                create_biobuddy_c3d_model(folder, preset="motive_57", output=output)
+
+        log = stream.getvalue()
+        self.assertIn("[BioBuddy C3D] Dossier source:", log)
+        self.assertIn("1 fichier(s) C3D détecté(s)", log)
+        self.assertIn("P6_Static.c3d", log)
+        self.assertIn("Construction du modèle BioBuddy en cours", log)
+        self.assertIn("bioMod écrit", log)
 
     def test_explicit_marker_prefixes_override_default(self) -> None:
         self.assertEqual(

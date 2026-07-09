@@ -1,10 +1,12 @@
 from __future__ import annotations
 
+import inspect
 import unittest
 
 import tempfile
 from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import patch
 
 import numpy as np
 import pandas as pd
@@ -27,7 +29,7 @@ from captury_biobuddy_gui import (
     transformed_marker_data,
     vertical_axis_label,
 )
-from gui_trial_viewer import marker_display_labels
+from gui_trial_viewer import is_joint_centre_marker_label, marker_display_labels
 from gui_trial_viewer import JointCentreChainData
 
 
@@ -51,6 +53,22 @@ class FakeButton:
             self.state = str(kwargs["state"])
 
 
+class FakeViewer:
+    def __init__(self) -> None:
+        self.visible_cor_layers: list[str] = []
+        self.show_chain_axes = False
+        self.rotate_body_segments_180_x = False
+
+    def set_visible_cor_layers(self, layers: list[str]) -> None:
+        self.visible_cor_layers = layers
+
+    def set_show_chain_axes(self, show: bool) -> None:
+        self.show_chain_axes = show
+
+    def set_rotate_body_segments_180_x(self, enabled: bool) -> None:
+        self.rotate_body_segments_180_x = enabled
+
+
 class P6DebugGuiTests(unittest.TestCase):
     def make_gui_stub(self) -> CapturyBioBuddyGui:
         gui = object.__new__(CapturyBioBuddyGui)
@@ -65,12 +83,14 @@ class P6DebugGuiTests(unittest.TestCase):
             "p6_time_start",
             "p6_time_end",
             "p6_joint_filter",
+            "p6_joint_centre_reference",
             "p6_auto_analyze",
             "p6_model_source",
             "p6_model_to_c3d_axis",
             "p6_segment_reference",
             "p6_captury_reorient_thigh_y_from_cor",
             "p6_rotate_body_segments_180_x",
+            "p6_reexpress_rotations_zxy",
             "p6_disable_static_model_alignment",
             "p6_disable_motive_marker_alignment",
             "root_offset_mode",
@@ -97,8 +117,10 @@ class P6DebugGuiTests(unittest.TestCase):
         gui.vars["p6_auto_analyze"].set(True)
         gui.vars["p6_no_cache"].set(False)
         gui.vars["p6_segment_reference"].set("biobuddy")
+        gui.vars["p6_joint_centre_reference"].set("biobuddy")
         gui.vars["p6_captury_reorient_thigh_y_from_cor"].set(False)
         gui.vars["p6_rotate_body_segments_180_x"].set(False)
+        gui.vars["p6_reexpress_rotations_zxy"].set(False)
         gui.vars["p6_disable_static_model_alignment"].set(False)
         gui.vars["p6_disable_motive_marker_alignment"].set(False)
         gui.vars["p6_no_mesh"].set(False)
@@ -112,9 +134,12 @@ class P6DebugGuiTests(unittest.TestCase):
         gui.occlusion_sort_column = "marker_order"
         gui.occlusion_sort_descending = False
         gui.process = None
+        gui.running_command_mode = None
         gui.pending_auto_analysis = False
         gui.auto_analysis_after_id = None
+        gui.auto_enable_biobuddy_cor_after_refresh = False
         gui.trial_inventory = {}
+        gui.joint_chain_cache = {}
         gui.status_var = FakeVar()
         return gui
 
@@ -197,6 +222,74 @@ class P6DebugGuiTests(unittest.TestCase):
 
         self.assertEqual(biobuddy_button.state, "normal")
 
+    def test_biobuddy_cor_checkbox_auto_enables_once_after_static_refresh(self) -> None:
+        gui = self.make_gui_stub()
+        with tempfile.TemporaryDirectory() as tmp:
+            biomod = Path(tmp) / "motive_57.bioMod"
+            biomod.write_text("model\n", encoding="utf-8")
+            gui.vars["biobuddy_c3d_output"].set(str(biomod))
+            gui.auto_enable_biobuddy_cor_after_refresh = True
+            gui.viewer_cor_layer_vars = {
+                "captury": FakeVar(False),
+                "motive": FakeVar(False),
+                "biobuddy": FakeVar(False),
+            }
+            biobuddy_button = FakeButton()
+            gui.viewer_cor_layer_checks = {"biobuddy": biobuddy_button}
+            gui.embedded_viewer = FakeViewer()
+            gui.embedded_viewer.chain_data = JointCentreChainData(
+                layers={"biobuddy": {"Hips": np.zeros((1, 3))}},
+                edges=[],
+            )
+            gui.viewer_chain_axes_var = FakeVar(False)
+
+            CapturyBioBuddyGui._update_cor_layer_check_states(gui)
+            CapturyBioBuddyGui._auto_enable_biobuddy_cor_layer_after_refresh(gui)
+
+        self.assertEqual(biobuddy_button.state, "normal")
+        self.assertTrue(gui.viewer_cor_layer_vars["biobuddy"].get())
+        self.assertFalse(gui.auto_enable_biobuddy_cor_after_refresh)
+
+    def test_biobuddy_cor_checkbox_does_not_recheck_after_manual_uncheck(self) -> None:
+        gui = self.make_gui_stub()
+        with tempfile.TemporaryDirectory() as tmp:
+            biomod = Path(tmp) / "motive_57.bioMod"
+            biomod.write_text("model\n", encoding="utf-8")
+            gui.vars["biobuddy_c3d_output"].set(str(biomod))
+            gui.auto_enable_biobuddy_cor_after_refresh = False
+            gui.viewer_cor_layer_vars = {"biobuddy": FakeVar(False)}
+            biobuddy_button = FakeButton()
+            gui.viewer_cor_layer_checks = {"biobuddy": biobuddy_button}
+            gui.embedded_viewer = SimpleNamespace(
+                chain_data=JointCentreChainData(
+                    layers={"biobuddy": {"Hips": np.zeros((1, 3))}},
+                    edges=[],
+                )
+            )
+
+            CapturyBioBuddyGui._update_cor_layer_check_states(gui)
+
+        self.assertEqual(biobuddy_button.state, "normal")
+        self.assertFalse(gui.viewer_cor_layer_vars["biobuddy"].get())
+
+    def test_visible_cor_update_applies_rotate_body_segments_to_viewer(self) -> None:
+        gui = self.make_gui_stub()
+        gui.viewer_cor_layer_vars = {
+            "captury": FakeVar(True),
+            "motive": FakeVar(False),
+            "biobuddy": FakeVar(False),
+        }
+        gui.viewer_cor_layer_checks = {}
+        gui.viewer_chain_axes_var = FakeVar(True)
+        gui.embedded_viewer = FakeViewer()
+        gui.vars["p6_rotate_body_segments_180_x"].set(True)
+
+        CapturyBioBuddyGui._update_visible_cor_layers(gui)
+
+        self.assertEqual(gui.embedded_viewer.visible_cor_layers, ["captury"])
+        self.assertTrue(gui.embedded_viewer.show_chain_axes)
+        self.assertTrue(gui.embedded_viewer.rotate_body_segments_180_x)
+
     def test_biobuddy_c3d_model_message_reports_failed_process(self) -> None:
         gui = self.make_gui_stub()
 
@@ -236,7 +329,38 @@ class P6DebugGuiTests(unittest.TestCase):
         self.assertEqual(level, "info")
         self.assertEqual(title, "Modèle BioBuddy créé")
         self.assertIn("motive_57.bioMod", message)
-        self.assertIn("case BioBuddy", message)
+        self.assertIn("reconstruction QLD", message)
+
+    def test_successful_biobuddy_model_creation_starts_static_ik_without_popup(
+        self,
+    ) -> None:
+        gui = self.make_gui_stub()
+        with tempfile.TemporaryDirectory() as tmp:
+            output = Path(tmp) / "motive_57.bioMod"
+            output.write_text("BioBuddy model\n", encoding="utf-8")
+            gui.vars["biobuddy_c3d_output"].set(str(output))
+            calls = []
+            gui._run_biobuddy_static_ik_after_model_creation = (  # type: ignore[method-assign]
+                lambda: calls.append("ik")
+            )
+            gui._append_log = lambda text: calls.append(text)  # type: ignore[method-assign]
+
+            with patch("captury_biobuddy_gui.messagebox.showinfo") as showinfo:
+                CapturyBioBuddyGui._notify_biobuddy_c3d_model_creation_finished(gui, 0)
+
+        showinfo.assert_not_called()
+        self.assertIn("ik", calls)
+        self.assertEqual(gui.vars["model_explorer_path"].get(), str(output))
+
+    def test_successful_process_invalidates_joint_chain_cache_before_refresh(
+        self,
+    ) -> None:
+        gui = self.make_gui_stub()
+        gui.joint_chain_cache = {("old", 1, 1): None}  # type: ignore[dict-item]
+
+        CapturyBioBuddyGui._invalidate_output_caches(gui)
+
+        self.assertEqual(gui.joint_chain_cache, {})
 
     def test_p6_debug_preset_populates_fast_static_analysis(self) -> None:
         gui = self.make_gui_stub()
@@ -331,11 +455,31 @@ class P6DebugGuiTests(unittest.TestCase):
         CapturyBioBuddyGui._load_p6_debug_preset(gui)
         gui.vars["p6_captury_reorient_thigh_y_from_cor"].set(True)
         gui.vars["p6_rotate_body_segments_180_x"].set(True)
+        gui.vars["p6_reexpress_rotations_zxy"].set(True)
 
         args = CapturyBioBuddyGui._p6_args(gui)
 
         self.assertIn("--captury-reorient-thigh-y-from-cor", args)
         self.assertIn("--rotate-body-segments-180-x", args)
+        self.assertIn("--reexpress-rotations-zxy", args)
+
+    def test_loading_tab_exposes_rotate_body_segments_option(self) -> None:
+        source = inspect.getsource(CapturyBioBuddyGui._build_loading_matching_tab)
+
+        self.assertIn('"R(x,180°)"', source)
+        self.assertIn('"p6_rotate_body_segments_180_x"', source)
+
+    def test_running_status_messages_are_specific_for_biobuddy_steps(self) -> None:
+        gui = self.make_gui_stub()
+
+        self.assertIn(
+            "Création du modèle BioBuddy",
+            CapturyBioBuddyGui._running_status_message(gui, "biobuddy_c3d_model"),
+        )
+        self.assertIn(
+            "Reconstruction QLD statique",
+            CapturyBioBuddyGui._running_status_message(gui, "biobuddy_c3d_ik"),
+        )
 
     def test_manual_phase_bounds_are_sorted_and_set_manual_cut_mode(self) -> None:
         gui = self.make_gui_stub()
@@ -754,6 +898,14 @@ class P6DebugGuiTests(unittest.TestCase):
             marker_display_labels(["Skeleton_001_LIAS", "Skeleton_001_LIAS"]),
             ["LIAS#1", "LIAS#2"],
         )
+
+    def test_joint_centre_marker_labels_are_detected_for_marker_mapping(self) -> None:
+        self.assertTrue(is_joint_centre_marker_label("CAPJC_Hips"))
+        self.assertTrue(is_joint_centre_marker_label("MOTJC_LeftKnee"))
+        self.assertTrue(is_joint_centre_marker_label("FBXJC_RightAnkle"))
+        self.assertTrue(is_joint_centre_marker_label("BVHJC_RightFoot"))
+        self.assertFalse(is_joint_centre_marker_label("Skeleton_001_LIAS"))
+        self.assertFalse(is_joint_centre_marker_label("Q_LH#1"))
 
     def test_occlusion_sort_can_rank_by_missing_percent_descending(self) -> None:
         gui = self.make_gui_stub()

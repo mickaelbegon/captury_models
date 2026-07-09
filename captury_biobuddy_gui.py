@@ -43,6 +43,7 @@ from gui_commands import (
     PROJECT_DIR,
     ROOT_OFFSET_MODE_CHOICES,
     ROOT_OFFSET_MODE_LABELS,
+    build_biobuddy_c3d_ik_args,
     build_biobuddy_c3d_model_args,
     build_comparison_args,
     build_p6_args,
@@ -58,8 +59,8 @@ from gui_graphs import (
     KINEMATIC_TIMESERIES_COLUMNS,
     draw_dimension_metric_graph,
     draw_segment_rotation_timeseries,
-    joint_centre_error_boxplot_series,
-    draw_joint_centre_error_timeseries,
+    joint_centre_error_boxplot_series_between,
+    draw_joint_centre_error_timeseries_between,
     draw_metric_boxplot,
     graph_metric_columns,
     is_rotation_q_name,
@@ -88,6 +89,7 @@ from gui_trial_viewer import (
     data_source_color,
     data_source_marker_color,
     display_marker_name,
+    is_joint_centre_marker_label,
     joint_chain_edges,
     load_joint_centre_chain_data,
     marker_display_labels,
@@ -313,6 +315,7 @@ class CapturyBioBuddyGui(tk.Tk):
         self.occlusion_sort_descending = False
         self.pending_auto_analysis = False
         self.auto_analysis_after_id: str | None = None
+        self.auto_enable_biobuddy_cor_after_refresh = False
         self.motive57_c3d_files: list[str] = []
         self.motive57_role_combos: dict[str, ttk.Combobox] = {}
         self.motive57_inventory_tree: ttk.Treeview | None = None
@@ -396,6 +399,7 @@ class CapturyBioBuddyGui(tk.Tk):
             "p6_time_start": "",
             "p6_time_end": "",
             "p6_joint_filter": "",
+            "p6_joint_centre_reference": "biobuddy",
             "p6_auto_analyze": True,
             "p6_no_figures": True,
             "p6_no_cache": False,
@@ -404,6 +408,7 @@ class CapturyBioBuddyGui(tk.Tk):
             "p6_segment_reference": "biobuddy",
             "p6_captury_reorient_thigh_y_from_cor": False,
             "p6_rotate_body_segments_180_x": False,
+            "p6_reexpress_rotations_zxy": False,
             "p6_disable_static_model_alignment": False,
             "p6_disable_motive_marker_alignment": False,
             "p6_no_mesh": False,
@@ -566,12 +571,18 @@ class CapturyBioBuddyGui(tk.Tk):
         self._check(
             data,
             7,
+            "R(x,180°)",
+            "p6_rotate_body_segments_180_x",
+        )
+        self._check(
+            data,
+            8,
             "Désactiver recalage statique Captury -> Motive",
             "p6_disable_static_model_alignment",
         )
         self._check(
             data,
-            8,
+            9,
             "Désactiver recalage Motive -> marqueurs C3D",
             "p6_disable_motive_marker_alignment",
         )
@@ -752,7 +763,7 @@ class CapturyBioBuddyGui(tk.Tk):
 
         actions = ttk.Frame(tab)
         actions.grid(row=2, column=0, sticky="ew", pady=(12, 0))
-        for column in range(4):
+        for column in range(5):
             actions.columnconfigure(column, weight=1)
         run_button = self._register_analysis_button(
             ttk.Button(
@@ -777,7 +788,15 @@ class CapturyBioBuddyGui(tk.Tk):
             actions,
             text="Ouvrir dans BioBuddy",
             command=self._open_biobuddy_c3d_model_in_explorer,
-        ).grid(row=0, column=3, sticky="ew", padx=(6, 0))
+        ).grid(row=0, column=3, sticky="ew", padx=6)
+        batch_button = self._register_analysis_button(
+            ttk.Button(
+                actions,
+                text="Batch cinématique inverse",
+                command=self._run_p6_ik_batch,
+            )
+        )
+        batch_button.grid(row=0, column=4, sticky="ew", padx=(6, 0))
 
         notes = ttk.LabelFrame(tab, text="Notes")
         notes.grid(row=3, column=0, sticky="ew", pady=(12, 0))
@@ -868,13 +887,12 @@ class CapturyBioBuddyGui(tk.Tk):
         panel.grid(row=0, column=0, sticky="ew")
         panel.columnconfigure(1, weight=1)
         self._entry_row(panel, 0, "Filtre centres", "p6_joint_filter")
-        self._entry_row(panel, 1, "Essai statique", "p6_static_trial")
         self._combo_row(
             panel,
-            2,
-            "Alignement C3D",
-            "compare_alignment",
-            ("global_rigid", "per_frame_rigid", "none"),
+            1,
+            "Référence",
+            "p6_joint_centre_reference",
+            ("biobuddy", "motive", "captury"),
         )
         self._analysis_action_row(tab, 1)
         self._build_graph_panel(tab, 2, "centres")
@@ -978,10 +996,11 @@ class CapturyBioBuddyGui(tk.Tk):
         self._entry_row(panel, 0, "Regex labels angles", "angle_label_regex")
         self._entry_row(panel, 1, "Labels angles extra", "extra_angle_labels")
         self._combo_row(panel, 2, "Unité angles C3D", "c3d_angle_unit", ("deg", "rad"))
+        self._check(panel, 3, "Exprimer rotations en ZXY", "p6_reexpress_rotations_zxy")
         self._check(
-            panel, 3, "Lancer l'IK du système de référence en batch", "p6_run_ik_batch"
+            panel, 4, "Lancer l'IK du système de référence en batch", "p6_run_ik_batch"
         )
-        self._entry_row(panel, 4, "Max frames IK batch", "p6_ik_max_frames")
+        self._entry_row(panel, 5, "Max frames IK batch", "p6_ik_max_frames")
         self._analysis_action_row(tab, 1)
         self._build_graph_panel(tab, 2, "kinematics")
 
@@ -1174,7 +1193,7 @@ class CapturyBioBuddyGui(tk.Tk):
         self._check(
             chain_compare,
             6,
-            "Captury/Motive: rotation segments 180 deg autour de X",
+            "R(x,180°)",
             "p6_rotate_body_segments_180_x",
         )
         self._check(chain_compare, 7, "Ne pas extraire les meshes FBX", "p6_no_mesh")
@@ -1700,11 +1719,18 @@ class CapturyBioBuddyGui(tk.Tk):
             and Figure is not None
             and FigureCanvasTkAgg is not None
         ):
-            figure = Figure(figsize=(5.0, 3.2), dpi=100)
-            axes = figure.add_subplot(111)
+            figure = Figure(figsize=(6.2, 3.2), dpi=100)
+            if graph_kind == "centres":
+                axes_pair = figure.subplots(1, 2, squeeze=False)[0]
+                axes = axes_pair[0]
+            else:
+                axes_pair = None
+                axes = figure.add_subplot(111)
             canvas = FigureCanvasTkAgg(figure, master=graph_frame)
             canvas.get_tk_widget().grid(row=0, column=0, sticky="nsew")
             panel_data.update({"figure": figure, "axes": axes, "canvas": canvas})
+            if axes_pair is not None:
+                panel_data["axes_pair"] = tuple(axes_pair)
             if graph_kind == "events":
                 canvas.mpl_connect("button_press_event", self._on_phase_drag_press)
                 canvas.mpl_connect("motion_notify_event", self._on_phase_drag_motion)
@@ -1726,7 +1752,11 @@ class CapturyBioBuddyGui(tk.Tk):
         self._populate_occlusion_table()
         self._refresh_graphs()
         self._update_embedded_joint_chain()
+        self._auto_enable_biobuddy_cor_layer_after_refresh()
         self._update_run_report_summary()
+
+    def _invalidate_output_caches(self) -> None:
+        self.joint_chain_cache.clear()
 
     def _refresh_marker_correspondence_lists(self) -> None:
         if not hasattr(self, "marker_motive_list"):
@@ -1746,7 +1776,12 @@ class CapturyBioBuddyGui(tk.Tk):
             except Exception as exc:
                 self._append_log(f"\nListe marqueurs impossible pour {path}: {exc}\n")
                 continue
-            display_labels = sorted(marker_display_labels(data.labels))
+            skin_marker_labels = [
+                label
+                for label in data.labels
+                if not is_joint_centre_marker_label(str(label))
+            ]
+            display_labels = sorted(marker_display_labels(skin_marker_labels))
             raw_by_display = {label: label for label in display_labels}
             self.marker_list_label_lookup[source] = raw_by_display
             for display_label in display_labels:
@@ -2062,6 +2097,19 @@ class CapturyBioBuddyGui(tk.Tk):
                 self.viewer_cor_layer_vars[layer].set(False)
                 checkbutton.configure(state=tk.DISABLED)
 
+    def _auto_enable_biobuddy_cor_layer_after_refresh(self) -> None:
+        if not self.auto_enable_biobuddy_cor_after_refresh:
+            return
+        self.auto_enable_biobuddy_cor_after_refresh = False
+        if not hasattr(self, "viewer_cor_layer_vars"):
+            return
+        if "biobuddy" not in self._available_viewer_cor_layers():
+            return
+        if not self._biobuddy_model_exists():
+            return
+        self.viewer_cor_layer_vars["biobuddy"].set(True)
+        self._update_visible_cor_layers()
+
     def _update_visible_cor_layers(self) -> None:
         if not hasattr(self, "embedded_viewer") or not hasattr(
             self, "viewer_cor_layer_vars"
@@ -2078,6 +2126,9 @@ class CapturyBioBuddyGui(tk.Tk):
             self.embedded_viewer.set_show_chain_axes(
                 bool(self.viewer_chain_axes_var.get())
             )
+        self.embedded_viewer.set_rotate_body_segments_180_x(
+            bool(self.vars["p6_rotate_body_segments_180_x"].get())
+        )
 
     def _update_visible_marker_layers(self) -> None:
         if not hasattr(self, "embedded_viewer") or not hasattr(
@@ -2600,39 +2651,78 @@ class CapturyBioBuddyGui(tk.Tk):
         if not trial:
             return False
         panel = self.graph_panels["centres"]
-        axes = panel["axes"]
+        axes_pair = tuple(panel.get("axes_pair", (panel["axes"],)))
         canvas = panel["canvas"]
-        axes.clear()
+        for axes in axes_pair:
+            axes.clear()
         path = self._joint_centre_timeseries_path(trial)
         dataframe = self._read_timeseries_table(
             path, self._legacy_joint_centre_timeseries_csv_path(trial)
         )
         if dataframe is None:
-            axes.set_title(f"Série temporelle absente: {path.name}")
+            axes_pair[0].set_title(f"Série temporelle absente: {path.name}")
         else:
             selected_joints = [
                 str(dict(payload["filters"]).get("joint", ""))
                 for payload in payloads
                 if str(dict(payload["filters"]).get("joint", ""))
             ]
-            if len(payloads) == 1 and selected_joints:
-                draw_joint_centre_error_timeseries(
-                    axes, dataframe, trial, selected_joints[0]
-                )
-            else:
-                series = joint_centre_error_boxplot_series(
-                    dataframe, metric, trial=trial, joints=selected_joints
-                )
-                if series:
-                    self._draw_metric_boxplot(
-                        axes, series, f"Centres articulaires - {metric}"
-                    )
-                    axes.set_ylabel("Erreur (mm)")
-                else:
-                    axes.set_title("Aucune erreur temporelle")
+            self._draw_joint_centre_reference_comparisons(
+                axes_pair, dataframe, trial, metric, selected_joints
+            )
         panel["figure"].tight_layout()
         canvas.draw_idle()
         return True
+
+    def _joint_centre_reference(self) -> str:
+        reference = str(self.vars["p6_joint_centre_reference"].get()).strip().lower()
+        return (
+            reference if reference in {"biobuddy", "motive", "captury"} else "biobuddy"
+        )
+
+    def _joint_centre_comparison_sources(self, reference: str) -> list[str]:
+        ordered_sources = ["motive", "captury", "biobuddy"]
+        return [source for source in ordered_sources if source != reference]
+
+    def _draw_joint_centre_reference_comparisons(
+        self,
+        axes_pair: tuple[object, ...],
+        dataframe: "pd.DataFrame",
+        trial: str,
+        metric: str,
+        selected_joints: list[str],
+    ) -> None:
+        reference = self._joint_centre_reference()
+        sources = self._joint_centre_comparison_sources(reference)
+        for index, axes in enumerate(axes_pair):
+            if index >= len(sources):
+                axes.set_axis_off()
+                continue
+            source = sources[index]
+            if len(selected_joints) == 1:
+                draw_joint_centre_error_timeseries_between(
+                    axes, dataframe, trial, selected_joints[0], reference, source
+                )
+            else:
+                series = joint_centre_error_boxplot_series_between(
+                    dataframe,
+                    metric,
+                    trial=trial,
+                    joints=selected_joints,
+                    reference=reference,
+                    source=source,
+                )
+                if series:
+                    self._draw_metric_boxplot(
+                        axes,
+                        series,
+                        f"{source.title()} vs {reference.title()} - {metric}",
+                    )
+                    axes.set_ylabel("Erreur (mm)")
+                else:
+                    axes.set_title(
+                        f"Aucune donnée: {source.title()} vs {reference.title()}"
+                    )
 
     def _draw_segment_graph(self, payloads: list[dict[str, object]]) -> bool:
         if not payloads:
@@ -3261,12 +3351,19 @@ class CapturyBioBuddyGui(tk.Tk):
             "p6_segment_reference",
             "p6_captury_reorient_thigh_y_from_cor",
             "p6_rotate_body_segments_180_x",
+            "p6_reexpress_rotations_zxy",
             "p6_disable_static_model_alignment",
             "p6_disable_motive_marker_alignment",
         ):
             self.vars[name].trace_add(
                 "write", lambda *_: self._on_p6_auto_analysis_option_changed()
             )
+        self.vars["p6_rotate_body_segments_180_x"].trace_add(
+            "write", lambda *_: self._update_visible_cor_layers()
+        )
+        self.vars["p6_joint_centre_reference"].trace_add(
+            "write", lambda *_: self._draw_selected_graph("centres")
+        )
         self.vars["biobuddy_c3d_folder"].trace_add(
             "write", lambda *_: self._refresh_motive57_c3d_mapping()
         )
@@ -3300,6 +3397,14 @@ class CapturyBioBuddyGui(tk.Tk):
                 motive57_mapping_path(values["biobuddy_c3d_folder"])
             )
         return build_biobuddy_c3d_model_args(values)
+
+    def _biobuddy_c3d_ik_args(
+        self, c3d_path: Path, source_name: str = "biobuddy_static"
+    ) -> list[str]:
+        values = self._var_values()
+        return build_biobuddy_c3d_ik_args(
+            values, str(c3d_path), source_name=source_name
+        )
 
     def _split_var_lines(self, var_name: str) -> list[str]:
         return split_lines(self.vars[var_name].get())
@@ -3374,6 +3479,9 @@ class CapturyBioBuddyGui(tk.Tk):
         mode = self._command_mode()
         if mode == "biobuddy_c3d_model":
             return self._biobuddy_c3d_model_args()
+        if mode == "biobuddy_c3d_ik":
+            c3d_path = self._static_motive_c3d_path()
+            return self._biobuddy_c3d_ik_args(c3d_path) if c3d_path else []
         if mode == "pipeline":
             return self._command_args()
         if mode == "comparison":
@@ -3385,6 +3493,8 @@ class CapturyBioBuddyGui(tk.Tk):
         if mode == "biobuddy_c3d_model":
             value = str(self.vars["biobuddy_c3d_output"].get()).strip()
             return self._resolve(value).parent
+        if mode == "biobuddy_c3d_ik":
+            return self._resolve(str(self.vars["p6_out_dir"].get()).strip())
         if mode == "pipeline":
             value = str(self.vars["out_dir"].get()).strip()
         elif mode == "comparison":
@@ -3397,6 +3507,8 @@ class CapturyBioBuddyGui(tk.Tk):
         mode = self._command_mode()
         if mode == "biobuddy_c3d_model":
             return self._validate_biobuddy_c3d_model()
+        if mode == "biobuddy_c3d_ik":
+            return self._validate_biobuddy_c3d_ik()
         if mode == "pipeline":
             return self._validate()
         if mode == "comparison":
@@ -3547,6 +3659,24 @@ class CapturyBioBuddyGui(tk.Tk):
             return False
         return True
 
+    def _biobuddy_model_exists(self) -> bool:
+        output = str(self.vars["biobuddy_c3d_output"].get()).strip()
+        return bool(output) and self._resolve(output).exists()
+
+    def _validate_biobuddy_c3d_ik(self) -> bool:
+        biomod_path = self._resolve(str(self.vars["biobuddy_c3d_output"].get()).strip())
+        if not biomod_path.exists():
+            messagebox.showerror("Modèle BioBuddy introuvable", str(biomod_path))
+            return False
+        c3d_path = self._static_motive_c3d_path()
+        if c3d_path is None:
+            messagebox.showerror(
+                "C3D statique introuvable",
+                "Aucun C3D Motive correspondant à l'essai statique n'a été trouvé.",
+            )
+            return False
+        return True
+
     def _validate_p6_analysis(self) -> bool:
         data_root = str(self.vars["p6_data_root"].get()).strip()
         if not data_root or not self._resolve(data_root).exists():
@@ -3655,6 +3785,26 @@ class CapturyBioBuddyGui(tk.Tk):
                 paths[system] = c3d_path
         return paths
 
+    def _static_motive_c3d_path(self) -> Path | None:
+        static_trial = str(self.vars["p6_static_trial"].get()).strip() or "Static"
+        if not self.trial_inventory:
+            self._refresh_trial_inventory()
+        c3d_path = (
+            self.trial_inventory.get(static_trial, {}).get("Motive", {}).get("c3d")
+        )
+        if c3d_path is not None and c3d_path.exists():
+            return c3d_path
+        folder = self._biobuddy_c3d_folder_path()
+        for candidate in (
+            folder / f"P6_{static_trial}.c3d",
+            folder / f"{static_trial}.c3d",
+            folder / "P6_Static.c3d",
+            folder / "Static.c3d",
+        ):
+            if candidate.exists():
+                return candidate
+        return None
+
     def _open_selected_trial_viewer(self) -> None:
         c3d_path = self._selected_trial_c3d_path()
         if c3d_path is None:
@@ -3689,13 +3839,23 @@ class CapturyBioBuddyGui(tk.Tk):
             return
         self._run_args(self._current_args())
 
-    def _run_args(self, args: list[str], command_mode: str | None = None) -> None:
+    def _run_args(
+        self,
+        args: list[str],
+        command_mode: str | None = None,
+        log_intro: str | None = None,
+        clear_log: bool = True,
+    ) -> None:
         self.running_command_mode = command_mode or self._command_mode()
         self._set_running(True)
-        self._clear_log()
+        if clear_log:
+            self._clear_log()
         self._append_log("$ " + " ".join(shlex.quote(part) for part in args) + "\n\n")
+        if log_intro:
+            self._append_log(log_intro.rstrip() + "\n\n")
         env = os.environ.copy()
         env.setdefault("MPLCONFIGDIR", "/private/tmp/captury_models_mplconfig")
+        env.setdefault("PYTHONUNBUFFERED", "1")
 
         def worker() -> None:
             try:
@@ -3735,6 +3895,23 @@ class CapturyBioBuddyGui(tk.Tk):
             return
         self._run_args(self._p6_args(), command_mode="kinematic")
 
+    def _run_p6_ik_batch(self) -> None:
+        if self.process is not None:
+            messagebox.showinfo("Exécution en cours", "Une commande est déjà lancée.")
+            return
+        if not self._validate_p6_analysis():
+            return
+        biomod_path = self._resolve(str(self.vars["biobuddy_c3d_output"].get()).strip())
+        if not biomod_path.exists():
+            messagebox.showerror("Modèle BioBuddy introuvable", str(biomod_path))
+            return
+        values = self._var_values()
+        values["p6_run_ik_batch"] = True
+        values["biobuddy_c3d_output"] = str(biomod_path)
+        args = build_p6_args(values)
+        self.vars["command_mode"].set(COMMAND_MODES["kinematic"])
+        self._run_args(args, command_mode="kinematic")
+
     def _run_biobuddy_c3d_model_creation(self) -> None:
         if self.process is not None:
             messagebox.showinfo("Exécution en cours", "Une commande est déjà lancée.")
@@ -3744,7 +3921,12 @@ class CapturyBioBuddyGui(tk.Tk):
         self._save_motive57_mapping_json()
         self.vars["command_mode"].set(COMMAND_MODES["biobuddy_c3d_model"])
         self._run_args(
-            self._biobuddy_c3d_model_args(), command_mode="biobuddy_c3d_model"
+            self._biobuddy_c3d_model_args(),
+            command_mode="biobuddy_c3d_model",
+            log_intro=(
+                "Création BioBuddy: préparation du dossier C3D, lecture du mapping "
+                "Motive 57, construction du modèle, puis écriture du bioMod."
+            ),
         )
 
     def _stop_pipeline(self) -> None:
@@ -3764,7 +3946,21 @@ class CapturyBioBuddyGui(tk.Tk):
             active_buttons.append(button)
         self.analysis_buttons = active_buttons
         self.stop_button.configure(state=tk.NORMAL if running else tk.DISABLED)
-        self.status_var.set("Exécution en cours" if running else "Prêt")
+        self.status_var.set(
+            self._running_status_message(self.running_command_mode)
+            if running
+            else "Prêt"
+        )
+
+    def _running_status_message(self, command_mode: str | None) -> str:
+        messages = {
+            "biobuddy_c3d_model": "Création du modèle BioBuddy en cours...",
+            "biobuddy_c3d_ik": "Reconstruction QLD statique en cours...",
+            "kinematic": "Analyse comparative en cours...",
+            "comparison": "Comparaison en cours...",
+            "pipeline": "Pipeline en cours...",
+        }
+        return messages.get(str(command_mode), "Exécution en cours")
 
     def _drain_output_queue(self) -> None:
         try:
@@ -3783,9 +3979,12 @@ class CapturyBioBuddyGui(tk.Tk):
                         f"\nProcessus terminé avec le code {return_code}.\n"
                     )
                     if return_code == 0:
+                        self._invalidate_output_caches()
                         self._refresh_results()
                     if finished_mode == "biobuddy_c3d_model":
                         self._notify_biobuddy_c3d_model_creation_finished(return_code)
+                    elif finished_mode == "biobuddy_c3d_ik" and return_code == 0:
+                        self._run_static_p6_analysis_after_biobuddy_ik()
                     self._run_pending_auto_analysis_if_needed()
                 else:
                     self._append_log(str(item))
@@ -3880,9 +4079,8 @@ class CapturyBioBuddyGui(tk.Tk):
             (
                 f"Le modèle a été écrit ici:\n{output_path}\n\n"
                 f"Taille: {size} octets.\n\n"
-                "Si la case BioBuddy de la chaîne CoR reste grisée, relance "
-                "l'analyse P6: elle se débloque seulement quand les résultats "
-                "de centres articulaires contiennent une couche BioBuddy."
+                "La reconstruction QLD de l'essai statique Motive va être lancée "
+                "automatiquement pour rendre ce modèle disponible dans les comparaisons."
             ),
         )
 
@@ -3892,10 +4090,48 @@ class CapturyBioBuddyGui(tk.Tk):
         if level == "info" and output_path.exists():
             self.vars["model_explorer_path"].set(str(output_path))
             self.status_var.set(f"Modèle BioBuddy créé: {output_path.name}")
-            messagebox.showinfo(title, message)
+            self._append_log(f"\n{title}\n{message}\n")
+            self._run_biobuddy_static_ik_after_model_creation()
         else:
             self.status_var.set(title)
             messagebox.showerror(title, message)
+
+    def _run_biobuddy_static_ik_after_model_creation(self) -> None:
+        c3d_path = self._static_motive_c3d_path()
+        if c3d_path is None:
+            self.status_var.set("Modèle créé; C3D statique Motive introuvable")
+            return
+        self.vars["command_mode"].set(COMMAND_MODES["biobuddy_c3d_ik"])
+        self._run_args(
+            self._biobuddy_c3d_ik_args(c3d_path),
+            command_mode="biobuddy_c3d_ik",
+            log_intro=(
+                "Étape suivante: reconstruction QLD de l'essai statique "
+                f"avec {c3d_path.name}."
+            ),
+            clear_log=False,
+        )
+
+    def _run_static_p6_analysis_after_biobuddy_ik(self) -> None:
+        values = self._var_values()
+        values["p6_trials"] = (
+            str(self.vars["p6_static_trial"].get()).strip() or "Static"
+        )
+        values["p6_run_ik_batch"] = True
+        values["p6_no_figures"] = True
+        values["p6_no_mesh"] = True
+        values["p6_max_mesh_points"] = "0"
+        self.auto_enable_biobuddy_cor_after_refresh = True
+        self.status_var.set("IK statique terminée; analyse P6 Static en cours")
+        self._run_args(
+            build_p6_args(values),
+            command_mode="kinematic",
+            log_intro=(
+                "Étape suivante: analyse Static avec le modèle BioBuddy reconstruit "
+                "pour exposer la couche BioBuddy dans le viewer."
+            ),
+            clear_log=False,
+        )
 
     def _biobuddy_c3d_folder_path(self) -> Path:
         raw_path = str(self.vars["biobuddy_c3d_folder"].get()).strip()

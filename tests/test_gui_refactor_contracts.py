@@ -19,9 +19,14 @@ from captury_biobuddy_gui import (
     transformed_marker_data,
     vertical_axis_label,
 )
-from gui_graphs import joint_centre_error_boxplot_series, joint_centre_error_timeseries
+from gui_graphs import (
+    joint_centre_error_boxplot_series,
+    joint_centre_error_boxplot_series_between,
+    joint_centre_error_timeseries,
+    joint_centre_error_timeseries_between,
+)
 from gui_commands import ROOT_OFFSET_MODE_LABELS
-from gui_trial_viewer import local_chain_axes
+from gui_trial_viewer import JointCentreChainData, TkC3DTrialCanvas, local_chain_axes
 
 
 class FakeVar:
@@ -48,11 +53,13 @@ def make_gui_stub() -> CapturyBioBuddyGui:
         "p6_time_start",
         "p6_time_end",
         "p6_joint_filter",
+        "p6_joint_centre_reference",
         "p6_auto_analyze",
         "p6_model_source",
         "p6_model_to_c3d_axis",
         "root_offset_mode",
         "c3d_angle_unit",
+        "p6_reexpress_rotations_zxy",
         "p6_no_figures",
         "p6_no_cache",
         "p6_no_mesh",
@@ -80,11 +87,13 @@ def make_gui_stub() -> CapturyBioBuddyGui:
     gui.vars["p6_time_start"].set("0.5")
     gui.vars["p6_time_end"].set("2.0")
     gui.vars["p6_joint_filter"].set("Hip|Knee\nAnkle")
+    gui.vars["p6_joint_centre_reference"].set("biobuddy")
     gui.vars["p6_auto_analyze"].set(True)
     gui.vars["p6_model_source"].set("fbx")
     gui.vars["p6_model_to_c3d_axis"].set("auto")
     gui.vars["root_offset_mode"].set("auto")
     gui.vars["c3d_angle_unit"].set("deg")
+    gui.vars["p6_reexpress_rotations_zxy"].set(False)
     gui.vars["p6_no_figures"].set(True)
     gui.vars["p6_no_cache"].set(True)
     gui.vars["p6_no_mesh"].set(True)
@@ -178,6 +187,19 @@ class GuiRefactorContracts(unittest.TestCase):
             args,
         )
         self.assertNotIn("--with-mesh", args)
+
+    def test_biobuddy_c3d_ik_command_contract(self) -> None:
+        gui = make_gui_stub()
+
+        args = CapturyBioBuddyGui._biobuddy_c3d_ik_args(gui, Path("/tmp/P6_Static.c3d"))
+
+        self.assertTrue(args[1].endswith("run_biobuddy_c3d_ik.py"))
+        self.assertIn("--biomod", args)
+        self.assertIn("/tmp/motive_57.bioMod", args)
+        self.assertIn("--c3d", args)
+        self.assertIn("/tmp/P6_Static.c3d", args)
+        self.assertIn("--strip-marker-prefix", args)
+        self.assertIn("Skeleton_001_", args)
 
     def test_biobuddy_c3d_folder_defaults_to_p6_motive_folder(self) -> None:
         gui = make_gui_stub()
@@ -293,6 +315,37 @@ class GuiRefactorContracts(unittest.TestCase):
         np.testing.assert_allclose(series[0]["values"], [1.0, 2.0])
         np.testing.assert_allclose(series[1]["values"], [10.0, 13.0])
 
+    def test_joint_centre_series_can_use_biobuddy_as_reference(self) -> None:
+        dataframe = pd.DataFrame(
+            {
+                "trial": ["A", "A"],
+                "time": [0.0, 0.1],
+                "joint": ["Hips", "Hips"],
+                "biobuddy_x_mm": [10.0, 10.0],
+                "biobuddy_y_mm": [0.0, 0.0],
+                "biobuddy_z_mm": [0.0, 0.0],
+                "motive_x_mm": [13.0, 14.0],
+                "motive_y_mm": [4.0, 0.0],
+                "motive_z_mm": [0.0, 0.0],
+            }
+        )
+
+        values = joint_centre_error_timeseries_between(
+            dataframe, "Hips", "biobuddy", "motive"
+        )
+        series = joint_centre_error_boxplot_series_between(
+            dataframe,
+            "median_error_mm",
+            trial="A",
+            reference="biobuddy",
+            source="motive",
+        )
+
+        np.testing.assert_allclose(values["distance_mm"].to_numpy(), [5.0, 4.0])
+        self.assertEqual(series[0]["reference"], "biobuddy")
+        self.assertEqual(series[0]["source"], "motive")
+        np.testing.assert_allclose(series[0]["values"], [5.0, 4.0])
+
     def test_local_chain_axes_are_orthonormal(self) -> None:
         points = {
             "Hips": np.asarray([0.0, 0.0, 0.0]),
@@ -308,6 +361,49 @@ class GuiRefactorContracts(unittest.TestCase):
             self.assertAlmostEqual(float(np.linalg.norm(axes[axis])), 1.0)
         self.assertAlmostEqual(float(np.dot(axes["X"], axes["Y"])), 0.0)
         self.assertAlmostEqual(float(np.dot(axes["Y"], axes["Z"])), 0.0)
+
+    def test_chain_axes_can_be_visible_when_chains_are_hidden(self) -> None:
+        viewer = object.__new__(TkC3DTrialCanvas)
+        viewer.visible_cor_layers = set()
+        viewer.chain_data = JointCentreChainData(
+            layers={
+                "captury": {"Hips": np.zeros((1, 3))},
+                "motive": {"Hips": np.zeros((1, 3))},
+            },
+            edges=[],
+        )
+
+        self.assertEqual(
+            TkC3DTrialCanvas._visible_chain_axis_layers(viewer),
+            ("captury", "motive"),
+        )
+
+    def test_rotate_body_segments_180_x_flips_captury_motive_local_yz_axes(
+        self,
+    ) -> None:
+        viewer = object.__new__(TkC3DTrialCanvas)
+        viewer.rotate_body_segments_180_x = True
+        viewer.chain_data = JointCentreChainData(
+            layers={},
+            edges=[("Hips", "Spine")],
+        )
+        points = {
+            "Hips": np.asarray([0.0, 0.0, 0.0]),
+            "Spine": np.asarray([0.0, 10.0, 0.0]),
+        }
+
+        captury_axes = TkC3DTrialCanvas._chain_axes_for_layer(
+            viewer, "captury", "Hips", points
+        )
+        biobuddy_axes = TkC3DTrialCanvas._chain_axes_for_layer(
+            viewer, "biobuddy", "Hips", points
+        )
+
+        assert captury_axes is not None
+        assert biobuddy_axes is not None
+        np.testing.assert_allclose(captury_axes["X"], biobuddy_axes["X"])
+        np.testing.assert_allclose(captury_axes["Y"], -biobuddy_axes["Y"])
+        np.testing.assert_allclose(captury_axes["Z"], -biobuddy_axes["Z"])
 
     def test_all_trials_label_remains_stable_for_callbacks(self) -> None:
         self.assertEqual(ALL_TRIALS_LABEL, "Tous les essais")

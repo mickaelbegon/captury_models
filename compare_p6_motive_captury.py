@@ -45,12 +45,14 @@ from compare_capture_systems import (
     unit_scale_to_mm,
 )
 from model_comparison_metrics import joint_center_error_xyz, waveform_metrics
+from run_biobuddy_c3d_ik import run_direct_biobuddy_ik
 
 DEFAULT_DATA_ROOT = Path("local_trials/2026-06-30_P6_flat")
 DEFAULT_OUTPUT_ROOT = Path("out_p6_motive_captury_comparison")
 ANGLE_LABEL_REGEX = r"(?i)(^.*angles?$|^.*_angle[s]?$|angle)"
 FOOT_MARKER_PATTERN = r"(LFCC|RFCC|LFM|RFM|LDP|RDP|Foot|Toe|Heel)"
-CACHE_VERSION = 3
+CACHE_VERSION = 4
+ROTATION_SEQUENCE_ZXY = "ZXY"
 
 MODEL_JOINT_MARKER_PROXIES = {
     "Hips": ("LIAS", "RIAS", "LIPS", "RIPS"),
@@ -154,6 +156,7 @@ def trial_cache_fingerprint(
                 args.captury_reorient_thigh_y_from_cor
             ),
             "rotate_body_segments_180_x": bool(args.rotate_body_segments_180_x),
+            "reexpress_rotations_zxy": bool(args.reexpress_rotations_zxy),
             "disable_static_model_alignment": bool(args.disable_static_model_alignment),
             "disable_motive_marker_alignment": bool(
                 args.disable_motive_marker_alignment
@@ -796,6 +799,119 @@ def rotation_deviation_vector(R1: np.ndarray, R2: np.ndarray) -> np.ndarray:
     return theta / (2.0 * np.sin(theta)) * skew_vector
 
 
+def axis_rotation_matrix(axis: str, angle: float) -> np.ndarray:
+    """Return a right-handed elementary rotation matrix for one axis."""
+
+    c = float(np.cos(angle))
+    s = float(np.sin(angle))
+    axis = str(axis).upper()
+    if axis == "X":
+        return np.asarray([[1.0, 0.0, 0.0], [0.0, c, -s], [0.0, s, c]])
+    if axis == "Y":
+        return np.asarray([[c, 0.0, s], [0.0, 1.0, 0.0], [-s, 0.0, c]])
+    if axis == "Z":
+        return np.asarray([[c, -s, 0.0], [s, c, 0.0], [0.0, 0.0, 1.0]])
+    raise ValueError(f"Unsupported rotation axis: {axis!r}")
+
+
+def euler_matrix_from_sequence(angles: np.ndarray, sequence: str) -> np.ndarray:
+    """Compose an Euler rotation matrix in the explicit listed-axis order."""
+
+    sequence = str(sequence).upper()
+    if len(sequence) != 3 or set(sequence) != {"X", "Y", "Z"}:
+        raise ValueError(f"Unsupported Euler sequence: {sequence!r}")
+    matrix = np.eye(3)
+    for axis, angle in zip(sequence, np.asarray(angles, dtype=float), strict=True):
+        matrix = matrix @ axis_rotation_matrix(axis, float(angle))
+    return matrix
+
+
+def euler_zxy_from_matrix(rotation: np.ndarray) -> np.ndarray:
+    """Extract ``Z, X, Y`` Euler angles from ``Rz @ Rx @ Ry`` matrices."""
+
+    matrix = np.asarray(rotation, dtype=float)
+    if matrix.shape != (3, 3):
+        raise ValueError(f"Expected a 3x3 rotation matrix, got {matrix.shape}.")
+    x_angle = float(np.arcsin(np.clip(matrix[2, 1], -1.0, 1.0)))
+    cos_x = float(np.cos(x_angle))
+    if abs(cos_x) < 1e-8:
+        z_angle = float(np.arctan2(matrix[1, 0], matrix[0, 0]))
+        y_angle = 0.0
+    else:
+        z_angle = float(np.arctan2(-matrix[0, 1], matrix[1, 1]))
+        y_angle = float(np.arctan2(-matrix[2, 0], matrix[2, 2]))
+    return np.asarray([z_angle, x_angle, y_angle], dtype=float)
+
+
+def _rotational_q_indices_by_segment(
+    q_names: list[str],
+) -> dict[str, dict[str, int]]:
+    indices: dict[str, dict[str, int]] = {}
+    for index, q_name in enumerate(q_names):
+        match = re.match(r"(.+)_rot([XYZ])$", str(q_name))
+        if match is None:
+            continue
+        segment, axis = match.groups()
+        indices.setdefault(segment, {})[axis] = index
+    return indices
+
+
+def reexpress_rotational_q_from_segment_rotations(
+    q: np.ndarray,
+    q_names: list[str],
+    rotations: dict[str, np.ndarray],
+    target_sequence: str = ROTATION_SEQUENCE_ZXY,
+) -> tuple[np.ndarray, dict[str, Any]]:
+    """Re-express rotational q channels from segment rotation matrices.
+
+    This is intentionally applied only to Captury/Motive comparison copies. The
+    BioBuddy reference q is left as produced by the IK/model pipeline.  The
+    supplied ``rotations`` can already include display/convention corrections
+    such as ``R(x,180 deg)``; this function only extracts the requested Euler
+    sequence and writes those angles back into matching ``*_rotX/Y/Z`` rows.
+    """
+
+    target_sequence = str(target_sequence).upper()
+    if target_sequence != ROTATION_SEQUENCE_ZXY:
+        raise ValueError(f"Unsupported target Euler sequence: {target_sequence!r}")
+    updated = np.asarray(q, dtype=float).copy()
+    indices_by_segment = _rotational_q_indices_by_segment(q_names)
+    changed_segments: list[str] = []
+    skipped_segments: list[str] = []
+    target_extractors = {ROTATION_SEQUENCE_ZXY: euler_zxy_from_matrix}
+    extractor = target_extractors[target_sequence]
+    for segment, axis_indices in sorted(indices_by_segment.items()):
+        if set(axis_indices) != {"X", "Y", "Z"} or segment not in rotations:
+            skipped_segments.append(segment)
+            continue
+        segment_rotations = np.asarray(rotations[segment], dtype=float)
+        n_frames = min(updated.shape[1], segment_rotations.shape[2])
+        if n_frames <= 0:
+            skipped_segments.append(segment)
+            continue
+        for frame in range(n_frames):
+            angles = extractor(segment_rotations[:, :, frame])
+            for angle, axis in zip(angles, target_sequence, strict=True):
+                updated[axis_indices[axis], frame] = float(angle)
+        changed_segments.append(segment)
+    return updated, {
+        "target_sequence": target_sequence,
+        "changed_segments": changed_segments,
+        "skipped_segments": skipped_segments,
+    }
+
+
+def reexpress_model_run_rotational_q(
+    run: ModelRun,
+    rotations: dict[str, np.ndarray],
+    target_sequence: str = ROTATION_SEQUENCE_ZXY,
+) -> tuple[ModelRun, dict[str, Any]]:
+    q, report = reexpress_rotational_q_from_segment_rotations(
+        run.q, run.q_names, rotations, target_sequence
+    )
+    return replace(run, q=q), report
+
+
 def segment_rotation_metric_rows(
     trial: str,
     rotations_by_source: dict[str, dict[str, np.ndarray]],
@@ -1380,6 +1496,73 @@ def centre_metric_rows(
     return summary_rows, timeseries_rows
 
 
+def add_biobuddy_centre_rows(
+    trial: str,
+    summary_rows: list[dict[str, Any]],
+    timeseries_rows: list[dict[str, Any]],
+    motive_centres_mm: dict[str, np.ndarray],
+    motive_time: np.ndarray,
+    biobuddy_centres_mm: dict[str, np.ndarray],
+    biobuddy_time: np.ndarray,
+    joint_filters: list[str] | None = None,
+) -> None:
+    """Add BioBuddy IK centre columns and summary rows in place."""
+
+    bio_on_motive = interpolate_centres_to_time(
+        biobuddy_centres_mm, biobuddy_time, motive_time
+    )
+    common = sorted(set(bio_on_motive).intersection(motive_centres_mm))
+    metric_joints = common
+    if joint_filters:
+        regexes = [re.compile(pattern) for pattern in joint_filters]
+        metric_joints = [
+            joint for joint in common if any(regex.search(joint) for regex in regexes)
+        ]
+    metric_joint_set = set(metric_joints)
+    row_by_joint_frame: dict[tuple[str, int], dict[str, Any]] = {}
+    counts_by_joint: dict[str, int] = {}
+    for row in timeseries_rows:
+        joint = str(row["joint"])
+        frame_index = counts_by_joint.get(joint, 0)
+        row_by_joint_frame[(joint, frame_index)] = row
+        counts_by_joint[joint] = frame_index + 1
+    for joint in common:
+        bio = bio_on_motive[joint].T
+        mot = motive_centres_mm[joint].T
+        valid = np.all(np.isfinite(bio), axis=1) & np.all(np.isfinite(mot), axis=1)
+        errors = np.linalg.norm(bio - mot, axis=1)
+        if joint in metric_joint_set:
+            summary_rows.append(
+                {
+                    "trial": trial,
+                    "joint": joint,
+                    "source": "biobuddy",
+                    "n_frames": int(valid.sum()),
+                    "median_error_mm": (
+                        float(np.nanmedian(errors[valid])) if valid.any() else np.nan
+                    ),
+                    "p95_error_mm": (
+                        float(np.nanpercentile(errors[valid], 95))
+                        if valid.any()
+                        else np.nan
+                    ),
+                    "max_error_mm": (
+                        float(np.nanmax(errors[valid])) if valid.any() else np.nan
+                    ),
+                    **joint_center_error_xyz(mot, bio),
+                }
+            )
+        for i, time_value in enumerate(motive_time):
+            row = row_by_joint_frame.get((joint, i))
+            if row is None:
+                row = {"trial": trial, "time": float(time_value), "joint": joint}
+                timeseries_rows.append(row)
+            row["biobuddy_x_mm"] = bio[i, 0]
+            row["biobuddy_y_mm"] = bio[i, 1]
+            row["biobuddy_z_mm"] = bio[i, 2]
+            row["biobuddy_distance_mm"] = errors[i]
+
+
 def q_metric_rows(
     trial: str, captury: ModelRun, motive: ModelRun
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
@@ -1410,6 +1593,44 @@ def q_metric_rows(
                     "motive": mot_curve[i],
                     "captury": cap_curve[i],
                     "difference": cap_curve[i] - mot_curve[i],
+                }
+            )
+    return summary_rows, timeseries_rows
+
+
+def q_metric_rows_with_optional_biobuddy(
+    trial: str, captury: ModelRun, motive: ModelRun, biobuddy: ModelRun | None
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    summary_rows, timeseries_rows = q_metric_rows(trial, captury, motive)
+    if biobuddy is None:
+        return summary_rows, timeseries_rows
+    bio_q = {name: biobuddy.q[i] for i, name in enumerate(biobuddy.q_names)}
+    mot_q = {name: motive.q[i] for i, name in enumerate(motive.q_names)}
+    for q_name in sorted(set(bio_q).intersection(mot_q)):
+        bio_curve = interpolate_array(
+            bio_q[q_name][None, :], biobuddy.time, motive.time
+        )[0]
+        mot_curve = mot_q[q_name]
+        unit = "rad" if "rot" in q_name.lower() else "native"
+        summary_rows.append(
+            {
+                "trial": trial,
+                "q_name": q_name,
+                "unit": unit,
+                "source": "biobuddy_ik",
+                **waveform_metrics(mot_curve, bio_curve, unit),
+            }
+        )
+        for i, time_value in enumerate(motive.time):
+            timeseries_rows.append(
+                {
+                    "trial": trial,
+                    "time": float(time_value),
+                    "q_name": q_name,
+                    "motive": mot_curve[i],
+                    "captury": np.nan,
+                    "biobuddy": bio_curve[i],
+                    "difference": bio_curve[i] - mot_curve[i],
                 }
             )
     return summary_rows, timeseries_rows
@@ -2002,6 +2223,86 @@ def biobuddy_dimension_rows(
     }
 
 
+def model_run_from_biobuddy_ik_npz(
+    biomod_path: Path,
+    ik_npz_path: Path,
+    *,
+    system: str = "biobuddy",
+    source_kind: str = "motive_57_ik",
+    unit_scale_to_m: float = 1.0,
+) -> ModelRun:
+    """Load a BioBuddy IK result and expose it as a third comparison source."""
+
+    data = np.load(ik_npz_path, allow_pickle=True)
+    q = np.asarray(data["q"], dtype=float)
+    time = np.asarray(data["time"], dtype=float)
+    q_names = [str(name) for name in data["q_names"].tolist()]
+    q_units = ["rad" if "rot" in name.lower() else "native" for name in q_names]
+    joint_names = biorbd_segment_names(require_biorbd().Model(str(biomod_path)))
+    centres_native = compute_model_joint_centres_native(
+        biomod_path, q, set(joint_names)
+    )
+    rotations_native = compute_model_segment_rotations_native(
+        biomod_path, q, set(joint_names)
+    )
+    return ModelRun(
+        system=system,
+        source_kind=source_kind,
+        biomod_path=biomod_path,
+        q=q,
+        q_names=q_names,
+        q_units=q_units,
+        time=time,
+        joint_names=joint_names,
+        centres_native=centres_native,
+        rotations_native=rotations_native,
+        unit_scale_to_m=unit_scale_to_m,
+        mesh_report={},
+        root_offset_policy={"source": "biobuddy_c3d_ik", "ik_npz": str(ik_npz_path)},
+    )
+
+
+def run_biobuddy_ik_for_trial(
+    bundle: TrialBundle,
+    trial_dir: Path,
+    biomod_path: Path | None,
+    unit_scale_to_m: float,
+    max_frames: int,
+    angle_label_regex: str,
+) -> tuple[ModelRun | None, dict[str, Any]]:
+    """Run direct BioBuddy QLD IK for a trial when a BioBuddy model is available."""
+
+    if biomod_path is None:
+        return None, {"status": "missing", "reason": "no_biobuddy_biomod_argument"}
+    if not biomod_path.exists():
+        return None, {
+            "status": "missing",
+            "path": str(biomod_path),
+            "reason": "biobuddy_biomod_not_found",
+        }
+    ik_dir = trial_dir / "biobuddy_ik"
+    source_name = f"biobuddy_{safe_name(bundle.name)}"
+    try:
+        report = run_direct_biobuddy_ik(
+            biomod_path,
+            bundle.motive_c3d,
+            ik_dir,
+            source_name=source_name,
+            biomod_unit_scale_to_m=unit_scale_to_m,
+            angle_label_regex=angle_label_regex,
+            max_frames=max_frames,
+        )
+        ik_npz = Path(report["outputs"]["npz"])
+        run = model_run_from_biobuddy_ik_npz(
+            biomod_path,
+            ik_npz,
+            unit_scale_to_m=unit_scale_to_m,
+        )
+        return run, report
+    except Exception as exc:
+        return None, {"status": "error", "error": str(exc), "path": str(biomod_path)}
+
+
 def marker_correspondence_rows(
     trial: str,
     motive_c3d: Path,
@@ -2445,6 +2746,7 @@ def compare_trial(
             args.captury_reorient_thigh_y_from_cor
         ),
         "rotate_body_segments_180_x": bool(args.rotate_body_segments_180_x),
+        "reexpress_rotations_zxy": bool(args.reexpress_rotations_zxy),
         "applied": [],
     }
     if args.captury_reorient_thigh_y_from_cor:
@@ -2459,6 +2761,10 @@ def compare_trial(
         mot_rotations_c3d = rotate_segment_frames_180_x(mot_rotations_c3d)
         segment_orientation_report["applied"].append(
             "captury_and_motive_segment_frames_rotated_180_deg_about_local_x"
+        )
+    if args.reexpress_rotations_zxy:
+        segment_orientation_report["applied"].append(
+            "captury_and_motive_q_reexpressed_from_corrected_segment_matrices_as_ZXY"
         )
     alignment_report["motive_model_to_c3d_markers"] = model_marker_report
     enriched_c3d = append_centres_to_motive_c3d(
@@ -2478,6 +2784,22 @@ def compare_trial(
     )
     captury_metrics = trim_model_run(captury, cut_start_s, cut_end_s)
     motive_metrics = trim_model_run(motive, cut_start_s, cut_end_s)
+    biobuddy_run: ModelRun | None = None
+    biobuddy_ik_report: dict[str, Any] = {
+        "status": "skipped",
+        "reason": "run_ik_batch_false",
+    }
+    if args.run_ik_batch:
+        biobuddy_run, biobuddy_ik_report = run_biobuddy_ik_for_trial(
+            bundle,
+            trial_dir,
+            args.biobuddy_biomod,
+            args.biobuddy_unit_scale_to_m,
+            args.ik_max_frames,
+            args.angle_label_regex,
+        )
+        if biobuddy_run is not None:
+            biobuddy_run = trim_model_run(biobuddy_run, cut_start_s, cut_end_s)
     cap_aligned_metrics_mm = trim_centres(
         cap_aligned_mm, time_window_mask(captury.time, cut_start_s, cut_end_s)
     )
@@ -2492,7 +2814,53 @@ def compare_trial(
         motive_metrics.time,
         args.joint_filter,
     )
-    q_rows, q_ts_rows = q_metric_rows(bundle.name, captury_metrics, motive_metrics)
+    if biobuddy_run is not None:
+        bio_centres_mm = centres_to_c3d_mm(
+            biobuddy_run.centres_native, biobuddy_run.unit_scale_to_m, "identity"
+        )
+        add_biobuddy_centre_rows(
+            bundle.name,
+            centre_rows,
+            centre_ts_rows,
+            mot_metrics_mm,
+            motive_metrics.time,
+            bio_centres_mm,
+            biobuddy_run.time,
+            args.joint_filter,
+        )
+    cap_rotation_metrics = trim_rotations(
+        cap_rotations_c3d, time_window_mask(captury.time, cut_start_s, cut_end_s)
+    )
+    mot_rotation_metrics = trim_rotations(
+        mot_rotations_c3d, time_window_mask(motive.time, cut_start_s, cut_end_s)
+    )
+    q_captury_metrics = captury_metrics
+    q_motive_metrics = motive_metrics
+    q_reexpression_report: dict[str, Any] = {
+        "enabled": bool(args.reexpress_rotations_zxy),
+        "target_sequence": (
+            ROTATION_SEQUENCE_ZXY if args.reexpress_rotations_zxy else None
+        ),
+        "applied_sources": [],
+        "biobuddy_modified": False,
+    }
+    if args.reexpress_rotations_zxy:
+        q_captury_metrics, captury_q_report = reexpress_model_run_rotational_q(
+            captury_metrics, cap_rotation_metrics, ROTATION_SEQUENCE_ZXY
+        )
+        q_motive_metrics, motive_q_report = reexpress_model_run_rotational_q(
+            motive_metrics, mot_rotation_metrics, ROTATION_SEQUENCE_ZXY
+        )
+        q_reexpression_report.update(
+            {
+                "applied_sources": ["captury", "motive"],
+                "captury": captury_q_report,
+                "motive": motive_q_report,
+            }
+        )
+    q_rows, q_ts_rows = q_metric_rows_with_optional_biobuddy(
+        bundle.name, q_captury_metrics, q_motive_metrics, biobuddy_run
+    )
     c3d_angle_rows, c3d_angle_ts_rows = captury_c3d_angle_rows(
         bundle.name,
         bundle.captury_c3d,
@@ -2503,12 +2871,6 @@ def compare_trial(
     )
     q_rows.extend(c3d_angle_rows)
     q_ts_rows.extend(c3d_angle_ts_rows)
-    cap_rotation_metrics = trim_rotations(
-        cap_rotations_c3d, time_window_mask(captury.time, cut_start_s, cut_end_s)
-    )
-    mot_rotation_metrics = trim_rotations(
-        mot_rotations_c3d, time_window_mask(motive.time, cut_start_s, cut_end_s)
-    )
     segment_q_rows, segment_q_ts_rows = segment_relative_q_metric_rows(
         bundle.name,
         cap_rotation_metrics,
@@ -2523,12 +2885,18 @@ def compare_trial(
         {
             "captury": cap_rotation_metrics,
             "motive": mot_rotation_metrics,
-            "biobuddy": {},
+            "biobuddy": (
+                biobuddy_run.rotations_native if biobuddy_run is not None else {}
+            ),
         },
         {
             "captury": captury_metrics.time,
             "motive": motive_metrics.time,
-            "biobuddy": np.asarray([], dtype=float),
+            "biobuddy": (
+                biobuddy_run.time
+                if biobuddy_run is not None
+                else np.asarray([], dtype=float)
+            ),
         },
         args.segment_reference,
     )
@@ -2659,6 +3027,7 @@ def compare_trial(
         "trial_events": event_report,
         "segment_rotations": segment_report,
         "segment_orientation_corrections": segment_orientation_report,
+        "q_reexpression": q_reexpression_report,
         "occlusion_figure": str(occlusion_figure) if occlusion_figure else None,
         "occlusion_marker_count": len(occlusion_rows),
         "angle_inventory": {
@@ -2682,6 +3051,7 @@ def compare_trial(
         },
     }
     if args.run_ik_batch:
+        report["biobuddy_ik_batch"] = biobuddy_ik_report
         report["motive_ik_batch"] = run_ik_batch(
             bundle, trial_dir, args.model_source, args.ik_max_frames
         )
@@ -2804,6 +3174,15 @@ def parse_args() -> argparse.Namespace:
         help=(
             "Rotate Captury and Motive segment frames by 180 degrees around each "
             "segment local X axis before segment-angle metrics."
+        ),
+    )
+    parser.add_argument(
+        "--reexpress-rotations-zxy",
+        action="store_true",
+        help=(
+            "Re-express Captury and Motive rotational q channels from corrected "
+            "segment rotation matrices in Z-X-Y order before q metrics. BioBuddy "
+            "q remains unchanged."
         ),
     )
     parser.add_argument(

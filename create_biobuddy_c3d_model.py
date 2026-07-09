@@ -20,6 +20,12 @@ DEFAULT_PRESET = "motive_57"
 DEFAULT_MOTIVE_57_MARKER_PREFIXES_TO_STRIP = ("Skeleton_001_",)
 
 
+def print_progress(message: str) -> None:
+    """Print a GUI-friendly progress message immediately."""
+
+    print(f"[BioBuddy C3D] {message}", flush=True)
+
+
 def _load_biobuddy_c3d_api() -> dict[str, Any]:
     try:
         from biobuddy.gui.c3d_model_creation import (  # type: ignore
@@ -159,12 +165,22 @@ def create_biobuddy_c3d_model(
     api = _load_biobuddy_c3d_api()
     folder_path = Path(c3d_folder).expanduser()
     output_path = Path(output).expanduser()
+    print_progress(f"Dossier source: {folder_path}")
+    print_progress(f"Sortie bioMod: {output_path}")
     if not folder_path.exists():
         raise FileNotFoundError(f"Dossier C3D introuvable: {folder_path}")
     if not folder_path.is_dir():
         raise NotADirectoryError(f"Le chemin C3D n'est pas un dossier: {folder_path}")
 
+    c3d_files = sorted(folder_path.glob("*.c3d"))
+    print_progress(f"{len(c3d_files)} fichier(s) C3D détecté(s).")
+    for c3d_file in c3d_files[:12]:
+        print_progress(f"  - {c3d_file.name}")
+    if len(c3d_files) > 12:
+        print_progress(f"  ... {len(c3d_files) - 12} fichier(s) non affiché(s)")
+
     preset_value = api["preset_from_cli"](preset)
+    print_progress(f"Preset demandé: {getattr(preset_value, 'value', preset_value)}")
     effective_folder = folder_path
     mapping_context = (
         prepared_motive57_c3d_folder(folder_path, motive_57_mapping_json)
@@ -172,22 +188,28 @@ def create_biobuddy_c3d_model(
         else None
     )
     if mapping_context is not None:
+        print_progress("Préparation des C3D Motive 57 à partir du mapping JSON...")
         effective_folder = mapping_context.__enter__()
-        print(
-            f"Mapping Motive 57: {Path(motive_57_mapping_json).expanduser()}",
-            flush=True,
+        print_progress(
+            f"Mapping Motive 57: {Path(motive_57_mapping_json).expanduser()}"
         )
-        print(f"Dossier C3D préparé: {effective_folder}", flush=True)
+        print_progress(f"Dossier C3D préparé: {effective_folder}")
     static_virtual_points = (
         api["default_static_virtual_points"](preset_value)
         if add_default_virtual_points
         else ()
     )
+    print_progress(f"Points virtuels statiques: {len(static_virtual_points)}")
     marker_prefixes = marker_prefixes_to_strip_for_preset(
         str(getattr(preset_value, "value", preset)),
         marker_name_prefixes_to_strip,
     )
+    if marker_prefixes:
+        print_progress(f"Préfixes marqueurs retirés: {', '.join(marker_prefixes)}")
+    else:
+        print_progress("Préfixes marqueurs retirés: aucun")
     try:
+        print_progress("Construction du modèle BioBuddy en cours...")
         result = api["create_model"](
             effective_folder,
             preset=preset_value,
@@ -195,13 +217,17 @@ def create_biobuddy_c3d_model(
             marker_name_prefixes_to_strip=marker_prefixes,
         )
         output_path.parent.mkdir(parents=True, exist_ok=True)
+        print_progress("Écriture du fichier bioMod...")
         result.model.to_biomod(str(output_path), with_mesh=with_mesh)
-        print(f"Preset: {getattr(result.preset, 'value', result.preset)}", flush=True)
-        print(f"bioMod: {output_path}", flush=True)
+        print_progress(
+            f"Preset final: {getattr(result.preset, 'value', result.preset)}"
+        )
+        print_progress(f"bioMod écrit: {output_path}")
         return output_path
     finally:
         if mapping_context is not None:
             mapping_context.__exit__(None, None, None)
+            print_progress("Dossier C3D temporaire nettoyé.")
 
 
 def main(argv: list[str] | None = None) -> int:
