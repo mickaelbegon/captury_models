@@ -68,6 +68,8 @@ from typing import Any, Iterable
 
 import numpy as np
 
+from mocap_units import point_unit_scale_to_m
+
 # These labels are Captury angle channels, not marker trajectories. Keeping this
 # list close to the top makes the filtering rule easy to find and edit.
 DEFAULT_C3D_ANGLE_LABELS = {
@@ -162,12 +164,8 @@ def c3d_point_unit_scale_to_m(c3d: dict) -> float:
     # FBX and C3D can be compared even when their native units differ.
     units = as_str_list(get_c3d_param(c3d, "POINT", "UNITS", [""]))
     unit = units[0].strip().lower() if units else ""
-    if unit in {"mm", "millimeter", "millimeters", "millimetre", "millimetres"}:
-        return 0.001
-    if unit in {"m", "meter", "meters", "metre", "metres"}:
-        return 1.0
     # Most mocap/Captury C3D marker trajectories are in mm. This fallback is explicit in the report.
-    return 0.001
+    return point_unit_scale_to_m(unit)
 
 
 def c3d_time_vector(c3d: dict) -> np.ndarray:

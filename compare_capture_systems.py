@@ -12,6 +12,7 @@ from typing import Any
 import numpy as np
 import pandas as pd
 
+from mocap_units import point_unit_scale_to_mm
 from model_comparison_metrics import joint_center_error_xyz, waveform_metrics
 
 
@@ -112,14 +113,7 @@ def as_str_list(value: Any) -> list[str]:
 
 
 def unit_scale_to_mm(unit: str) -> float:
-    unit = unit.strip().lower()
-    if unit in {"m", "meter", "meters", "metre", "metres"}:
-        return 1000.0
-    if unit in {"mm", "millimeter", "millimeters", "millimetre", "millimetres"}:
-        return 1.0
-    if unit in {"cm", "centimeter", "centimeters", "centimetre", "centimetres"}:
-        return 10.0
-    return 1.0
+    return point_unit_scale_to_mm(unit)
 
 
 def canonical_angle_name(name: str) -> str:

@@ -12,6 +12,8 @@ from typing import Iterable
 
 import numpy as np
 
+from mocap_units import point_unit_scale_to_mm
+
 ANGLE_LABEL_REGEX = r"(?i)(^.*angles?$|^.*_angle[s]?$|angle)"
 
 AXIS_COLORS = {"x": "#ef4444", "y": "#22c55e", "z": "#3b82f6"}
@@ -46,29 +48,6 @@ class MarkerVisualState:
     assigned_segments: dict[str, str] = field(default_factory=dict)
     active_labels: set[str] = field(default_factory=set)
     selected_label: str | None = None
-
-
-def point_unit_scale_to_mm(unit: str) -> float:
-    normalized_unit = str(unit).strip().lower()
-    if normalized_unit in {
-        "mm",
-        "millimeter",
-        "millimeters",
-        "millimetre",
-        "millimetres",
-    }:
-        return 1.0
-    if normalized_unit in {
-        "cm",
-        "centimeter",
-        "centimeters",
-        "centimetre",
-        "centimetres",
-    }:
-        return 10.0
-    if normalized_unit in {"m", "meter", "meters", "metre", "metres"}:
-        return 1000.0
-    return 1.0
 
 
 def load_c3d_marker_data(

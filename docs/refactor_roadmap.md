@@ -111,11 +111,13 @@ Completed in this phase:
   comparison workflow.
 - Fixed duplicate display-label lookup so a unique clean label is not indexed
   twice.
+- Extracted shared C3D point-unit conversion helpers to `mocap_units.py`.
+- Reused unit conversion from the C3D viewer, capture-system comparison and
+  historical BVH/FBX/C3D pipeline.
 
 Still pending:
 
 - Extract C3D point splitting and angle-channel filtering.
-- Extract unit conversion to millimetres/model units.
 - Extract rigid/Kabsch alignment helpers used by viewer and comparison scripts.
 
 Tests first:
