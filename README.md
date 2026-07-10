@@ -12,6 +12,7 @@ Small workspace for comparing Captury BVH/FBX skeleton exports with C3D marker d
 - `c3d_source_preparation.py`: shared source-specific C3D point preparation helpers used by diagnostics and future comparison/viewer refactors.
 - `mocap_labels.py`: shared marker-label helpers for Motive prefixes, duplicate display names, joint-centre labels and IK marker matching.
 - `mocap_units.py`: shared C3D point-unit conversion helpers for millimetres/metres.
+- `mocap_alignment.py`: shared row-vector rigid-alignment helpers for Kabsch, transform application and transform composition.
 - `create_biobuddy_c3d_model.py`: CLI wrapper for BioBuddy's C3D-folder model creation workflow.
 - `c3d_trial_viewer.py`: lightweight PySide/QPainter C3D marker viewer used from the trial-cutting tab.
 - `compare_capture_systems.py`: compare Motive marker-based C3D trials against Captury markerless C3D trials.

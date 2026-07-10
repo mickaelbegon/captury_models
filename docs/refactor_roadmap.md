@@ -114,11 +114,13 @@ Completed in this phase:
 - Extracted shared C3D point-unit conversion helpers to `mocap_units.py`.
 - Reused unit conversion from the C3D viewer, capture-system comparison and
   historical BVH/FBX/C3D pipeline.
+- Extracted shared row-vector rigid-alignment helpers to `mocap_alignment.py`.
+- Reused Kabsch/transform composition from the Tk viewer, P6 comparison and
+  capture-system comparison.
 
 Still pending:
 
 - Extract C3D point splitting and angle-channel filtering.
-- Extract rigid/Kabsch alignment helpers used by viewer and comparison scripts.
 
 Tests first:
 

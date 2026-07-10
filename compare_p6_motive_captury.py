@@ -44,6 +44,11 @@ from compare_capture_systems import (
     load_landmark_map,
     unit_scale_to_mm,
 )
+from mocap_alignment import (
+    apply_row_alignment,
+    compose_row_alignment,
+    kabsch_rows,
+)
 from mocap_labels import (
     display_marker_name,
     is_joint_centre_marker_label,
@@ -1101,23 +1106,6 @@ def choose_root_offset_policy_in_c3d(
     return use_correction, report, selected_centres
 
 
-def kabsch_rows(
-    reference: np.ndarray, moving: np.ndarray
-) -> tuple[np.ndarray, np.ndarray]:
-    ref_mean = np.mean(reference, axis=0)
-    moving_mean = np.mean(moving, axis=0)
-    ref_centered = reference - ref_mean
-    moving_centered = moving - moving_mean
-    h = moving_centered.T @ ref_centered
-    u, _, vt = np.linalg.svd(h)
-    rotation = u @ vt
-    if np.linalg.det(rotation) < 0:
-        u[:, -1] *= -1
-        rotation = u @ vt
-    translation = ref_mean - moving_mean @ rotation
-    return rotation, translation
-
-
 def static_alignment(
     captury_centres_mm: dict[str, np.ndarray],
     motive_centres_mm: dict[str, np.ndarray],
@@ -1164,31 +1152,9 @@ def apply_alignment(
 ) -> dict[str, np.ndarray]:
     aligned: dict[str, np.ndarray] = {}
     for name, values in centres_mm.items():
-        rows = values.T @ rotation + translation
+        rows = apply_row_alignment(values.T, rotation, translation)
         aligned[name] = rows.T
     return aligned
-
-
-def compose_row_alignment(
-    first_rotation: np.ndarray,
-    first_translation: np.ndarray,
-    second_rotation: np.ndarray,
-    second_translation: np.ndarray,
-) -> tuple[np.ndarray, np.ndarray]:
-    """Compose two row-vector rigid transforms.
-
-    Points are transformed as ``p @ R + t``.  Applying ``first`` then ``second``
-    is therefore ``p @ (R1 @ R2) + (t1 @ R2 + t2)``.
-    """
-
-    first_rotation = np.asarray(first_rotation, dtype=float)
-    first_translation = np.asarray(first_translation, dtype=float)
-    second_rotation = np.asarray(second_rotation, dtype=float)
-    second_translation = np.asarray(second_translation, dtype=float)
-    return (
-        first_rotation @ second_rotation,
-        first_translation @ second_rotation + second_translation,
-    )
 
 
 def yaw_rotation_rows(angle_rad: float) -> np.ndarray:

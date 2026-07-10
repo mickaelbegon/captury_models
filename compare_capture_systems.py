@@ -13,6 +13,7 @@ import numpy as np
 import pandas as pd
 
 from mocap_units import point_unit_scale_to_mm
+from mocap_alignment import kabsch_rows
 from model_comparison_metrics import joint_center_error_xyz, waveform_metrics
 
 
@@ -278,19 +279,10 @@ def extract_landmarks(
     return names, np.stack(reference_curves), np.stack(test_curves), report
 
 
-def kabsch_transform(reference_points: np.ndarray, test_points: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
-    ref_mean = np.mean(reference_points, axis=0)
-    test_mean = np.mean(test_points, axis=0)
-    ref_centered = reference_points - ref_mean
-    test_centered = test_points - test_mean
-    h = test_centered.T @ ref_centered
-    u, _, vt = np.linalg.svd(h)
-    rotation = u @ vt
-    if np.linalg.det(rotation) < 0:
-        u[:, -1] *= -1
-        rotation = u @ vt
-    translation = ref_mean - test_mean @ rotation
-    return rotation, translation
+def kabsch_transform(
+    reference_points: np.ndarray, test_points: np.ndarray
+) -> tuple[np.ndarray, np.ndarray]:
+    return kabsch_rows(reference_points, test_points)
 
 
 def apply_global_rigid_alignment(reference: np.ndarray, test: np.ndarray) -> tuple[np.ndarray, dict[str, Any]]:

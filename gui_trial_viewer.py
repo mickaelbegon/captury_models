@@ -21,6 +21,7 @@ from c3d_trial_viewer import (
     rotation_matrix_from_drag,
 )
 from compare_capture_systems import DEFAULT_LANDMARK_MAP
+from mocap_alignment import kabsch_rows
 from mocap_labels import (
     display_marker_name,
     is_joint_centre_marker_label,
@@ -201,21 +202,6 @@ def average_marker_group(points: np.ndarray, indices: list[int]) -> np.ndarray |
         return None
     with np.errstate(invalid="ignore"):
         return np.nanmean(points[:, indices, :], axis=1)
-
-
-def kabsch_rows(
-    reference: np.ndarray, moving: np.ndarray
-) -> tuple[np.ndarray, np.ndarray]:
-    reference_mean = np.nanmean(reference, axis=0)
-    moving_mean = np.nanmean(moving, axis=0)
-    covariance = (moving - moving_mean).T @ (reference - reference_mean)
-    u, _s, vt = np.linalg.svd(covariance)
-    rotation = u @ vt
-    if np.linalg.det(rotation) < 0:
-        u[:, -1] *= -1.0
-        rotation = u @ vt
-    translation = reference_mean - moving_mean @ rotation
-    return rotation, translation
 
 
 def captury_marker_transform_from_c3d_layers(
