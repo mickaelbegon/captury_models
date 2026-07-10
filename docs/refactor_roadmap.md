@@ -88,7 +88,7 @@ Tests first:
 
 ## Phase 3 - C3D, Labels, Units and Alignment Contracts
 
-Status: planned.
+Status: started.
 
 Candidate scope:
 
@@ -103,6 +103,20 @@ Purpose:
   handling, unit conversion, Kabsch/rigid alignment and source colors/names.
 - Prevent GUI/viewer/comparison scripts from reimplementing marker filtering or
   coordinate preparation differently.
+
+Completed in this phase:
+
+- Extracted shared marker-label helpers to `mocap_labels.py`.
+- Reused these helpers from the Tk trial viewer, BioBuddy IK CLI and P6
+  comparison workflow.
+- Fixed duplicate display-label lookup so a unique clean label is not indexed
+  twice.
+
+Still pending:
+
+- Extract C3D point splitting and angle-channel filtering.
+- Extract unit conversion to millimetres/model units.
+- Extract rigid/Kabsch alignment helpers used by viewer and comparison scripts.
 
 Tests first:
 

@@ -24,27 +24,13 @@ from bvh_c3d_biobuddy_pyorerun_compare import (
     solve_inverse_kinematics_least_squares,
     split_c3d_points,
 )
+from mocap_labels import (
+    DEFAULT_MARKER_PREFIXES_TO_STRIP,
+    marker_name_index,
+    stripped_marker_label,
+)
 
 ANGLE_LABEL_REGEX = r"(?i)(^.*angles?$|^.*_angle[s]?$|angle)"
-DEFAULT_MARKER_PREFIXES_TO_STRIP = ("Skeleton_001_",)
-
-
-def stripped_marker_label(label: str, prefixes: tuple[str, ...]) -> str:
-    """Return ``label`` without the first matching acquisition prefix."""
-
-    for prefix in prefixes:
-        if prefix and label.startswith(prefix):
-            return label[len(prefix) :]
-    return label
-
-
-def marker_name_index(names: list[str]) -> dict[str, int]:
-    """Return unique marker names and drop duplicates from automatic matching."""
-
-    counts: dict[str, int] = {}
-    for name in names:
-        counts[name] = counts.get(name, 0) + 1
-    return {name: index for index, name in enumerate(names) if counts[name] == 1}
 
 
 def build_direct_marker_data(

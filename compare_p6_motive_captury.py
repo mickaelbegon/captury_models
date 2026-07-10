@@ -44,6 +44,12 @@ from compare_capture_systems import (
     load_landmark_map,
     unit_scale_to_mm,
 )
+from mocap_labels import (
+    display_marker_name,
+    is_joint_centre_marker_label,
+    marker_display_labels,
+    marker_indices_by_display_label,
+)
 from model_comparison_metrics import joint_center_error_xyz, waveform_metrics
 from run_biobuddy_c3d_ik import run_direct_biobuddy_ik
 
@@ -1790,22 +1796,11 @@ def read_c3d_points_mm(
 
 
 def clean_marker_label(label: str) -> str:
-    return label.replace("Skeleton_001_", "").strip()
+    return display_marker_name(label)
 
 
 def marker_indices_by_clean_label(labels: list[str]) -> dict[str, list[int]]:
-    lookup: dict[str, list[int]] = {}
-    clean_labels = [clean_marker_label(label) for label in labels]
-    totals: dict[str, int] = {}
-    for label in clean_labels:
-        totals[label] = totals.get(label, 0) + 1
-    seen: dict[str, int] = {}
-    for i, label in enumerate(clean_labels):
-        seen[label] = seen.get(label, 0) + 1
-        lookup.setdefault(label, []).append(i)
-        if totals[label] > 1:
-            lookup.setdefault(f"{label}#{seen[label]}", []).append(i)
-    return lookup
+    return marker_indices_by_display_label(labels)
 
 
 def average_marker_group(
@@ -2327,21 +2322,11 @@ def run_biobuddy_ik_for_trial(
 
 
 def is_synthetic_joint_centre_label(label: str) -> bool:
-    clean = clean_marker_label(label).upper()
-    return clean.startswith(("CAPJC_", "MOTJC_", "BVHJC_", "FBXJC_"))
+    return is_joint_centre_marker_label(label)
 
 
 def unique_marker_labels(labels: list[str]) -> list[str]:
-    clean_labels = [clean_marker_label(label) for label in labels]
-    totals: dict[str, int] = {}
-    for label in clean_labels:
-        totals[label] = totals.get(label, 0) + 1
-    seen: dict[str, int] = {}
-    unique: list[str] = []
-    for label in clean_labels:
-        seen[label] = seen.get(label, 0) + 1
-        unique.append(f"{label}#{seen[label]}" if totals[label] > 1 else label)
-    return unique
+    return marker_display_labels(labels)
 
 
 def proposal_candidate_indices(labels: list[str]) -> list[int]:

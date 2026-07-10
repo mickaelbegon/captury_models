@@ -21,6 +21,12 @@ from c3d_trial_viewer import (
     rotation_matrix_from_drag,
 )
 from compare_capture_systems import DEFAULT_LANDMARK_MAP
+from mocap_labels import (
+    display_marker_name,
+    is_joint_centre_marker_label,
+    marker_display_labels,
+    marker_indices_by_display_label,
+)
 
 VIEWER_MARKER_COLOR = "#38bdf8"
 VIEWER_SELECTED_OUTLINE_COLOR = "#111827"
@@ -128,42 +134,6 @@ def local_chain_axes(
     return {"X": x_axis, "Y": y_axis, "Z": z_axis}
 
 
-def display_marker_name(label: str) -> str:
-    return str(label).replace("Skeleton_001_", "").strip()
-
-
-def is_joint_centre_marker_label(label: str) -> bool:
-    """Return True for synthetic joint-centre point labels, not skin markers."""
-
-    clean_label = display_marker_name(label).upper()
-    return clean_label.startswith(("CAPJC_", "MOTJC_", "BVHJC_", "FBXJC_"))
-
-
-def marker_display_labels(labels: Iterable[str]) -> list[str]:
-    """Return unique GUI labels while preserving the C3D marker order.
-
-    Some Captury exports contain several POINT entries with the same label.  A
-    plain listbox would collapse these names conceptually, making it impossible
-    to map a specific duplicate marker to a Motive marker.  Duplicated display
-    names are therefore numbered as ``Name#1``, ``Name#2``; unique names are
-    left unchanged.
-    """
-
-    base_labels = [display_marker_name(str(label)) for label in labels]
-    totals: dict[str, int] = {}
-    for base_label in base_labels:
-        totals[base_label] = totals.get(base_label, 0) + 1
-    seen: dict[str, int] = {}
-    display_labels: list[str] = []
-    for base_label in base_labels:
-        seen[base_label] = seen.get(base_label, 0) + 1
-        if totals[base_label] > 1:
-            display_labels.append(f"{base_label}#{seen[base_label]}")
-        else:
-            display_labels.append(base_label)
-    return display_labels
-
-
 def data_source_color(source: str) -> str:
     key = str(source).strip().lower()
     if key in {"bio_buddy", "biorbd"}:
@@ -224,15 +194,6 @@ def captury_marker_transform_from_report(
                     translation @ model_rotation + model_translation,
                 )
     return rotation, translation
-
-
-def marker_indices_by_display_label(labels: list[str]) -> dict[str, list[int]]:
-    lookup: dict[str, list[int]] = {}
-    unique_labels = marker_display_labels(labels)
-    for index, (label, unique_label) in enumerate(zip(labels, unique_labels)):
-        lookup.setdefault(display_marker_name(label), []).append(index)
-        lookup.setdefault(unique_label, []).append(index)
-    return lookup
 
 
 def average_marker_group(points: np.ndarray, indices: list[int]) -> np.ndarray | None:
