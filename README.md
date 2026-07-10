@@ -15,7 +15,9 @@ Small workspace for comparing Captury BVH/FBX skeleton exports with C3D marker d
 - `compare_p6_motive_captury.py`: Captury/Motive model-centre comparison and C3D enrichment workflow for the `captury/` + `squelettes/` trial layout.
 - `model_comparison_metrics.py`: agreement metrics used by the comparison script.
 - `motive_captury_landmark_map.json`: editable Motive/Captury anatomical landmark correspondence map.
+- `plot_c3d_initial_offset.py`: independent Motive/Captury C3D marker-cloud diagnostic for inspecting raw offsets before model registration.
 - `plot_bvh_c3d_angle_comparisons.py`: optional plotting helper for BVH q versus C3D angle channels.
+- `docs/refactor_roadmap.md`: staged refactor plan with the test-first and agent-validation rule for each phase.
 - `environment_bvh_c3d_biobuddy.yml`: conda environment definition.
 - `data/unknown.bvh`, `data/unknown.fbx`, `data/unknown.c3d`: expected local Captury input files. They are ignored by git because they are data files.
 
@@ -254,6 +256,35 @@ The selected policy is written to:
 - `out_p6_motive_captury_comparison/<trial>/<system>/<source>/<system>_<source>_root_translation_policy.json`
 
 Use `--root-offset-mode subtract` or `--root-offset-mode keep` to force either convention. In the GUI this is the `Offset racine` selector with explicit labels: choose the best C3D overlay automatically, subtract the static root offset, or keep the file root translations. The automatic mode is preferred for debugging because it documents both scores instead of silently assuming one convention.
+
+`plot_c3d_initial_offset.py` is a separate raw-C3D diagnostic and does not use
+`--root-offset-mode`. It treats Motive and Captury independently so that offsets
+and axis hypotheses can be tested without hiding where a discrepancy comes from.
+The operation order is explicit: optional source root-translation subtraction
+first, then optional source axis transform. For the current P6 raw Captury C3D
+marker cloud, do not subtract the FBX/BVH root offset; test the vertical
+conversion with Captury `R(x,+90 deg)` only:
+
+```bash
+MPLCONFIGDIR=/tmp/mplconfig python plot_c3d_initial_offset.py \
+  --captury-transform rx_plus_90 \
+  --output out_c3d_initial_offset/static_initial_offset_captury_rx_plus_90.png
+```
+
+When you need to test an offset on Motive only, keep it source-specific:
+
+```bash
+MPLCONFIGDIR=/tmp/mplconfig python plot_c3d_initial_offset.py \
+  --motive-subtract-root-offset \
+  --motive-root-offset-mm X_MM Y_MM Z_MM \
+  --captury-transform rx_plus_90 \
+  --output out_c3d_initial_offset/static_initial_offset_motive_offset_test.png
+```
+
+The symmetrical options are `--motive-transform`, `--captury-transform`,
+`--motive-subtract-root-offset` and `--captury-subtract-root-offset`. The hidden
+legacy `--subtract-root-offsets` flag still enables both subtractions for old
+commands, but new debugging commands should use the per-source flags.
 
 ## Generalized Coordinate Units
 

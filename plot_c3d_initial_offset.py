@@ -1,11 +1,19 @@
 #!/usr/bin/env python3
-"""Plot raw Motive and Captury C3D marker clouds to inspect initial offsets.
+"""Plot Motive and Captury C3D marker clouds to inspect initial offsets.
 
 The script intentionally does not perform anatomical registration, yaw correction,
-root-offset correction, or model-based alignment.  It only reads marker points from
-two C3D files, converts them to millimetres through the existing C3D loader, removes
-C3D angle channels from the marker cloud, and overlays the two raw point clouds for
-one frame or a short median window.
+or model-based alignment.  It reads marker points from two C3D files, converts them
+to millimetres through the existing C3D loader, removes C3D angle channels from the
+marker cloud, and overlays the two point clouds for one frame or a short median
+window.
+
+Each source can be prepared independently.  Optional root-translation offsets are
+subtracted in the original C3D/source coordinate system first, then any diagnostic
+axis transform is applied.  This order mirrors the model pipeline question being
+debugged: root translations are interpreted before expressing the data in the
+comparison frame.  For raw Captury C3D markers, the default root offset is zero and
+the subtraction flag is off because the FBX/BVH static root offset belongs to q
+interpretation rather than to marker coordinates.
 """
 
 from __future__ import annotations
@@ -24,8 +32,27 @@ DEFAULT_DATA_ROOT = PROJECT_DIR / "local_trials" / "2026-06-30_P6_flat"
 DEFAULT_MOTIVE_C3D = DEFAULT_DATA_ROOT / "Motive" / "P6_Static.c3d"
 DEFAULT_CAPTURY_C3D = DEFAULT_DATA_ROOT / "Captury" / "Static_P6.c3d"
 DEFAULT_OUTPUT = PROJECT_DIR / "out_c3d_initial_offset" / "static_initial_offset.png"
+DEFAULT_MOTIVE_ROOT_OFFSET_MM = (0.0, 0.0, 0.0)
+DEFAULT_CAPTURY_ROOT_OFFSET_MM = (0.0, 0.0, 0.0)
 
 SOURCE_COLORS = {"Motive": "#0ea5e9", "Captury": "#f97316"}
+POINT_TRANSFORM_CHOICES = ("none", "rx_plus_90")
+CAPTURY_TRANSFORM_CHOICES = POINT_TRANSFORM_CHOICES
+
+
+@dataclass(frozen=True)
+class SourcePreparationConfig:
+    """Preparation options applied independently to one C3D source.
+
+    ``root_offset_mm`` is expressed in the source C3D coordinate system.  When
+    ``subtract_root_offset`` is true, it is subtracted before applying
+    ``transform``.  ``transform`` is an active diagnostic rotation used to express
+    one source in a candidate comparison frame.
+    """
+
+    root_offset_mm: np.ndarray
+    subtract_root_offset: bool = False
+    transform: str = "none"
 
 
 @dataclass(frozen=True)
@@ -66,6 +93,84 @@ def representative_points(points: np.ndarray, start: int, stop: int) -> np.ndarr
         return np.nanmedian(window, axis=2).T
 
 
+def rotation_x_degrees(angle_degrees: float) -> np.ndarray:
+    """Return an active 3D rotation matrix around the X axis."""
+
+    angle = np.deg2rad(float(angle_degrees))
+    cosine = float(np.cos(angle))
+    sine = float(np.sin(angle))
+    return np.asarray(
+        [
+            [1.0, 0.0, 0.0],
+            [0.0, cosine, -sine],
+            [0.0, sine, cosine],
+        ],
+        dtype=float,
+    )
+
+
+def apply_point_transform(points: np.ndarray, rotation: np.ndarray) -> np.ndarray:
+    """Apply a 3D rotation to C3D points stored as ``(3, n_markers, n_frames)``."""
+
+    return np.einsum("ij,jkf->ikf", rotation, points)
+
+
+def subtract_root_offset(points: np.ndarray, root_offset_mm: np.ndarray) -> np.ndarray:
+    """Subtract a root offset from C3D points before axis conversion."""
+
+    offset = np.asarray(root_offset_mm, dtype=float).reshape(3, 1, 1)
+    return np.asarray(points, dtype=float) - offset
+
+
+def transform_points(points: np.ndarray, mode: str) -> np.ndarray:
+    """Apply an optional diagnostic point transform."""
+
+    if mode == "none":
+        return points.copy()
+    if mode == "rx_plus_90":
+        return apply_point_transform(points, rotation_x_degrees(90.0))
+    raise ValueError(
+        f"Unsupported point transform {mode!r}. Expected one of {POINT_TRANSFORM_CHOICES}."
+    )
+
+
+def prepare_source_points(
+    points: np.ndarray,
+    config: SourcePreparationConfig,
+) -> np.ndarray:
+    """Apply one source's diagnostic preparation in pipeline order."""
+
+    prepared = np.asarray(points, dtype=float)
+    if config.subtract_root_offset:
+        prepared = subtract_root_offset(prepared, config.root_offset_mm)
+    return transform_points(prepared, config.transform)
+
+
+def transform_captury_points(points: np.ndarray, mode: str) -> np.ndarray:
+    """Backward-compatible wrapper for older tests/imports."""
+
+    return transform_points(points, mode)
+
+
+def prepare_c3d_points_for_offset_test(
+    points: np.ndarray,
+    *,
+    root_offset_mm: np.ndarray,
+    subtract_offset: bool,
+    captury_transform: str = "none",
+) -> np.ndarray:
+    """Backward-compatible wrapper using Captury-named transform arguments."""
+
+    return prepare_source_points(
+        points,
+        SourcePreparationConfig(
+            root_offset_mm=np.asarray(root_offset_mm, dtype=float),
+            subtract_root_offset=subtract_offset,
+            transform=captury_transform,
+        ),
+    )
+
+
 def finite_marker_points(points: np.ndarray) -> np.ndarray:
     """Keep markers whose XYZ coordinates are finite."""
 
@@ -83,14 +188,57 @@ def centroid(points: np.ndarray) -> np.ndarray:
 
 
 def offset_summary(
-    motive: C3DMarkerData, captury: C3DMarkerData, frame: int, window: int
+    motive: C3DMarkerData,
+    captury: C3DMarkerData,
+    frame: int,
+    window: int,
+    *,
+    motive_transform: str = "none",
+    captury_transform: str = "none",
+    subtract_root_offsets: bool = False,
+    motive_subtract_root_offset: bool | None = None,
+    captury_subtract_root_offset: bool | None = None,
+    motive_root_offset_mm: np.ndarray | None = None,
+    captury_root_offset_mm: np.ndarray | None = None,
 ) -> OffsetSummary:
     """Compute raw centroid offset for the same frame index in two C3D files."""
 
     n_frames = min(motive.n_frames, captury.n_frames)
     start, stop = selected_frame_window(n_frames, frame, window)
-    motive_points = representative_points(motive.points, start, stop)
-    captury_points = representative_points(captury.points, start, stop)
+    if motive_subtract_root_offset is None:
+        motive_subtract_root_offset = subtract_root_offsets
+    if captury_subtract_root_offset is None:
+        captury_subtract_root_offset = subtract_root_offsets
+    motive_prepared = prepare_source_points(
+        motive.points,
+        SourcePreparationConfig(
+            root_offset_mm=(
+                np.zeros(3)
+                if motive_root_offset_mm is None
+                else np.asarray(motive_root_offset_mm, dtype=float)
+            ),
+            subtract_root_offset=motive_subtract_root_offset,
+            transform=motive_transform,
+        ),
+    )
+    captury_prepared = prepare_source_points(
+        captury.points,
+        SourcePreparationConfig(
+            root_offset_mm=(
+                np.zeros(3)
+                if captury_root_offset_mm is None
+                else np.asarray(captury_root_offset_mm, dtype=float)
+            ),
+            subtract_root_offset=captury_subtract_root_offset,
+            transform=captury_transform,
+        ),
+    )
+    motive_points = representative_points(motive_prepared, start, stop)
+    captury_points = representative_points(
+        captury_prepared,
+        start,
+        stop,
+    )
     motive_centroid = centroid(motive_points)
     captury_centroid = centroid(captury_points)
     delta = captury_centroid - motive_centroid
@@ -141,6 +289,12 @@ def plot_clouds(
     captury_path: Path,
     output: Path | None,
     show: bool,
+    motive_transform: str = "none",
+    captury_transform: str = "none",
+    motive_subtract_root_offset: bool = False,
+    captury_subtract_root_offset: bool = False,
+    motive_root_offset_mm: np.ndarray | None = None,
+    captury_root_offset_mm: np.ndarray | None = None,
 ) -> None:
     all_points = np.vstack(
         [finite_marker_points(motive_points), finite_marker_points(captury_points)]
@@ -217,6 +371,12 @@ def plot_clouds(
     text = (
         f"Motive: {motive_path}\n"
         f"Captury: {captury_path}\n"
+        f"Transforms: Motive={motive_transform}, Captury={captury_transform}\n"
+        f"Offsets racine soustraits avant rotation: "
+        f"Motive={motive_subtract_root_offset} "
+        f"{np.asarray(motive_root_offset_mm if motive_root_offset_mm is not None else np.zeros(3)).tolist()}, "
+        f"Captury={captury_subtract_root_offset} "
+        f"{np.asarray(captury_root_offset_mm if captury_root_offset_mm is not None else np.zeros(3)).tolist()}\n"
         f"Frames utilisées: {summary.frame_start + 1}-{summary.frame_stop}\n"
         f"Delta centroïdes Captury - Motive (mm): "
         f"X={delta[0]:.1f}, Y={delta[1]:.1f}, Z={delta[2]:.1f}; "
@@ -257,9 +417,21 @@ def print_summary(summary: OffsetSummary) -> None:
     )
 
 
+def effective_root_offset_subtractions(args: argparse.Namespace) -> tuple[bool, bool]:
+    """Return effective Motive/Captury root-offset flags from parsed CLI args."""
+
+    legacy_global_flag = bool(getattr(args, "legacy_subtract_root_offsets", False))
+    return (
+        bool(getattr(args, "motive_subtract_root_offset", False) or legacy_global_flag),
+        bool(
+            getattr(args, "captury_subtract_root_offset", False) or legacy_global_flag
+        ),
+    )
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Plot raw Motive and Captury C3D marker clouds to inspect an initial offset."
+        description="Plot Motive and Captury C3D marker clouds with independent source preparation to inspect an initial offset."
     )
     parser.add_argument("--motive-c3d", type=Path, default=DEFAULT_MOTIVE_C3D)
     parser.add_argument("--captury-c3d", type=Path, default=DEFAULT_CAPTURY_C3D)
@@ -274,6 +446,68 @@ def parse_args() -> argparse.Namespace:
         "--angle-label-regex",
         default=ANGLE_LABEL_REGEX,
         help="Regex used to exclude C3D angle channels from marker clouds.",
+    )
+    parser.add_argument(
+        "--motive-transform",
+        choices=POINT_TRANSFORM_CHOICES,
+        default="none",
+        help=(
+            "Optional Motive diagnostic transform before computing the offset. "
+            "The root offset, when enabled, is subtracted before this transform."
+        ),
+    )
+    parser.add_argument(
+        "--captury-transform",
+        choices=POINT_TRANSFORM_CHOICES,
+        default="none",
+        help=(
+            "Optional Captury diagnostic transform before computing the offset. "
+            "Use rx_plus_90 to apply active R(x, +90 deg) after any enabled "
+            "Captury root-offset subtraction."
+        ),
+    )
+    parser.add_argument(
+        "--motive-subtract-root-offset",
+        action="store_true",
+        help=(
+            "Subtract --motive-root-offset-mm from Motive C3D markers before any "
+            "Motive transform."
+        ),
+    )
+    parser.add_argument(
+        "--captury-subtract-root-offset",
+        action="store_true",
+        help=(
+            "Subtract --captury-root-offset-mm from Captury C3D markers before any "
+            "Captury transform. Keep this disabled for raw Captury C3D marker "
+            "diagnostics unless you are explicitly testing a marker-space offset."
+        ),
+    )
+    parser.add_argument(
+        "--subtract-root-offsets",
+        action="store_true",
+        dest="legacy_subtract_root_offsets",
+        help=argparse.SUPPRESS,
+    )
+    parser.add_argument(
+        "--motive-root-offset-mm",
+        nargs=3,
+        type=float,
+        default=DEFAULT_MOTIVE_ROOT_OFFSET_MM,
+        metavar=("X", "Y", "Z"),
+        help="Motive root offset to subtract before transforms, in millimetres.",
+    )
+    parser.add_argument(
+        "--captury-root-offset-mm",
+        nargs=3,
+        type=float,
+        default=DEFAULT_CAPTURY_ROOT_OFFSET_MM,
+        metavar=("X", "Y", "Z"),
+        help=(
+            "Captury root offset to subtract before transforms, in millimetres. "
+            "Default is zero because raw Captury C3D markers should not receive "
+            "the FBX/BVH root offset correction."
+        ),
     )
     parser.add_argument("--output", type=Path, default=DEFAULT_OUTPUT)
     parser.add_argument("--show", action="store_true", help="Open a matplotlib window.")
@@ -290,9 +524,52 @@ def main() -> None:
     )
     n_frames = min(motive.n_frames, captury.n_frames)
     start, stop = selected_frame_window(n_frames, args.frame, args.window)
-    motive_points = representative_points(motive.points, start, stop)
-    captury_points = representative_points(captury.points, start, stop)
-    summary = offset_summary(motive, captury, args.frame, args.window)
+    motive_root_offset = np.asarray(args.motive_root_offset_mm, dtype=float)
+    captury_root_offset = np.asarray(args.captury_root_offset_mm, dtype=float)
+    (
+        motive_subtract_root_offset,
+        captury_subtract_root_offset,
+    ) = effective_root_offset_subtractions(args)
+    motive_prepared_points = prepare_source_points(
+        motive.points,
+        SourcePreparationConfig(
+            root_offset_mm=motive_root_offset,
+            subtract_root_offset=motive_subtract_root_offset,
+            transform=args.motive_transform,
+        ),
+    )
+    transformed_captury_points = prepare_source_points(
+        captury.points,
+        SourcePreparationConfig(
+            root_offset_mm=captury_root_offset,
+            subtract_root_offset=captury_subtract_root_offset,
+            transform=args.captury_transform,
+        ),
+    )
+    motive_points = representative_points(motive_prepared_points, start, stop)
+    captury_points = representative_points(transformed_captury_points, start, stop)
+    summary = offset_summary(
+        motive,
+        captury,
+        args.frame,
+        args.window,
+        motive_transform=args.motive_transform,
+        captury_transform=args.captury_transform,
+        motive_subtract_root_offset=motive_subtract_root_offset,
+        captury_subtract_root_offset=captury_subtract_root_offset,
+        motive_root_offset_mm=motive_root_offset,
+        captury_root_offset_mm=captury_root_offset,
+    )
+    if motive_subtract_root_offset or captury_subtract_root_offset:
+        print(
+            "Offsets racine soustraits avant rotation: "
+            f"Motive={motive_subtract_root_offset} {motive_root_offset.tolist()}, "
+            f"Captury={captury_subtract_root_offset} {captury_root_offset.tolist()}"
+        )
+    if args.motive_transform != "none":
+        print(f"Transformation Motive appliquée: {args.motive_transform}")
+    if args.captury_transform != "none":
+        print(f"Transformation Captury appliquée: {args.captury_transform}")
     print_summary(summary)
     plot_clouds(
         motive_points,
@@ -302,6 +579,12 @@ def main() -> None:
         args.captury_c3d,
         args.output,
         args.show,
+        args.motive_transform,
+        args.captury_transform,
+        motive_subtract_root_offset,
+        captury_subtract_root_offset,
+        motive_root_offset,
+        captury_root_offset,
     )
     if args.output is not None:
         print(f"Figure écrite: {args.output}")
