@@ -25,6 +25,13 @@ from pathlib import Path
 import matplotlib.pyplot as plt
 import numpy as np
 
+from c3d_source_preparation import (
+    POINT_TRANSFORM_CHOICES,
+    SourcePreparationConfig,
+    prepare_source_points,
+    source_preparation_configs_from_args,
+    transform_points,
+)
 from c3d_trial_viewer import ANGLE_LABEL_REGEX, C3DMarkerData, load_c3d_marker_data
 
 PROJECT_DIR = Path(__file__).resolve().parent
@@ -36,23 +43,6 @@ DEFAULT_MOTIVE_ROOT_OFFSET_MM = (0.0, 0.0, 0.0)
 DEFAULT_CAPTURY_ROOT_OFFSET_MM = (0.0, 0.0, 0.0)
 
 SOURCE_COLORS = {"Motive": "#0ea5e9", "Captury": "#f97316"}
-POINT_TRANSFORM_CHOICES = ("none", "rx_plus_90")
-CAPTURY_TRANSFORM_CHOICES = POINT_TRANSFORM_CHOICES
-
-
-@dataclass(frozen=True)
-class SourcePreparationConfig:
-    """Preparation options applied independently to one C3D source.
-
-    ``root_offset_mm`` is expressed in the source C3D coordinate system.  When
-    ``subtract_root_offset`` is true, it is subtracted before applying
-    ``transform``.  ``transform`` is an active diagnostic rotation used to express
-    one source in a candidate comparison frame.
-    """
-
-    root_offset_mm: np.ndarray
-    subtract_root_offset: bool = False
-    transform: str = "none"
 
 
 @dataclass(frozen=True)
@@ -91,59 +81,6 @@ def representative_points(points: np.ndarray, start: int, stop: int) -> np.ndarr
         return window[:, :, 0].T
     with np.errstate(all="ignore"):
         return np.nanmedian(window, axis=2).T
-
-
-def rotation_x_degrees(angle_degrees: float) -> np.ndarray:
-    """Return an active 3D rotation matrix around the X axis."""
-
-    angle = np.deg2rad(float(angle_degrees))
-    cosine = float(np.cos(angle))
-    sine = float(np.sin(angle))
-    return np.asarray(
-        [
-            [1.0, 0.0, 0.0],
-            [0.0, cosine, -sine],
-            [0.0, sine, cosine],
-        ],
-        dtype=float,
-    )
-
-
-def apply_point_transform(points: np.ndarray, rotation: np.ndarray) -> np.ndarray:
-    """Apply a 3D rotation to C3D points stored as ``(3, n_markers, n_frames)``."""
-
-    return np.einsum("ij,jkf->ikf", rotation, points)
-
-
-def subtract_root_offset(points: np.ndarray, root_offset_mm: np.ndarray) -> np.ndarray:
-    """Subtract a root offset from C3D points before axis conversion."""
-
-    offset = np.asarray(root_offset_mm, dtype=float).reshape(3, 1, 1)
-    return np.asarray(points, dtype=float) - offset
-
-
-def transform_points(points: np.ndarray, mode: str) -> np.ndarray:
-    """Apply an optional diagnostic point transform."""
-
-    if mode == "none":
-        return points.copy()
-    if mode == "rx_plus_90":
-        return apply_point_transform(points, rotation_x_degrees(90.0))
-    raise ValueError(
-        f"Unsupported point transform {mode!r}. Expected one of {POINT_TRANSFORM_CHOICES}."
-    )
-
-
-def prepare_source_points(
-    points: np.ndarray,
-    config: SourcePreparationConfig,
-) -> np.ndarray:
-    """Apply one source's diagnostic preparation in pipeline order."""
-
-    prepared = np.asarray(points, dtype=float)
-    if config.subtract_root_offset:
-        prepared = subtract_root_offset(prepared, config.root_offset_mm)
-    return transform_points(prepared, config.transform)
 
 
 def transform_captury_points(points: np.ndarray, mode: str) -> np.ndarray:
@@ -417,18 +354,6 @@ def print_summary(summary: OffsetSummary) -> None:
     )
 
 
-def effective_root_offset_subtractions(args: argparse.Namespace) -> tuple[bool, bool]:
-    """Return effective Motive/Captury root-offset flags from parsed CLI args."""
-
-    legacy_global_flag = bool(getattr(args, "legacy_subtract_root_offsets", False))
-    return (
-        bool(getattr(args, "motive_subtract_root_offset", False) or legacy_global_flag),
-        bool(
-            getattr(args, "captury_subtract_root_offset", False) or legacy_global_flag
-        ),
-    )
-
-
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Plot Motive and Captury C3D marker clouds with independent source preparation to inspect an initial offset."
@@ -524,28 +449,9 @@ def main() -> None:
     )
     n_frames = min(motive.n_frames, captury.n_frames)
     start, stop = selected_frame_window(n_frames, args.frame, args.window)
-    motive_root_offset = np.asarray(args.motive_root_offset_mm, dtype=float)
-    captury_root_offset = np.asarray(args.captury_root_offset_mm, dtype=float)
-    (
-        motive_subtract_root_offset,
-        captury_subtract_root_offset,
-    ) = effective_root_offset_subtractions(args)
-    motive_prepared_points = prepare_source_points(
-        motive.points,
-        SourcePreparationConfig(
-            root_offset_mm=motive_root_offset,
-            subtract_root_offset=motive_subtract_root_offset,
-            transform=args.motive_transform,
-        ),
-    )
-    transformed_captury_points = prepare_source_points(
-        captury.points,
-        SourcePreparationConfig(
-            root_offset_mm=captury_root_offset,
-            subtract_root_offset=captury_subtract_root_offset,
-            transform=args.captury_transform,
-        ),
-    )
+    motive_config, captury_config = source_preparation_configs_from_args(args)
+    motive_prepared_points = prepare_source_points(motive.points, motive_config)
+    transformed_captury_points = prepare_source_points(captury.points, captury_config)
     motive_points = representative_points(motive_prepared_points, start, stop)
     captury_points = representative_points(transformed_captury_points, start, stop)
     summary = offset_summary(
@@ -553,23 +459,23 @@ def main() -> None:
         captury,
         args.frame,
         args.window,
-        motive_transform=args.motive_transform,
-        captury_transform=args.captury_transform,
-        motive_subtract_root_offset=motive_subtract_root_offset,
-        captury_subtract_root_offset=captury_subtract_root_offset,
-        motive_root_offset_mm=motive_root_offset,
-        captury_root_offset_mm=captury_root_offset,
+        motive_transform=motive_config.transform,
+        captury_transform=captury_config.transform,
+        motive_subtract_root_offset=motive_config.subtract_root_offset,
+        captury_subtract_root_offset=captury_config.subtract_root_offset,
+        motive_root_offset_mm=motive_config.root_offset_mm,
+        captury_root_offset_mm=captury_config.root_offset_mm,
     )
-    if motive_subtract_root_offset or captury_subtract_root_offset:
+    if motive_config.subtract_root_offset or captury_config.subtract_root_offset:
         print(
             "Offsets racine soustraits avant rotation: "
-            f"Motive={motive_subtract_root_offset} {motive_root_offset.tolist()}, "
-            f"Captury={captury_subtract_root_offset} {captury_root_offset.tolist()}"
+            f"Motive={motive_config.subtract_root_offset} {motive_config.root_offset_mm.tolist()}, "
+            f"Captury={captury_config.subtract_root_offset} {captury_config.root_offset_mm.tolist()}"
         )
-    if args.motive_transform != "none":
-        print(f"Transformation Motive appliquée: {args.motive_transform}")
-    if args.captury_transform != "none":
-        print(f"Transformation Captury appliquée: {args.captury_transform}")
+    if motive_config.transform != "none":
+        print(f"Transformation Motive appliquée: {motive_config.transform}")
+    if captury_config.transform != "none":
+        print(f"Transformation Captury appliquée: {captury_config.transform}")
     print_summary(summary)
     plot_clouds(
         motive_points,
@@ -579,12 +485,12 @@ def main() -> None:
         args.captury_c3d,
         args.output,
         args.show,
-        args.motive_transform,
-        args.captury_transform,
-        motive_subtract_root_offset,
-        captury_subtract_root_offset,
-        motive_root_offset,
-        captury_root_offset,
+        motive_config.transform,
+        captury_config.transform,
+        motive_config.subtract_root_offset,
+        captury_config.subtract_root_offset,
+        motive_config.root_offset_mm,
+        captury_config.root_offset_mm,
     )
     if args.output is not None:
         print(f"Figure écrite: {args.output}")
