@@ -68,24 +68,12 @@ from typing import Any, Iterable
 
 import numpy as np
 
+from c3d_point_channels import (
+    DEFAULT_C3D_ANGLE_LABELS,
+    angle_labels_from_c3d_parameters,
+    classify_c3d_point_channels,
+)
 from mocap_units import point_unit_scale_to_m
-
-# These labels are Captury angle channels, not marker trajectories. Keeping this
-# list close to the top makes the filtering rule easy to find and edit.
-DEFAULT_C3D_ANGLE_LABELS = {
-    "RHip",
-    "LHip",
-    "RKne",
-    "LKne",
-    "RAnk",
-    "LAnk",
-    "RSho",
-    "LSho",
-    "RElb",
-    "LElb",
-    "RWri",
-    "LWri",
-}
 
 DEFAULT_RERUN_MARKER_RADIUS_NATIVE = 15.0
 DEFAULT_RERUN_WAIT_SECONDS = 2.0
@@ -1424,13 +1412,13 @@ class C3dSplitData:
 
 
 def get_angle_label_set_from_c3d_parameters(c3d: dict) -> set[str]:
-    candidates: set[str] = set()
-    for param_name in ("ANGLES", "ANGLE_LABELS"):
-        for label in as_str_list(get_c3d_param(c3d, "POINT", param_name, [])):
-            if label:
-                candidates.add(label)
-                candidates.add(label.replace(" ", ""))
-    return candidates
+    """Return explicit angle labels from C3D POINT parameters.
+
+    This compatibility wrapper keeps external callers of the historical module
+    working while the point-channel contract lives in ``c3d_point_channels``.
+    """
+
+    return angle_labels_from_c3d_parameters(c3d)
 
 
 def split_c3d_points(
@@ -1441,10 +1429,12 @@ def split_c3d_points(
 ) -> C3dSplitData:
     ezc3d = require_ezc3d()
     c3d = ezc3d.c3d(str(c3d_path))
-    labels = as_str_list(get_c3d_param(c3d, "POINT", "LABELS", []))
-    descriptions = as_str_list(get_c3d_param(c3d, "POINT", "DESCRIPTIONS", []))
-    if len(descriptions) < len(labels):
-        descriptions += [""] * (len(labels) - len(descriptions))
+    classification = classify_c3d_point_channels(
+        c3d,
+        angle_label_regex=angle_label_regex,
+        extra_angle_labels=extra_angle_labels,
+    )
+    labels = classification.labels
 
     # ezc3d stores point data as 4 x n_points x n_frames. Rows 0, 1 and 2 are
     # X/Y/Z. Row 3 is a residual/confidence value, so it is not a coordinate.
@@ -1452,26 +1442,10 @@ def split_c3d_points(
     time = c3d_time_vector(c3d)
     c3d_unit_scale = c3d_point_unit_scale_to_m(c3d)
 
-    regex = re.compile(angle_label_regex) if angle_label_regex else None
-    c3d_angle_param_labels = get_angle_label_set_from_c3d_parameters(c3d)
-    extra_angle_label_set = DEFAULT_C3D_ANGLE_LABELS | {label.strip() for label in (extra_angle_labels or [])}
-
-    def is_angle_point(i: int) -> bool:
-        label = labels[i]
-        compact_label = label.replace(" ", "")
-        description = descriptions[i]
-        if label in c3d_angle_param_labels or compact_label in c3d_angle_param_labels:
-            return True
-        if label in extra_angle_label_set or compact_label in extra_angle_label_set:
-            return True
-        if regex is not None and (regex.search(label) or regex.search(description)):
-            return True
-        return False
-
-    angle_indices = [i for i in range(len(labels)) if is_angle_point(i)]
+    angle_indices = classification.angle_indices
     # Angles can live in the POINT section of a C3D, but they are not physical
     # markers. The rest of the script only animates and localizes marker_indices.
-    marker_indices = [i for i in range(len(labels)) if i not in set(angle_indices)]
+    marker_indices = classification.marker_indices
 
     marker_data_native = points[:, marker_indices, :]
     marker_data_bvh_units = marker_data_native * (c3d_unit_scale / bvh_unit_scale_to_m)

@@ -27,6 +27,8 @@ import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
 
+from c3d_point_channels import classify_c3d_point_channels
+
 
 AXIS_TO_INDEX = {"X": 0, "Y": 1, "Z": 2, "x": 0, "y": 1, "z": 2}
 
@@ -43,6 +45,7 @@ DEFAULT_C3D_ANGLE_LABELS = {
     "LElb",
     "RWri",
     "LWri",
+    "Neck",
 }
 
 
@@ -96,45 +99,21 @@ def interpolate_array(data: np.ndarray, source_time: np.ndarray, target_time: np
     return out.reshape((*data.shape[:-1], target_time.shape[0]))
 
 
-def get_angle_label_set_from_c3d_parameters(c3d: dict) -> set[str]:
-    candidates: set[str] = set()
-    for param_name in ("ANGLES", "ANGLE_LABELS"):
-        for label in as_str_list(get_c3d_param(c3d, "POINT", param_name, [])):
-            if label:
-                candidates.add(label)
-                candidates.add(label.replace(" ", ""))
-    return candidates
-
-
 def split_c3d_points(c3d_path: Path, angle_label_regex: str = r"Angles?$", extra_angle_labels: list[str] | None = None):
     ezc3d = require_ezc3d()
     c3d = ezc3d.c3d(str(c3d_path))
-    labels = as_str_list(get_c3d_param(c3d, "POINT", "LABELS", []))
-    descriptions = as_str_list(get_c3d_param(c3d, "POINT", "DESCRIPTIONS", []))
-    if len(descriptions) < len(labels):
-        descriptions += [""] * (len(labels) - len(descriptions))
+    classification = classify_c3d_point_channels(
+        c3d,
+        angle_label_regex=angle_label_regex,
+        extra_angle_labels=extra_angle_labels,
+        default_angle_labels=DEFAULT_C3D_ANGLE_LABELS,
+    )
 
     points = np.asarray(c3d["data"]["points"], dtype=float)[:3, :, :]
     time = c3d_time_vector(c3d)
-    regex = re.compile(angle_label_regex) if angle_label_regex else None
-    c3d_angle_param_labels = get_angle_label_set_from_c3d_parameters(c3d)
-    extra_angle_label_set = DEFAULT_C3D_ANGLE_LABELS | {label.strip() for label in (extra_angle_labels or [])}
-
-    def is_angle_point(i: int) -> bool:
-        label = labels[i]
-        compact_label = label.replace(" ", "")
-        description = descriptions[i]
-        if label in c3d_angle_param_labels or compact_label in c3d_angle_param_labels:
-            return True
-        if label in extra_angle_label_set or compact_label in extra_angle_label_set:
-            return True
-        if regex is not None and (regex.search(label) or regex.search(description)):
-            return True
-        return False
-
-    angle_indices = [i for i in range(len(labels)) if is_angle_point(i)]
+    angle_indices = classification.angle_indices
     angle_data = points[:, angle_indices, :]
-    angle_labels = [labels[i] for i in angle_indices]
+    angle_labels = classification.angle_labels
     angle_unit = as_str_list(get_c3d_param(c3d, "POINT", "ANGLE_UNITS", ["deg"]))
     angle_unit = angle_unit[0] if angle_unit else "deg"
     return time, angle_labels, angle_data, angle_unit

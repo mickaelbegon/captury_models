@@ -12,6 +12,10 @@ from typing import Any
 import numpy as np
 import pandas as pd
 
+from c3d_point_channels import (
+    classify_c3d_point_channels,
+    point_angle_tail_indices,
+)
 from mocap_units import point_unit_scale_to_mm
 from mocap_alignment import kabsch_rows
 from model_comparison_metrics import joint_center_error_xyz, waveform_metrics
@@ -174,16 +178,23 @@ def read_c3d(path: Path, angle_label_regex: str) -> C3dData:
 
 
 def detect_angle_indices(c3d: dict, labels: list[str], angle_label_regex: str) -> dict[str, int]:
+    """Return canonical angle-name to C3D point-index mappings.
+
+    The shared classifier keeps marker/angle treatment aligned with viewer and
+    IK paths while retaining this CLI's legacy POINT:ANGLES tail fallback.
+    """
+
     angle_indices: dict[str, int] = {}
-    regex = re.compile(angle_label_regex)
-    point_angles = as_str_list(get_c3d_param(c3d, "POINT", "ANGLES", []))
-    if point_angles and len(point_angles) <= len(labels):
-        start = len(labels) - len(point_angles)
-        for i, angle_name in enumerate(point_angles):
-            angle_indices[canonical_angle_name(angle_name)] = start + i
-    for i, label in enumerate(labels):
-        if label in DEFAULT_CAPTURY_ANGLE_LABELS or regex.search(label):
-            angle_indices.setdefault(canonical_angle_name(label), i)
+    classification = classify_c3d_point_channels(
+        c3d,
+        angle_label_regex=angle_label_regex,
+        default_angle_labels=DEFAULT_CAPTURY_ANGLE_LABELS,
+        point_angles_tail_fallback=True,
+    )
+    for angle_name, index in point_angle_tail_indices(c3d, len(labels)):
+        angle_indices.setdefault(canonical_angle_name(angle_name), index)
+    for index in classification.angle_indices:
+        angle_indices.setdefault(canonical_angle_name(classification.labels[index]), index)
     return angle_indices
 
 

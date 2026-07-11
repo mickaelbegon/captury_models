@@ -118,9 +118,14 @@ Completed in this phase:
 - Reused Kabsch/transform composition from the Tk viewer, P6 comparison and
   capture-system comparison.
 
-Still pending:
+Completed in this phase:
 
-- Extract C3D point splitting and angle-channel filtering.
+- Extracted C3D point-channel classification and angle filtering to
+  `c3d_point_channels.py`.
+- Reused that contract from the historical BVH/FBX pipeline, capture-system
+  comparison and angle-figure CLI.
+- Added synthetic C3D tests covering explicit angle metadata, known Captury
+  labels, extra labels and label/description regex matching.
 
 Tests first:
 
