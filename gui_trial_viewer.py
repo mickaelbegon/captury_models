@@ -84,6 +84,26 @@ COR_CHAIN_CANDIDATES = (
     ("RightLeg", "RightFoot"),
 )
 
+# BioBuddy Motive-57 has one Thorax segment and no separate neck/shoulder
+# segments.  Its normalized GUI headings therefore need their own compact
+# topology instead of the BVH Spine1..Spine4 chain.
+BIOBUDDY_COR_CHAIN_CANDIDATES = (
+    ("Hips", "Spine"),
+    ("Spine", "Head"),
+    ("Spine", "LeftArm"),
+    ("LeftArm", "LeftForeArm"),
+    ("LeftForeArm", "LeftHand"),
+    ("Spine", "RightArm"),
+    ("RightArm", "RightForeArm"),
+    ("RightForeArm", "RightHand"),
+    ("Hips", "LeftUpLeg"),
+    ("LeftUpLeg", "LeftLeg"),
+    ("LeftLeg", "LeftFoot"),
+    ("Hips", "RightUpLeg"),
+    ("RightUpLeg", "RightLeg"),
+    ("RightLeg", "RightFoot"),
+)
+
 
 def _unit_vector(vector: np.ndarray) -> np.ndarray | None:
     norm = float(np.linalg.norm(vector))
@@ -264,6 +284,15 @@ def joint_chain_edges(joints: Iterable[str]) -> list[tuple[str, str]]:
     ]
 
 
+def biobuddy_joint_chain_edges(joints: Iterable[str]) -> list[tuple[str, str]]:
+    available = set(joints)
+    return [
+        (proximal, distal)
+        for proximal, distal in BIOBUDDY_COR_CHAIN_CANDIDATES
+        if proximal in available and distal in available
+    ]
+
+
 def available_cor_layers(fieldnames: Iterable[str]) -> list[str]:
     names = set(fieldnames)
     layers: list[str] = []
@@ -277,6 +306,12 @@ def available_cor_layers(fieldnames: Iterable[str]) -> list[str]:
 class JointCentreChainData:
     layers: dict[str, dict[str, np.ndarray]]
     edges: list[tuple[str, str]]
+    edges_by_layer: dict[str, list[tuple[str, str]]] | None = None
+
+    def edges_for_layer(self, layer: str) -> list[tuple[str, str]]:
+        if self.edges_by_layer is not None and layer in self.edges_by_layer:
+            return self.edges_by_layer[layer]
+        return self.edges
 
     @property
     def n_frames(self) -> int:
@@ -331,8 +366,18 @@ def _load_joint_centre_chain_data_npz(path: Path) -> JointCentreChainData | None
     all_joints = {joint for joints in layer_arrays.values() for joint in joints}
     if not all_joints:
         return None
+    edges_by_layer = {
+        layer: (
+            biobuddy_joint_chain_edges(joints)
+            if layer == "biobuddy"
+            else joint_chain_edges(joints)
+        )
+        for layer, joints in layer_arrays.items()
+    }
     return JointCentreChainData(
-        layers=layer_arrays, edges=joint_chain_edges(all_joints)
+        layers=layer_arrays,
+        edges=joint_chain_edges(all_joints),
+        edges_by_layer=edges_by_layer,
     )
 
 
@@ -376,7 +421,17 @@ def _load_joint_centre_chain_data_csv(path: Path) -> JointCentreChainData | None
             layer_arrays[layer][joint] = np.vstack([point for _time, point in samples])
     all_joints = {joint for joints in layer_arrays.values() for joint in joints}
     edges = joint_chain_edges(all_joints)
-    return JointCentreChainData(layers=layer_arrays, edges=edges)
+    edges_by_layer = {
+        layer: (
+            biobuddy_joint_chain_edges(joints)
+            if layer == "biobuddy"
+            else joint_chain_edges(joints)
+        )
+        for layer, joints in layer_arrays.items()
+    }
+    return JointCentreChainData(
+        layers=layer_arrays, edges=edges, edges_by_layer=edges_by_layer
+    )
 
 
 class TkC3DTrialCanvas(tk.Canvas):
@@ -761,7 +816,9 @@ class TkC3DTrialCanvas(tk.Canvas):
                 continue
             color = COR_LAYER_COLORS.get(layer, "#111827")
             frame_points = self._chain_frame_points(joints)
-            self._draw_chain_edges(frame_points, color, center, scale, width, height)
+            self._draw_chain_edges(
+                layer, frame_points, color, center, scale, width, height
+            )
             self._draw_chain_points(frame_points, color, center, scale, width, height)
         if self.show_chain_axes:
             for layer in self._visible_chain_axis_layers():
@@ -804,6 +861,7 @@ class TkC3DTrialCanvas(tk.Canvas):
 
     def _draw_chain_edges(
         self,
+        layer: str,
         points: dict[str, np.ndarray],
         color: str,
         center: np.ndarray,
@@ -811,7 +869,7 @@ class TkC3DTrialCanvas(tk.Canvas):
         width: int,
         height: int,
     ) -> None:
-        edges = self.chain_data.edges if self.chain_data else ()
+        edges = self.chain_data.edges_for_layer(layer) if self.chain_data else ()
         for proximal, distal in edges:
             if proximal not in points or distal not in points:
                 continue
@@ -913,7 +971,9 @@ class TkC3DTrialCanvas(tk.Canvas):
     ) -> dict[str, np.ndarray] | None:
         if self.chain_data is None:
             return None
-        axes = local_chain_axes(joint, points, self.chain_data.edges)
+        axes = local_chain_axes(
+            joint, points, self.chain_data.edges_for_layer(layer)
+        )
         if axes is None:
             return None
         if self.rotate_body_segments_180_x and layer in {"captury", "motive"}:
