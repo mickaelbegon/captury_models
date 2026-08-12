@@ -10,10 +10,13 @@ try:
 
     from compare_p6_motive_captury import (
         TrialBundle,
+        comparison_input_files,
+        provenance_trials_with_static,
         captury_flat_trial_name,
         c3d_angle_scale_to_deg,
         centre_metric_rows,
         compose_row_alignment,
+        compute_model_segment_rotations_native,
         discover_flat_trials,
         dimension_rows_from_centres,
         euler_matrix_from_sequence,
@@ -30,6 +33,7 @@ try:
         required_trial_outputs,
         resolve_cut_window,
         rotation_deviation_vector,
+        rotations_to_c3d,
         rotate_segment_frames_180_x,
         root_alignment_score_mm,
         sanitize_channel_name,
@@ -41,10 +45,13 @@ try:
     )
 except ImportError as exc:  # pragma: no cover - depends on optional scientific env
     TrialBundle = None
+    comparison_input_files = None
+    provenance_trials_with_static = None
     captury_flat_trial_name = None
     c3d_angle_scale_to_deg = None
     centre_metric_rows = None
     compose_row_alignment = None
+    compute_model_segment_rotations_native = None
     discover_flat_trials = None
     dimension_rows_from_centres = None
     euler_matrix_from_sequence = None
@@ -61,6 +68,7 @@ except ImportError as exc:  # pragma: no cover - depends on optional scientific 
     required_trial_outputs = None
     resolve_cut_window = None
     rotation_deviation_vector = None
+    rotations_to_c3d = None
     rotate_segment_frames_180_x = None
     root_alignment_score_mm = None
     sanitize_channel_name = None
@@ -78,6 +86,75 @@ else:
     IMPORT_ERROR is not None, f"optional dependencies missing: {IMPORT_ERROR}"
 )
 class FlatTrialDiscoveryTests(unittest.TestCase):
+    def test_comparison_inputs_include_only_selected_model_files(self) -> None:
+        assert TrialBundle is not None
+        assert comparison_input_files is not None
+
+        bundle = TrialBundle(
+            name="Static",
+            captury_c3d=Path("captury.c3d"),
+            captury_bvh=Path("captury.bvh"),
+            captury_fbx=Path("captury.fbx"),
+            motive_c3d=Path("motive.c3d"),
+            motive_bvh=Path("motive.bvh"),
+            motive_fbx=Path("motive.fbx"),
+        )
+        args = argparse.Namespace(
+            model_source="fbx",
+            biobuddy_biomod=Path("model.bioMod"),
+            landmark_map=Path("markers.json"),
+            occlusions_only=False,
+        )
+
+        inputs = comparison_input_files([bundle], args)
+
+        self.assertEqual(
+            inputs,
+            {
+                "Static/captury/c3d": Path("captury.c3d"),
+                "Static/captury/fbx": Path("captury.fbx"),
+                "Static/motive/c3d": Path("motive.c3d"),
+                "Static/motive/fbx": Path("motive.fbx"),
+                "biobuddy/biomod": Path("model.bioMod"),
+                "markers/landmark_map": Path("markers.json"),
+            },
+        )
+
+    def test_provenance_includes_hidden_static_calibration_trial(self) -> None:
+        assert TrialBundle is not None
+        assert provenance_trials_with_static is not None
+
+        static = TrialBundle(
+            "Static",
+            Path("static_cap.c3d"),
+            Path("static_cap.bvh"),
+            None,
+            Path("static_mot.c3d"),
+            Path("static_mot.bvh"),
+            None,
+        )
+        walk = TrialBundle(
+            "Marche_001",
+            Path("walk_cap.c3d"),
+            Path("walk_cap.bvh"),
+            None,
+            Path("walk_mot.c3d"),
+            Path("walk_mot.bvh"),
+            None,
+        )
+
+        provenance_trials = provenance_trials_with_static(
+            [walk], [static, walk], "Static"
+        )
+
+        self.assertEqual(
+            [trial.name for trial in provenance_trials], ["Marche_001", "Static"]
+        )
+        self.assertEqual(
+            provenance_trials_with_static([static, walk], [static, walk], "Static"),
+            [static, walk],
+        )
+
     def test_flat_trial_names_strip_system_specific_suffixes(self) -> None:
         assert captury_flat_trial_name is not None
         assert motive_flat_trial_name is not None
@@ -105,6 +182,15 @@ class FlatTrialDiscoveryTests(unittest.TestCase):
         self.assertNotIn("joint_centre_timeseries.csv", outputs)
         self.assertNotIn("kinematics_q_timeseries.csv", outputs)
         self.assertNotIn("segment_rotation_timeseries.csv", outputs)
+
+        audit_outputs = [
+            str(path)
+            for path in required_trial_outputs(
+                Path("out"), "Static", include_rotation_audit=True
+            )
+        ]
+        self.assertIn("out/captury/bvh_fbx_rotation_audit.npz", audit_outputs)
+        self.assertIn("out/motive/bvh_fbx_rotation_audit.json", audit_outputs)
 
     def test_dimension_rows_from_centres_supports_biobuddy_source(self) -> None:
         assert dimension_rows_from_centres is not None
@@ -204,6 +290,113 @@ class FlatTrialDiscoveryTests(unittest.TestCase):
         vector = rotation_deviation_vector(np.eye(3), rotation_x)
 
         np.testing.assert_allclose(vector, [angle, 0.0, 0.0], atol=1e-10)
+
+    def test_rotation_deviation_vector_is_finite_at_180_degrees(self) -> None:
+        assert rotation_deviation_vector is not None
+
+        rotation_x_180 = np.diag([1.0, -1.0, -1.0])
+        vector = rotation_deviation_vector(np.eye(3), rotation_x_180)
+
+        self.assertTrue(np.all(np.isfinite(vector)))
+        self.assertAlmostEqual(np.linalg.norm(vector), np.pi, places=12)
+
+    def test_rotations_to_c3d_canonicalizes_small_fbx_scale_roundoff(self) -> None:
+        assert rotations_to_c3d is not None
+
+        raw = np.diag([1.0 + 2.0e-6, 1.0 - 1.0e-6, 1.0])[:, :, None]
+        converted = rotations_to_c3d({"pelvis": raw}, "y_up_to_z_up")["pelvis"]
+
+        np.testing.assert_allclose(
+            converted[:, :, 0].T @ converted[:, :, 0], np.eye(3), atol=1e-12
+        )
+        self.assertAlmostEqual(np.linalg.det(converted[:, :, 0]), 1.0, places=12)
+
+    def test_global_jcs_rotation_block_is_stored_without_transposition(self) -> None:
+        assert compute_model_segment_rotations_native is not None
+
+        expected = np.asarray([[0.0, -1.0, 0.0], [1.0, 0.0, 0.0], [0.0, 0.0, 1.0]])
+
+        class FakeTransform:
+            def to_array(self):
+                transform = np.eye(4)
+                transform[:3, :3] = expected
+                return transform
+
+        class FakeModel:
+            def nbQ(self):
+                return 1
+
+            def nbSegment(self):
+                return 2
+
+            def segment(self, index):
+                names = ("root", "pelvis")
+
+                class Name:
+                    def to_string(self):
+                        return names[index]
+
+                class Segment:
+                    def name(self):
+                        return Name()
+
+                return Segment()
+
+            def globalJCS(self, _q, index):
+                self.last_index = index
+                return FakeTransform()
+
+        class FakeBiorbd:
+            def __init__(self):
+                self.model = FakeModel()
+
+            def Model(self, _path):
+                return self.model
+
+        import compare_p6_motive_captury as comparison
+        from unittest.mock import patch
+
+        fake_biorbd = FakeBiorbd()
+        with patch.object(comparison, "require_biorbd", return_value=fake_biorbd):
+            rotations = compute_model_segment_rotations_native(
+                Path("synthetic.bioMod"), np.asarray([[0.25]]), {"pelvis"}
+            )
+
+        np.testing.assert_allclose(rotations["pelvis"][:, :, 0], expected)
+        self.assertEqual(fake_biorbd.model.last_index, 1)
+
+    def test_biorbd_global_jcs_matches_known_static_biomod_rotation(self) -> None:
+        assert compute_model_segment_rotations_native is not None
+
+        biomod = """version 4
+segment root
+    parent base
+    RTinMatrix 1
+    RT
+        1 0 0 0
+        0 1 0 0
+        0 0 1 0
+        0 0 0 1
+endsegment
+segment pelvis
+    parent root
+    RTinMatrix 1
+    RT
+        0 -1 0 0
+        1 0 0 0
+        0 0 1 0
+        0 0 0 1
+endsegment
+"""
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "known_rotation.bioMod"
+            path.write_text(biomod, encoding="utf-8")
+            rotations = compute_model_segment_rotations_native(
+                path, np.empty((0, 1)), {"pelvis"}
+            )
+
+        expected = np.asarray([[0.0, -1.0, 0.0], [1.0, 0.0, 0.0], [0.0, 0.0, 1.0]])
+        np.testing.assert_allclose(rotations["pelvis"][:, :, 0], expected)
 
     def test_rotate_segment_frames_180_x_changes_local_x_and_y_axes(self) -> None:
         assert rotate_segment_frames_180_x is not None
@@ -442,6 +635,12 @@ class FlatTrialDiscoveryTests(unittest.TestCase):
             )
 
             first = trial_cache_fingerprint(bundle, args)
+            args.audit_bvh_fbx_rotations = True
+            audited = trial_cache_fingerprint(bundle, args)
+            args.bvh_fbx_max_p95_geodesic_deg = 2.0
+            stricter_audit = trial_cache_fingerprint(bundle, args)
+            args.audit_bvh_fbx_rotations = False
+            args.bvh_fbx_max_p95_geodesic_deg = 5.0
             args.captury_reorient_thigh_y_from_cor = True
             fourth = trial_cache_fingerprint(bundle, args)
             args.captury_reorient_thigh_y_from_cor = False
@@ -455,6 +654,8 @@ class FlatTrialDiscoveryTests(unittest.TestCase):
             second = trial_cache_fingerprint(bundle, args)
 
             self.assertNotEqual(first["digest"], second["digest"])
+            self.assertNotEqual(first["digest"], audited["digest"])
+            self.assertNotEqual(audited["digest"], stricter_audit["digest"])
             self.assertNotEqual(first["digest"], third["digest"])
             self.assertNotEqual(first["digest"], fourth["digest"])
             self.assertNotEqual(first["digest"], fifth["digest"])

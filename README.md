@@ -21,7 +21,10 @@ Small workspace for comparing Captury BVH/FBX skeleton exports with C3D marker d
 - `motive_captury_landmark_map.json`: editable Motive/Captury anatomical landmark correspondence map.
 - `plot_c3d_initial_offset.py`: independent Motive/Captury C3D marker-cloud diagnostic for inspecting raw offsets before model registration.
 - `plot_bvh_c3d_angle_comparisons.py`: optional plotting helper for BVH q versus C3D angle channels.
+- `kinematic_conventions.json`: versioned registry of source, segment, joint and ISB D1-D6 convention statuses.
+- `kinematic_conventions.py`: registry validation, final-comparison blockers and reproducibility-manifest helpers.
 - `docs/refactor_roadmap.md`: staged refactor plan with the test-first and agent-validation rule for each phase.
+- `docs/scientific_kinematics_roadmap.md`: scientific work plan for harmonizing Captury, Motive and BioBuddy kinematics, including the ISB D1-D6 audit gates.
 - `environment_bvh_c3d_biobuddy.yml`: conda environment definition.
 - `data/unknown.bvh`, `data/unknown.fbx`, `data/unknown.c3d`: expected local Captury input files. They are ignored by git because they are data files.
 
@@ -112,6 +115,8 @@ The GUI tabs are organized for the Captury/Motive analysis:
 The metric tabs contain embedded Matplotlib graphs instead of PNG previews. Each graph panel has a hierarchical selector (`trial -> metric -> component`) so a metric can be plotted globally or narrowed to a specific marker, segment, joint, landmark or q component. In the `Segments` tab, selecting a segment displays global and X/Y/Z rotation-deviation curves over time from `segment_rotation_timeseries.npz`; selecting a broader metric displays absolute-deviation boxplots by segment/source. Segment deviations are computed from `R_ref.T @ R_source` with the rotation-vector log map, then displayed in degrees. In the `Centres` tab, selecting a metric displays one time-distribution boxplot per joint centre from `joint_centre_timeseries.npz`; selecting a single joint displays its error curves over time, with Euclidean distance and absolute X/Y/Z components. In the `Cinématiques` tab, selecting one DoF displays its Motive, Captury and difference waveforms over time; selecting one Captury C3D angle channel displays the exported Captury C3D angle waveform. Selecting a metric such as `bias_rad`, `mae_rad`, `rmse_rad` or `c3d_mean_deg` displays one boxplot per DoF/channel. Rotation metrics and rotation waveforms are converted to degrees for display, while the output files keep the raw radian values when they come from model q.
 
 The model-centre workflow automatically handles the current P6 conventions by default: Captury BVH/FBX is treated as millimetres, Motive BVH/FBX as centimetres, and `--model-to-c3d-axis auto` currently resolves to the Y-up model -> Motive C3D Z-up conversion. Before writing `CAPJC_*` and `MOTJC_*` channels into enriched C3D copies, the Motive model chain is also yaw/translation-aligned to the Motive C3D marker cloud from 57-marker anatomical proxies, with a horizontal PCA fallback when too few proxies are available. The bottom-left `Log` button opens the live process log when needed.
+
+Each `compare_p6_motive_captury.py` batch now writes `provenance_manifest.json` before scientific processing. It records the exact selected C3D/BVH/FBX/bioMod inputs, SHA-256 hashes, command, Python executable, dependency versions, matrix convention and unresolved convention blockers. A `comparison_readiness.status` of `diagnostic_only` means that the figures remain useful for diagnosis but must not be interpreted as final biomechanical agreement. The manifest does not yet recover every C3D sampling rate or proprietary exporter convention; these remain explicit G0/G2 tasks in the scientific roadmap.
 
 The detected-file tables show the vertical-axis convention used by the GUI: BVH/FBX model files are treated as `+Y modèle`, while C3D files are displayed and written in `+Z labo`.
 
@@ -449,7 +454,24 @@ python compare_p6_motive_captury.py \
 
 Use `--cut-mode full` to explicitly ignore manual and detected bounds.
 
-The script builds BioBuddy/biorbd models for both systems from BVH by default. Use `--model-source fbx` to force FBX, or `--model-source auto` to prefer BVH and fall back to FBX. Captury BVH/FBX is treated as millimetres; Motive BVH/FBX is treated as centimetres unless overridden with `--captury-unit-scale-to-m` or `--motive-unit-scale-to-m`.
+The script builds BioBuddy/biorbd models for both systems from BVH by default. Use `--model-source fbx` to force FBX. `--model-source auto` now builds and compares both exports when both are available: automatic selection is rejected unless every mapped segment stays below `--bvh-fbx-max-p95-geodesic-deg` (default `5` degrees at p95). This numerical gate prevents silent source substitution; it is not an ISB tolerance or proof of anatomical equivalence. Captury BVH/FBX is treated as millimetres; Motive BVH/FBX is treated as centimetres unless overridden with `--captury-unit-scale-to-m` or `--motive-unit-scale-to-m`.
+
+Audit BVH and FBX while keeping an explicit BVH result:
+
+```bash
+python compare_p6_motive_captury.py \
+  --data-root local_trials/2026-06-30_P6_flat \
+  --out-dir out_p6_motive_captury_debug \
+  --trial Static \
+  --model-source bvh \
+  --audit-bvh-fbx-rotations \
+  --bvh-fbx-max-p95-geodesic-deg 5 \
+  --no-mesh --no-figures
+```
+
+Each system writes `bvh_fbx_rotation_audit.json` plus a compressed `bvh_fbx_rotation_audit.npz` under the trial's `captury/` or `motive/` directory. The JSON records canonical segment coverage, SO(3) quality corrections, per-segment median/p95/max/RMS geodesic deviations and the automatic-selection verdict. On the current P6 Static files, both systems fail the conservative 5-degree gate, so BVH or FBX must be selected explicitly.
+
+BVH and FBX timestamps are compared as elapsed time from each export's first sample; FBX rotations are interpolated by SLERP onto overlapping BVH elapsed times. The audit does not estimate temporal lag or compensate for missing leading frames, so a dynamic-trial failure can include synchronization error and must remain diagnostic until the G10 synchronization gate is implemented.
 
 The model coordinates are converted from Y-up to the Motive C3D Z-up convention before writing C3D outputs:
 

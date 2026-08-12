@@ -57,13 +57,33 @@ from mocap_labels import (
 )
 from model_comparison_metrics import joint_center_error_xyz, waveform_metrics
 from run_biobuddy_c3d_ik import run_direct_biobuddy_ik
+from kinematic_conventions import (
+    build_provenance_manifest,
+    load_kinematic_conventions,
+    segment_source_names,
+)
+from kinematic_rotations import (
+    assess_rotation_source_equivalence,
+    canonicalize_segment_rotation_mapping,
+    change_lab_basis,
+    compare_segment_rotation_mappings,
+    rotation_vector as canonical_rotation_vector,
+)
 
 DEFAULT_DATA_ROOT = Path("local_trials/2026-06-30_P6_flat")
 DEFAULT_OUTPUT_ROOT = Path("out_p6_motive_captury_comparison")
 ANGLE_LABEL_REGEX = r"(?i)(^.*angles?$|^.*_angle[s]?$|angle)"
 FOOT_MARKER_PATTERN = r"(LFCC|RFCC|LFM|RFM|LDP|RDP|Foot|Toe|Heel)"
-CACHE_VERSION = 4
+CACHE_VERSION = 5
 ROTATION_SEQUENCE_ZXY = "ZXY"
+SCIENTIFIC_IMPLEMENTATION_FILES = {
+    "comparison_batch": Path(__file__),
+    "kinematic_conventions_registry": Path(__file__).with_name(
+        "kinematic_conventions.json"
+    ),
+    "kinematic_conventions_code": Path(__file__).with_name("kinematic_conventions.py"),
+    "kinematic_rotations_code": Path(__file__).with_name("kinematic_rotations.py"),
+}
 
 MODEL_JOINT_MARKER_PROXIES = {
     "Hips": ("LIAS", "RIAS", "LIPS", "RIPS"),
@@ -138,7 +158,10 @@ def trial_cache_fingerprint(
 ) -> dict[str, Any]:
     payload = {
         "cache_version": CACHE_VERSION,
-        "implementation": file_fingerprint(Path(__file__)),
+        "implementation": {
+            name: file_fingerprint(path)
+            for name, path in SCIENTIFIC_IMPLEMENTATION_FILES.items()
+        },
         "inputs": {
             "captury_c3d": file_fingerprint(bundle.captury_c3d),
             "captury_bvh": file_fingerprint(bundle.captury_bvh),
@@ -152,6 +175,12 @@ def trial_cache_fingerprint(
         },
         "options": {
             "model_source": args.model_source,
+            "audit_bvh_fbx_rotations": bool(
+                getattr(args, "audit_bvh_fbx_rotations", False)
+            ),
+            "bvh_fbx_max_p95_geodesic_deg": float(
+                getattr(args, "bvh_fbx_max_p95_geodesic_deg", 5.0)
+            ),
             "model_to_c3d_axis": args.model_to_c3d_axis,
             "captury_unit_scale_to_m": args.captury_unit_scale_to_m,
             "motive_unit_scale_to_m": args.motive_unit_scale_to_m,
@@ -192,9 +221,11 @@ def trial_cache_fingerprint(
     }
 
 
-def required_trial_outputs(trial_dir: Path, trial_name: str) -> list[Path]:
+def required_trial_outputs(
+    trial_dir: Path, trial_name: str, *, include_rotation_audit: bool = False
+) -> list[Path]:
     safe_trial = safe_name(trial_name)
-    return [
+    outputs = [
         trial_dir / f"{safe_trial}_motive_with_capjc_motjc.c3d",
         trial_dir / "joint_centre_metrics.csv",
         trial_dir / "joint_centre_timeseries.npz",
@@ -212,6 +243,15 @@ def required_trial_outputs(trial_dir: Path, trial_name: str) -> list[Path]:
         trial_dir / "trial_events_contacts.csv",
         trial_dir / "run_report.json",
     ]
+    if include_rotation_audit:
+        for system in ("captury", "motive"):
+            outputs.extend(
+                (
+                    trial_dir / system / "bvh_fbx_rotation_audit.json",
+                    trial_dir / system / "bvh_fbx_rotation_audit.npz",
+                )
+            )
+    return outputs
 
 
 def cached_trial_report(
@@ -232,7 +272,15 @@ def cached_trial_report(
     expected = trial_cache_fingerprint(bundle, args, static_alignment_transform)
     if report.get("cache", {}).get("fingerprint") != expected:
         return None
-    for output_path in required_trial_outputs(trial_dir, bundle.name):
+    include_rotation_audit = bool(
+        getattr(args, "audit_bvh_fbx_rotations", False)
+        or getattr(args, "model_source", None) == "auto"
+    )
+    for output_path in required_trial_outputs(
+        trial_dir,
+        bundle.name,
+        include_rotation_audit=include_rotation_audit,
+    ):
         if not output_path.exists() or output_path.stat().st_size == 0:
             return None
     if args.run_ik_batch and "motive_ik_batch" not in report:
@@ -363,6 +411,116 @@ def select_model_file(
     if fbx is not None:
         return "fbx", fbx
     raise FileNotFoundError(f"No {system} BVH/FBX for {bundle.name}.")
+
+
+def comparison_input_files(
+    trials: list[TrialBundle], args: argparse.Namespace
+) -> dict[str, Path]:
+    """Return every input that materially contributes to this batch run."""
+
+    inputs: dict[str, Path] = {}
+    for bundle in trials:
+        prefix = bundle.name
+        inputs[f"{prefix}/captury/c3d"] = bundle.captury_c3d
+        inputs[f"{prefix}/motive/c3d"] = bundle.motive_c3d
+        if not args.occlusions_only:
+            audit_both = bool(
+                getattr(args, "audit_bvh_fbx_rotations", False)
+                or args.model_source == "auto"
+            )
+            for system in ("captury", "motive"):
+                bvh = bundle.captury_bvh if system == "captury" else bundle.motive_bvh
+                fbx = bundle.captury_fbx if system == "captury" else bundle.motive_fbx
+                if audit_both and bvh is not None and fbx is not None:
+                    inputs[f"{prefix}/{system}/bvh"] = bvh
+                    inputs[f"{prefix}/{system}/fbx"] = fbx
+                    continue
+                source_kind, source_path = select_model_file(
+                    bundle, system, args.model_source
+                )
+                inputs[f"{prefix}/{system}/{source_kind}"] = source_path
+            motive_kind, _ = select_model_file(bundle, "motive", args.model_source)
+            if (
+                getattr(args, "run_ik_batch", False)
+                and motive_kind == "fbx"
+                and bundle.motive_bvh is not None
+            ):
+                inputs[f"{prefix}/motive/ik_bvh"] = bundle.motive_bvh
+    if getattr(args, "biobuddy_biomod", None) is not None:
+        inputs["biobuddy/biomod"] = args.biobuddy_biomod
+    if getattr(args, "landmark_map", None) is not None:
+        inputs["markers/landmark_map"] = args.landmark_map
+    return inputs
+
+
+def provenance_trials_with_static(
+    selected_trials: list[TrialBundle],
+    discovered_trials: list[TrialBundle],
+    static_trial_name: str,
+) -> list[TrialBundle]:
+    """Include a hidden static calibration trial exactly once in provenance."""
+
+    result = list(selected_trials)
+    if any(bundle.name == static_trial_name for bundle in result):
+        return result
+    static_bundle = next(
+        (bundle for bundle in discovered_trials if bundle.name == static_trial_name),
+        None,
+    )
+    if static_bundle is not None:
+        result.append(static_bundle)
+    return result
+
+
+def comparison_derived_artifacts(
+    reports: list[dict[str, Any]],
+) -> dict[str, Path]:
+    """Collect generated models and maps consumed later in the same run."""
+
+    artifacts: dict[str, Path] = {}
+    for report in reports:
+        trial = str(report["trial"])
+        models = report.get("models", {})
+        for system in ("captury", "motive"):
+            biomod = models.get(system, {}).get("biomod")
+            if biomod:
+                artifacts[f"{trial}/{system}/generated_biomod"] = Path(biomod)
+            rotation_audit = report.get("bvh_fbx_rotation_audit", {}).get(system, {})
+            for source_kind, path in rotation_audit.get(
+                "generated_biomods", {}
+            ).items():
+                artifacts[f"{trial}/{system}/{source_kind}/audit_generated_biomod"] = (
+                    Path(path)
+                )
+            for artifact_kind, path in rotation_audit.get("artifacts", {}).items():
+                artifacts[f"{trial}/{system}/rotation_audit_{artifact_kind}"] = Path(
+                    path
+                )
+        marker_comparison = report.get("skin_marker_correspondence", {})
+        if marker_comparison.get("map_source") == "automatic_proposal":
+            proposal = report.get("outputs", {}).get(
+                "skin_marker_correspondence_proposal"
+            )
+            if proposal:
+                artifacts[f"{trial}/markers/automatic_proposal"] = Path(proposal)
+    return artifacts
+
+
+def write_comparison_provenance_manifest(
+    trials: list[TrialBundle],
+    args: argparse.Namespace,
+    reports: list[dict[str, Any]] | None = None,
+) -> Path:
+    """Write the reproducibility manifest for a selected comparison batch."""
+
+    manifest = build_provenance_manifest(
+        input_files=comparison_input_files(trials, args),
+        derived_artifacts=comparison_derived_artifacts(reports or []),
+        command=[sys.executable, str(Path(__file__).resolve()), *sys.argv[1:]],
+    )
+    output_path = args.out_dir / "provenance_manifest.json"
+    output_path.write_text(json.dumps(manifest, indent=2), encoding="utf-8")
+    return output_path
 
 
 def native_unit_scale_to_m(
@@ -542,6 +700,173 @@ def build_model_run(
     )
 
 
+def _rotation_audit_timeseries_rows(
+    system: str, comparison: Mapping[str, Any]
+) -> list[dict[str, Any]]:
+    rows: list[dict[str, Any]] = []
+    for segment, values in comparison.get("timeseries", {}).items():
+        time = np.asarray(values["time"], dtype=float)
+        vectors = np.asarray(values["rotation_vector_rad"], dtype=float)
+        geodesic = np.asarray(values["geodesic_deg"], dtype=float)
+        for frame, time_value in enumerate(time):
+            rows.append(
+                {
+                    "system": system,
+                    "segment": segment,
+                    "time_s": float(time_value),
+                    "deviation_x_deg": float(np.rad2deg(vectors[0, frame])),
+                    "deviation_y_deg": float(np.rad2deg(vectors[1, frame])),
+                    "deviation_z_deg": float(np.rad2deg(vectors[2, frame])),
+                    "geodesic_deg": float(geodesic[frame]),
+                }
+            )
+    return rows
+
+
+def write_bvh_fbx_rotation_audit(
+    out_dir: Path,
+    system: str,
+    audit: Mapping[str, Any],
+    comparison: Mapping[str, Any] | None = None,
+) -> dict[str, str]:
+    """Write a compact audit summary and compressed rotation time series."""
+
+    system_dir = out_dir / system
+    system_dir.mkdir(parents=True, exist_ok=True)
+    summary_path = system_dir / "bvh_fbx_rotation_audit.json"
+    timeseries_path = system_dir / "bvh_fbx_rotation_audit.npz"
+    summary_path.write_text(json.dumps(audit, indent=2), encoding="utf-8")
+    write_table_npz(
+        timeseries_path,
+        _rotation_audit_timeseries_rows(system, comparison or {}),
+    )
+    return {"summary": str(summary_path), "timeseries": str(timeseries_path)}
+
+
+def build_model_run_with_rotation_audit(
+    bundle: TrialBundle,
+    system: str,
+    args: argparse.Namespace,
+    trial_dir: Path,
+) -> tuple[ModelRun, dict[str, Any]]:
+    """Build the selected export and optionally audit BVH/FBX equivalence.
+
+    Explicit ``bvh`` or ``fbx`` selection remains authoritative. In ``auto``
+    mode, both available exports must pass the declared SO(3) gate before BVH is
+    selected; a failed gate requires the user to choose a source explicitly.
+    """
+
+    audit_requested = bool(
+        getattr(args, "audit_bvh_fbx_rotations", False) or args.model_source == "auto"
+    )
+    available = {
+        "bvh": bundle.captury_bvh if system == "captury" else bundle.motive_bvh,
+        "fbx": bundle.captury_fbx if system == "captury" else bundle.motive_fbx,
+    }
+
+    def build(source_kind: str) -> ModelRun:
+        return build_model_run(
+            bundle,
+            system,
+            source_kind,
+            trial_dir,
+            include_mesh=not args.no_mesh,
+            max_mesh_points=args.max_mesh_points,
+            unit_scale_override=(
+                args.captury_unit_scale_to_m
+                if system == "captury"
+                else args.motive_unit_scale_to_m
+            ),
+            root_offset_mode=args.root_offset_mode,
+            model_to_c3d_axis=args.model_to_c3d_axis,
+            angle_label_regex=args.angle_label_regex,
+        )
+
+    if not audit_requested or not all(available.values()):
+        selected = build(args.model_source)
+        audit = {
+            "status": "not_requested" if not audit_requested else "single_source_only",
+            "system": system,
+            "available_sources": sorted(
+                source_kind
+                for source_kind, path in available.items()
+                if path is not None
+            ),
+            "selected_source": selected.source_kind,
+            "blocks_automatic_source_selection": False,
+            "meaning": (
+                "BVH/FBX equivalence was not evaluated."
+                if not audit_requested
+                else "Only one model export is available; no cross-format equivalence can be tested."
+            ),
+        }
+        if audit_requested:
+            audit["artifacts"] = write_bvh_fbx_rotation_audit(trial_dir, system, audit)
+        return selected, audit
+
+    runs = {source_kind: build(source_kind) for source_kind in ("bvh", "fbx")}
+    registry = load_kinematic_conventions()
+    source_id = "captury_model" if system == "captury" else "motive_model"
+    mapped: dict[str, dict[str, np.ndarray]] = {}
+    mapping_reports: dict[str, dict[str, list[str]]] = {}
+    for source_kind, run in runs.items():
+        mapped[source_kind], mapping_reports[source_kind] = (
+            canonicalize_segment_rotation_mapping(
+                run.rotations_native,
+                segment_source_names(registry, source_id, source_kind),
+            )
+        )
+    comparison = compare_segment_rotation_mappings(
+        mapped["bvh"],
+        runs["bvh"].time,
+        mapped["fbx"],
+        runs["fbx"].time,
+    )
+    comparison["missing_in_reference"] = sorted(
+        set(comparison["missing_in_reference"]).union(
+            mapping_reports["bvh"]["missing_canonical_segments"]
+        )
+    )
+    comparison["missing_in_test"] = sorted(
+        set(comparison["missing_in_test"]).union(
+            mapping_reports["fbx"]["missing_canonical_segments"]
+        )
+    )
+    verdict = assess_rotation_source_equivalence(
+        comparison,
+        max_p95_geodesic_deg=float(args.bvh_fbx_max_p95_geodesic_deg),
+    )
+    audit = {
+        "system": system,
+        "reference_source": "bvh",
+        "test_source": "fbx",
+        "matrix_convention": "R_model_segment; columns are local axes in model coordinates",
+        "mapping": mapping_reports,
+        "time_alignment": comparison["time_alignment"],
+        "summary": comparison["summary"],
+        "verdict": verdict,
+        "status": verdict["status"],
+        "blocks_automatic_source_selection": verdict[
+            "blocks_automatic_source_selection"
+        ],
+        "generated_biomods": {
+            source_kind: str(run.biomod_path) for source_kind, run in runs.items()
+        },
+    }
+    audit["artifacts"] = write_bvh_fbx_rotation_audit(
+        trial_dir, system, audit, comparison
+    )
+    if args.model_source == "auto" and verdict["blocks_automatic_source_selection"]:
+        raise RuntimeError(
+            f"Automatic {system} model-source selection is blocked: BVH and FBX "
+            f"are not equivalent within {args.bvh_fbx_max_p95_geodesic_deg:g} deg "
+            f"p95. Select --model-source bvh or --model-source fbx explicitly; "
+            f"see {audit['artifacts']['summary']}."
+        )
+    selected_kind = "bvh" if args.model_source == "auto" else args.model_source
+    return runs[selected_kind], audit
+
+
 def model_to_c3d_matrix(axis_mode: str) -> np.ndarray:
     if axis_mode == "auto":
         axis_mode = "y_up_to_z_up"
@@ -575,7 +900,7 @@ def rotations_to_c3d(
     if row_global_rotation is not None:
         matrix = np.asarray(row_global_rotation, dtype=float).T @ matrix
     return {
-        name: np.einsum("ij,jkf->ikf", matrix, values)
+        name: change_lab_basis(values, matrix)
         for name, values in rotations_native.items()
     }
 
@@ -789,26 +1114,12 @@ def nearest_time_indices(
 def rotation_deviation_vector(R1: np.ndarray, R2: np.ndarray) -> np.ndarray:
     """Return the rotation-vector deviation that maps ``R1`` to ``R2``.
 
-    The implementation follows the logarithm map supplied in the GUI request:
     ``R = R1.T @ R2`` and the returned vector components are expressed in
-    radians around the local X/Y/Z axes of the reference orientation.
+    radians around the local X/Y/Z axes of the reference orientation. The
+    canonical SO(3) logarithm remains stable at rotations close to 180 degrees.
     """
 
-    R = np.asarray(R1, dtype=float).T @ np.asarray(R2, dtype=float)
-    cos_theta = (np.trace(R) - 1.0) / 2.0
-    cos_theta = np.clip(cos_theta, -1.0, 1.0)
-    theta = float(np.arccos(cos_theta))
-    skew_vector = np.array(
-        [
-            R[2, 1] - R[1, 2],
-            R[0, 2] - R[2, 0],
-            R[1, 0] - R[0, 1],
-        ],
-        dtype=float,
-    )
-    if theta < 1e-8:
-        return 0.5 * skew_vector
-    return theta / (2.0 * np.sin(theta)) * skew_vector
+    return canonical_rotation_vector(R1, R2)
 
 
 def axis_rotation_matrix(axis: str, angle: float) -> np.ndarray:
@@ -2761,29 +3072,11 @@ def compare_trial(
             )
         cached_transform = static_transform_from_report(cached_report)
         return cached_report, static_alignment_transform or cached_transform
-    captury = build_model_run(
-        bundle,
-        "captury",
-        args.model_source,
-        trial_dir,
-        include_mesh=not args.no_mesh,
-        max_mesh_points=args.max_mesh_points,
-        unit_scale_override=args.captury_unit_scale_to_m,
-        root_offset_mode=args.root_offset_mode,
-        model_to_c3d_axis=args.model_to_c3d_axis,
-        angle_label_regex=args.angle_label_regex,
+    captury, captury_source_audit = build_model_run_with_rotation_audit(
+        bundle, "captury", args, trial_dir
     )
-    motive = build_model_run(
-        bundle,
-        "motive",
-        args.model_source,
-        trial_dir,
-        include_mesh=not args.no_mesh,
-        max_mesh_points=args.max_mesh_points,
-        unit_scale_override=args.motive_unit_scale_to_m,
-        root_offset_mode=args.root_offset_mode,
-        model_to_c3d_axis=args.model_to_c3d_axis,
-        angle_label_regex=args.angle_label_regex,
+    motive, motive_source_audit = build_model_run_with_rotation_audit(
+        bundle, "motive", args, trial_dir
     )
     cap_c3d_mm = centres_to_c3d_mm(
         captury.centres_native, captury.unit_scale_to_m, args.model_to_c3d_axis
@@ -3159,6 +3452,10 @@ def compare_trial(
         },
         "trial_events": event_report,
         "segment_rotations": segment_report,
+        "bvh_fbx_rotation_audit": {
+            "captury": captury_source_audit,
+            "motive": motive_source_audit,
+        },
         "segment_orientation_corrections": segment_orientation_report,
         "q_reexpression": q_reexpression_report,
         "occlusion_figure": str(occlusion_figure) if occlusion_figure else None,
@@ -3240,6 +3537,23 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument("--model-source", choices=["auto", "bvh", "fbx"], default="bvh")
+    parser.add_argument(
+        "--audit-bvh-fbx-rotations",
+        action="store_true",
+        help=(
+            "Build both model exports when available and report their canonical "
+            "segment-frame SO(3) deviations without changing an explicit source choice."
+        ),
+    )
+    parser.add_argument(
+        "--bvh-fbx-max-p95-geodesic-deg",
+        type=float,
+        default=5.0,
+        help=(
+            "Maximum per-segment p95 geodesic deviation accepted by automatic "
+            "BVH/FBX source selection (default: 5 degrees)."
+        ),
+    )
     parser.add_argument(
         "--root-offset-mode",
         choices=["auto", "subtract", "keep"],
@@ -3399,51 +3713,59 @@ def run_occlusions_only(
 
 def main() -> None:
     args = parse_args()
-    trials = discover_trials(args.data_root)
+    discovered_trials = discover_trials(args.data_root)
     if args.list_trials:
-        for bundle in trials:
+        for bundle in discovered_trials:
             print(bundle.name)
         return
+    trials = list(discovered_trials)
     if args.trial:
         requested = set(args.trial)
         trials = [bundle for bundle in trials if bundle.name in requested]
     if not trials:
         raise RuntimeError(f"No trials found in {args.data_root}.")
     args.out_dir.mkdir(parents=True, exist_ok=True)
+    provenance_trials = (
+        trials
+        if args.occlusions_only
+        else provenance_trials_with_static(trials, discovered_trials, args.static_trial)
+    )
+    provenance_path = write_comparison_provenance_manifest(provenance_trials, args)
     if args.occlusions_only:
         run_occlusions_only(trials, args)
+        print(f"Provenance: {provenance_path}")
         return
 
     static_bundle = next(
-        (
-            bundle
-            for bundle in discover_trials(args.data_root)
-            if bundle.name == args.static_trial
-        ),
+        (bundle for bundle in discovered_trials if bundle.name == args.static_trial),
         None,
     )
     static_transform: tuple[np.ndarray, np.ndarray] | None = None
     reports: list[dict[str, Any]] = []
+    provenance_reports: list[dict[str, Any]] = []
     if static_bundle is not None and not args.trial:
         static_report, static_transform = compare_trial(
             static_bundle, args.out_dir, args, static_alignment_transform=None
         )
         reports.append(static_report)
+        provenance_reports.append(static_report)
         trials = [bundle for bundle in trials if bundle.name != static_bundle.name]
     elif static_bundle is not None and all(
         bundle.name != static_bundle.name for bundle in trials
     ):
-        _, static_transform = compare_trial(
+        static_report, static_transform = compare_trial(
             static_bundle,
             args.out_dir / "_static_alignment",
             args,
             static_alignment_transform=None,
         )
+        provenance_reports.append(static_report)
     for bundle in trials:
         report, static_transform = compare_trial(
             bundle, args.out_dir, args, static_alignment_transform=static_transform
         )
         reports.append(report)
+        provenance_reports.append(report)
 
     all_centre_rows: list[dict[str, Any]] = []
     all_q_rows: list[dict[str, Any]] = []
@@ -3551,12 +3873,16 @@ def main() -> None:
         ),
         encoding="utf-8",
     )
+    provenance_path = write_comparison_provenance_manifest(
+        provenance_trials, args, provenance_reports
+    )
     print(f"Compared {len(reports)} trial(s).")
     print(f"Joint-centre metrics: {args.out_dir / 'all_joint_centre_metrics.csv'}")
     print(f"Kinematics metrics: {args.out_dir / 'all_kinematics_q_metrics.csv'}")
     if not args.no_figures:
         print(f"Figures: {args.out_dir / 'figures'}")
     print(f"Report: {args.out_dir / 'run_report.json'}")
+    print(f"Provenance: {provenance_path}")
 
 
 if __name__ == "__main__":
