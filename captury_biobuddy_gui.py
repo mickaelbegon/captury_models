@@ -3844,8 +3844,6 @@ class CapturyBioBuddyGui(tk.Tk):
         selected = str(self.vars["selected_trial"].get()).strip()
         if not selected or selected == ALL_TRIALS_LABEL:
             selected = str(self.vars["p6_static_trial"].get()).strip()
-        if not self.trial_inventory:
-            self._refresh_trial_inventory()
         files = self.trial_inventory.get(selected, {})
         paths: dict[str, Path] = {}
         for system in ("Motive", "Captury"):

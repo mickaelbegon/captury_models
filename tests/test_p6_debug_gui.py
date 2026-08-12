@@ -760,6 +760,13 @@ class P6DebugGuiTests(unittest.TestCase):
                 {"Motive": motive_c3d, "Captury": captury_c3d},
             )
 
+    def test_selected_trial_c3d_paths_accepts_empty_inventory(self) -> None:
+        gui = self.make_gui_stub()
+        gui.trial_inventory = {}
+        gui.vars["selected_trial"].set("Static")
+
+        self.assertEqual(CapturyBioBuddyGui._selected_trial_c3d_paths(gui), {})
+
     def test_graph_metric_columns_keeps_only_numeric_requested_columns(self) -> None:
         dataframe = pd.DataFrame(
             {
