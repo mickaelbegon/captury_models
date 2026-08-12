@@ -3463,19 +3463,25 @@ class CapturyBioBuddyGui(tk.Tk):
     def _refresh_trial_inventory(self) -> None:
         if not hasattr(self, "trial_combobox"):
             return
-        data_root = self._resolve(str(self.vars["p6_data_root"].get()).strip())
-        self.trial_inventory = (
-            inventory_p6_dataset(data_root) if data_root.exists() else {}
-        )
-        values = [ALL_TRIALS_LABEL] + sorted(self.trial_inventory)
-        self.trial_combobox.configure(values=tuple(values))
-        selected = str(self.vars["selected_trial"].get()).strip()
-        if selected not in values:
-            self.vars["selected_trial"].set(ALL_TRIALS_LABEL)
-        else:
-            self._update_inventory_table()
-            self._update_embedded_trial_viewer()
-        self._refresh_default_motive57_c3d_mapping_if_needed()
+        if self.__dict__.get("_refreshing_trial_inventory", False):
+            return
+        self._refreshing_trial_inventory = True
+        try:
+            data_root = self._resolve(str(self.vars["p6_data_root"].get()).strip())
+            self.trial_inventory = (
+                inventory_p6_dataset(data_root) if data_root.exists() else {}
+            )
+            values = [ALL_TRIALS_LABEL] + sorted(self.trial_inventory)
+            self.trial_combobox.configure(values=tuple(values))
+            selected = str(self.vars["selected_trial"].get()).strip()
+            if selected not in values:
+                self.vars["selected_trial"].set(ALL_TRIALS_LABEL)
+            else:
+                self._update_inventory_table()
+                self._update_embedded_trial_viewer()
+            self._refresh_default_motive57_c3d_mapping_if_needed()
+        finally:
+            self._refreshing_trial_inventory = False
 
     def _sync_selected_trial(self) -> None:
         selected = str(self.vars["selected_trial"].get()).strip()

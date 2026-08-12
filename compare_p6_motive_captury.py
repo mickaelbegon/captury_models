@@ -75,6 +75,36 @@ MODEL_JOINT_MARKER_PROXIES = {
     "RightFoot": ("RFAL", "RTAM", "RFAX"),
 }
 
+# The Motive-57 BioBuddy model uses compact segment names, whereas the output
+# tables and GUI use the Captury/Motive BVH vocabulary.  Normalize headings at
+# the comparison boundary so BioBuddy centres populate the same joint rows.
+BIOBUDDY_GUI_JOINT_NAMES = {
+    "Pelvis": "Hips",
+    "Thorax": "Spine",
+    "Head": "Head",
+    "RThigh": "RightUpLeg",
+    "RShank": "RightLeg",
+    "RFoot": "RightFoot",
+    "LThigh": "LeftUpLeg",
+    "LShank": "LeftLeg",
+    "LFoot": "LeftFoot",
+    "RUpperArm": "RightArm",
+    "RForearm": "RightForeArm",
+    "RHand": "RightHand",
+    "LUpperArm": "LeftArm",
+    "LForearm": "LeftForeArm",
+    "LHand": "LeftHand",
+}
+
+
+def biobuddy_centres_with_gui_joint_names(
+    centres: Mapping[str, np.ndarray],
+) -> dict[str, np.ndarray]:
+    return {
+        BIOBUDDY_GUI_JOINT_NAMES.get(name, name): np.asarray(values, dtype=float)
+        for name, values in centres.items()
+    }
+
 
 @dataclass
 class TrialBundle:
@@ -2925,6 +2955,7 @@ def compare_trial(
         bio_centres_mm = centres_to_c3d_mm(
             biobuddy_run.centres_native, biobuddy_run.unit_scale_to_m, "identity"
         )
+        bio_centres_mm = biobuddy_centres_with_gui_joint_names(bio_centres_mm)
         add_biobuddy_centre_rows(
             bundle.name,
             centre_rows,
