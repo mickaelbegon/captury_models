@@ -74,6 +74,7 @@ class ComparisonProvenanceTests(unittest.TestCase):
                 "kinematic_conventions_registry",
                 "kinematic_conventions_code",
                 "kinematic_rotations_code",
+                "isb_segment_audit_code",
                 "spatial_calibration_code",
                 "mocap_alignment_code",
             },
@@ -199,6 +200,23 @@ class ComparisonProvenanceTests(unittest.TestCase):
                 "Static/alignment/spatial_calibration": Path(
                     "/tmp/spatial_calibration.json"
                 ),
+            },
+        )
+
+    def test_batch_isb_audit_artifacts_are_included_in_provenance(self) -> None:
+        artifacts = comparison.comparison_derived_artifacts(
+            [],
+            batch_artifacts={
+                "scientific/isb_d1_d3_json": Path("/tmp/isb_d1_d3_audit.json"),
+                "scientific/isb_d1_d3_table": Path("/tmp/isb_d1_d3_audit.npz"),
+            },
+        )
+
+        self.assertEqual(
+            artifacts,
+            {
+                "scientific/isb_d1_d3_json": Path("/tmp/isb_d1_d3_audit.json"),
+                "scientific/isb_d1_d3_table": Path("/tmp/isb_d1_d3_audit.npz"),
             },
         )
 

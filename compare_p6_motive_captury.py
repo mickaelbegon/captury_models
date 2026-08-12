@@ -67,6 +67,7 @@ from kinematic_conventions import (
     load_kinematic_conventions,
     segment_source_names,
 )
+from isb_segment_audit import build_isb_d1_d3_audit, write_isb_d1_d3_audit
 from kinematic_rotations import (
     assess_rotation_source_equivalence,
     canonicalize_segment_rotation_mapping,
@@ -94,6 +95,7 @@ SCIENTIFIC_IMPLEMENTATION_FILES = {
     ),
     "kinematic_conventions_code": Path(__file__).with_name("kinematic_conventions.py"),
     "kinematic_rotations_code": Path(__file__).with_name("kinematic_rotations.py"),
+    "isb_segment_audit_code": Path(__file__).with_name("isb_segment_audit.py"),
     "spatial_calibration_code": Path(__file__).with_name("spatial_calibration.py"),
     "mocap_alignment_code": Path(__file__).with_name("mocap_alignment.py"),
 }
@@ -571,10 +573,11 @@ def split_static_calibration_trial(
 
 def comparison_derived_artifacts(
     reports: list[dict[str, Any]],
+    batch_artifacts: dict[str, Path] | None = None,
 ) -> dict[str, Path]:
     """Collect generated models and maps consumed later in the same run."""
 
-    artifacts: dict[str, Path] = {}
+    artifacts: dict[str, Path] = dict(batch_artifacts or {})
     for report in reports:
         trial = str(report["trial"])
         models = report.get("models", {})
@@ -612,12 +615,15 @@ def write_comparison_provenance_manifest(
     trials: list[TrialBundle],
     args: argparse.Namespace,
     reports: list[dict[str, Any]] | None = None,
+    batch_artifacts: dict[str, Path] | None = None,
 ) -> Path:
     """Write the reproducibility manifest for a selected comparison batch."""
 
     manifest = build_provenance_manifest(
         input_files=comparison_input_files(trials, args),
-        derived_artifacts=comparison_derived_artifacts(reports or []),
+        derived_artifacts=comparison_derived_artifacts(
+            reports or [], batch_artifacts=batch_artifacts
+        ),
         command=[sys.executable, str(Path(__file__).resolve()), *sys.argv[1:]],
     )
     output_path = args.out_dir / "provenance_manifest.json"
@@ -3991,11 +3997,21 @@ def main() -> None:
         if args.occlusions_only
         else provenance_trials_with_static(trials, discovered_trials, args.static_trial)
     )
-    provenance_path = write_comparison_provenance_manifest(provenance_trials, args)
     if args.occlusions_only:
+        provenance_path = write_comparison_provenance_manifest(provenance_trials, args)
         run_occlusions_only(trials, args)
         print(f"Provenance: {provenance_path}")
         return
+
+    isb_audit = build_isb_d1_d3_audit(load_kinematic_conventions())
+    isb_audit_paths = write_isb_d1_d3_audit(args.out_dir, isb_audit)
+    scientific_artifacts = {
+        "scientific/isb_d1_d3_json": isb_audit_paths["json"],
+        "scientific/isb_d1_d3_table": isb_audit_paths["table"],
+    }
+    provenance_path = write_comparison_provenance_manifest(
+        provenance_trials, args, batch_artifacts=scientific_artifacts
+    )
 
     static_bundle, _ = split_static_calibration_trial(
         discovered_trials, args.static_trial
@@ -4127,6 +4143,10 @@ def main() -> None:
                 "out_dir": str(args.out_dir),
                 "n_trials": len(reports),
                 "static_trial": args.static_trial,
+                "isb_d1_d3_audit": {
+                    "summary": str(isb_audit_paths["json"]),
+                    "table": str(isb_audit_paths["table"]),
+                },
                 "figures": figures,
                 "reports": reports,
             },
@@ -4135,7 +4155,10 @@ def main() -> None:
         encoding="utf-8",
     )
     provenance_path = write_comparison_provenance_manifest(
-        provenance_trials, args, provenance_reports
+        provenance_trials,
+        args,
+        provenance_reports,
+        batch_artifacts=scientific_artifacts,
     )
     print(f"Compared {len(reports)} trial(s).")
     print(f"Joint-centre metrics: {args.out_dir / 'all_joint_centre_metrics.csv'}")
@@ -4143,6 +4166,7 @@ def main() -> None:
     if not args.no_figures:
         print(f"Figures: {args.out_dir / 'figures'}")
     print(f"Report: {args.out_dir / 'run_report.json'}")
+    print(f"ISB D1-D3 audit: {isb_audit_paths['json']}")
     print(f"Provenance: {provenance_path}")
 
 

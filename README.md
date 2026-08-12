@@ -23,6 +23,7 @@ Small workspace for comparing Captury BVH/FBX skeleton exports with C3D marker d
 - `plot_bvh_c3d_angle_comparisons.py`: optional plotting helper for BVH q versus C3D angle channels.
 - `kinematic_conventions.json`: versioned registry of source, segment, joint and ISB D1-D6 convention statuses.
 - `kinematic_conventions.py`: registry validation, final-comparison blockers and reproducibility-manifest helpers.
+- `isb_segment_audit.py`: reproducible ISB D1-D3 segment-frame audit and BioBuddy Motive 57 template introspection.
 - `docs/refactor_roadmap.md`: staged refactor plan with the test-first and agent-validation rule for each phase.
 - `docs/scientific_kinematics_roadmap.md`: scientific work plan for harmonizing Captury, Motive and BioBuddy kinematics, including the ISB D1-D6 audit gates.
 - `environment_bvh_c3d_biobuddy.yml`: conda environment definition.
@@ -116,7 +117,9 @@ The metric tabs contain embedded Matplotlib graphs instead of PNG previews. Each
 
 The model-centre workflow automatically handles the current P6 conventions by default: Captury BVH/FBX is treated as millimetres, Motive BVH/FBX as centimetres, and `--model-to-c3d-axis auto` currently resolves to the Y-up model -> Motive C3D Z-up conversion. Before writing `CAPJC_*` and `MOTJC_*` channels into enriched C3D copies, the Motive model chain is also yaw/translation-aligned to the Motive C3D marker cloud from 57-marker anatomical proxies, with a horizontal PCA fallback when too few proxies are available. The bottom-left `Log` button opens the live process log when needed.
 
-Each `compare_p6_motive_captury.py` batch now writes `provenance_manifest.json` before scientific processing. It records the exact selected C3D/BVH/FBX/bioMod inputs, SHA-256 hashes, command, Python executable, dependency versions, matrix convention and unresolved convention blockers. A `comparison_readiness.status` of `diagnostic_only` means that the figures remain useful for diagnosis but must not be interpreted as final biomechanical agreement. The manifest does not yet recover every C3D sampling rate or proprietary exporter convention; these remain explicit G0/G2 tasks in the scientific roadmap.
+Each full `compare_p6_motive_captury.py` comparison batch now writes `provenance_manifest.json` before scientific processing. It records the exact selected C3D/BVH/FBX/bioMod inputs, SHA-256 hashes, command, Python executable, dependency versions, matrix convention and unresolved convention blockers. It also records the generated `isb_d1_d3_audit.json` and `isb_d1_d3_audit.npz` artifacts. The specialized `--occlusions-only` path intentionally skips BioBuddy import and D1-D3 audit generation. A `comparison_readiness.status` of `diagnostic_only` means that the figures remain useful for diagnosis but must not be interpreted as final biomechanical agreement. The manifest does not yet recover every C3D sampling rate or proprietary exporter convention; these remain explicit G0/G2 tasks in the scientific roadmap.
+
+The D1-D3 audit inventories every source and segment. For the active BioBuddy Motive 57 runtime, it extracts the declared origin, raw axes, axis retained during orthogonalization, functional SCoRE/SARA trials and static fallbacks, and records the exact imported template path and SHA-256 hash. Captury and Motive exporter frames remain `inconnu` when their construction is proprietary. A missing numeric deviation means that no justified source-to-ISB matrix exists; it never means zero error or compliance. The current audit does not yet prove that the generated `.bioMod` frame is identical to the template declaration, nor does it compute an origin error until paired source and ISB origins are explicitly defined.
 
 The detected-file tables show the vertical-axis convention used by the GUI: BVH/FBX model files are treated as `+Y modèle`, while C3D files are displayed and written in `+Z labo`.
 
@@ -523,6 +526,8 @@ Main outputs:
 - `out_p6_motive_captury_comparison/all_motive_marker_occlusions.csv`
 - `out_p6_motive_captury_comparison/all_model_dimensions.csv`
 - `out_p6_motive_captury_comparison/all_skin_marker_correspondence_metrics.csv`
+- `out_p6_motive_captury_comparison/isb_d1_d3_audit.json`
+- `out_p6_motive_captury_comparison/isb_d1_d3_audit.npz`
 - `out_p6_motive_captury_comparison/run_report.json`
 
 Trial-level results are cached in each trial's `run_report.json`. A trial is reused
