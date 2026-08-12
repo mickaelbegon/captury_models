@@ -13,6 +13,10 @@ from pathlib import Path
 from typing import Any
 
 from motive57_c3d_mapping import prepared_motive57_c3d_folder
+from isb_segment_audit import (
+    compare_real_model_to_biomod,
+    evaluate_biobuddy_static_against_isb,
+)
 
 DEFAULT_C3D_FOLDER = Path("/Users/mickaelbegon/Downloads/data/Motive")
 DEFAULT_OUTPUT = Path("/tmp/motive_57.bioMod")
@@ -219,6 +223,37 @@ def create_biobuddy_c3d_model(
         output_path.parent.mkdir(parents=True, exist_ok=True)
         print_progress("Écriture du fichier bioMod...")
         result.model.to_biomod(str(output_path), with_mesh=with_mesh)
+        verification = compare_real_model_to_biomod(result.model, output_path)
+        verification_path = output_path.with_suffix(".roundtrip.json")
+        verification_path.write_text(
+            __import__("json").dumps(verification, indent=2), encoding="utf-8"
+        )
+        print_progress(
+            "Roundtrip repères template -> bioMod: "
+            f"{verification['status']} ({verification_path})"
+        )
+        if verification["status"] != "match":
+            raise ValueError(
+                "Les RT du bioMod ne reproduisent pas les repères BioBuddy construits."
+            )
+        static_evaluation = evaluate_biobuddy_static_against_isb(
+            result.model, result.static_data
+        )
+        static_evaluation["biomod_path"] = str(output_path.resolve())
+        static_evaluation["biomod_sha256"] = verification["biomod_sha256"]
+        static_evaluation_path = output_path.with_suffix(".isb_static.json")
+        static_evaluation_path.write_text(
+            __import__("json").dumps(static_evaluation, indent=2), encoding="utf-8"
+        )
+        available_count = sum(
+            item.get("status") == "available"
+            for item in static_evaluation["segments"].values()
+        )
+        print_progress(
+            "Évaluation statique ISB D1-D3: "
+            f"{available_count}/{len(static_evaluation['segments'])} segments "
+            f"({static_evaluation_path})"
+        )
         print_progress(
             f"Preset final: {getattr(result.preset, 'value', result.preset)}"
         )

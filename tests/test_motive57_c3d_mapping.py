@@ -62,9 +62,29 @@ class Motive57C3dMappingTests(unittest.TestCase):
 
             with prepared_motive57_c3d_folder(folder, mapping_path) as prepared:
                 prepared_files = discover_c3d_files(prepared)
+                prepared_static = prepared / "selected_Static.c3d"
+                self.assertTrue(prepared_static.exists())
+                self.assertEqual(
+                    prepared_static.read_text(encoding="utf-8"), "P6_Static.c3d"
+                )
 
         self.assertIn("selected_Static.c3d", prepared_files)
         self.assertIn("selected_Func_LHip.c3d", prepared_files)
+
+    def test_prepared_links_remain_valid_when_source_folder_is_relative(self) -> None:
+        with tempfile.TemporaryDirectory(dir=Path.cwd()) as tmp:
+            folder = Path(tmp)
+            (folder / "P6_Static.c3d").write_text("static", encoding="utf-8")
+            mapping_path = save_motive57_mapping(folder, {"static": "P6_Static.c3d"})
+            relative_folder = folder.relative_to(Path.cwd())
+            relative_mapping = mapping_path.relative_to(Path.cwd())
+
+            with prepared_motive57_c3d_folder(
+                relative_folder, relative_mapping
+            ) as prepared:
+                prepared_static = prepared / "selected_Static.c3d"
+                self.assertTrue(prepared_static.exists())
+                self.assertEqual(prepared_static.read_text(encoding="utf-8"), "static")
 
 
 if __name__ == "__main__":

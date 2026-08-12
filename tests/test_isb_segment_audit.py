@@ -12,8 +12,15 @@ import numpy as np
 
 from gui_graphs import read_table_npz
 from isb_segment_audit import (
+    assess_biobuddy_template_against_isb,
     build_isb_d1_d3_audit,
+    compare_template_frames_to_biomod,
     extract_biobuddy_template_frames,
+    load_isb_segment_targets,
+    load_biobuddy_audit_sidecars,
+    parse_biomod_segment_transforms,
+    evaluate_static_frame_pair,
+    validate_isb_segment_targets,
     write_isb_d1_d3_audit,
 )
 from kinematic_conventions import load_kinematic_conventions
@@ -199,9 +206,11 @@ class IsbSegmentAuditTests(unittest.TestCase):
 
         self.assertEqual(pelvis["D1_status"], "documente_non_evalue")
         self.assertTrue(pelvis["D1_evidence"])
-        self.assertIn(
-            hashlib.sha256(Path(__file__).read_bytes()).hexdigest(),
-            pelvis["D1_evidence"][0],
+        self.assertTrue(
+            any(
+                hashlib.sha256(Path(__file__).read_bytes()).hexdigest() in item
+                for item in pelvis["D1_evidence"]
+            )
         )
 
     def test_missing_biobuddy_import_is_explicit_and_does_not_crash(self) -> None:
@@ -256,6 +265,202 @@ class IsbSegmentAuditTests(unittest.TestCase):
         self.assertEqual(len(loaded_table), len(report["segments"]))
         self.assertIn("D3_status", loaded_table.columns)
         self.assertFalse(paths["json"].suffix == ".csv")
+
+    def test_versioned_isb_targets_cover_biobuddy_segments_with_primary_sources(
+        self,
+    ) -> None:
+        targets = load_isb_segment_targets()
+
+        validate_isb_segment_targets(targets)
+        self.assertEqual(targets["schema_version"], 1)
+        self.assertIn("pelvis", targets["segments"])
+        self.assertIn("thorax", targets["segments"])
+        self.assertEqual(targets["segments"]["head"]["applicability"], "non_applicable")
+        self.assertIn("option 2", targets["segments"]["upper_arm"]["selected_option"])
+        self.assertIn("midway", targets["segments"]["hand"]["origin"]["definition"])
+        for target in targets["segments"].values():
+            if target["applicability"] == "non_applicable":
+                continue
+            self.assertRegex(target["citation"]["doi"], r"^10\.1016/")
+            self.assertTrue(target["origin"]["definition"])
+            self.assertEqual(set(target["axes"]), {"X", "Y", "Z"})
+
+    def test_symbolic_assessment_distinguishes_known_deviations_and_non_applicable(
+        self,
+    ) -> None:
+        frames = extract_biobuddy_template_frames(_Template())
+        assessment = assess_biobuddy_template_against_isb(
+            frames, load_isb_segment_targets()
+        )
+
+        self.assertEqual(assessment["pelvis"]["D2_status"], "deviation")
+        self.assertEqual(assessment["pelvis"]["D3_status"], "deviation")
+        self.assertIn("ISB", assessment["pelvis"]["D2_evidence"][0])
+
+    def test_biomod_parser_and_template_comparison_use_parent_local_transforms(
+        self,
+    ) -> None:
+        biomod = """
+segment Pelvis
+    parent root
+    RTinMatrix 1
+    RT
+        1 0 0 1
+        0 1 0 2
+        0 0 1 3
+        0 0 0 1
+endsegment
+segment RThigh
+    parent Pelvis
+    RTinMatrix 1
+    RT
+        1 0 0 0
+        0 1 0 -1
+        0 0 1 0
+        0 0 0 1
+endsegment
+"""
+        parsed = parse_biomod_segment_transforms(biomod)
+        self.assertEqual(parsed["RThigh"]["parent"], "Pelvis")
+        np.testing.assert_allclose(
+            parsed["RThigh"]["transform"][:3, 3], [0.0, -1.0, 0.0]
+        )
+
+        pelvis = np.eye(4)
+        pelvis[:3, 3] = [1.0, 2.0, 3.0]
+        thigh = pelvis.copy()
+        thigh[1, 3] -= 1.0
+        comparison = compare_template_frames_to_biomod(
+            {"Pelvis": pelvis, "RThigh": thigh},
+            biomod,
+            expected_parents={"Pelvis": "base", "RThigh": "Pelvis"},
+        )
+
+        self.assertEqual(comparison["status"], "match")
+        self.assertLess(comparison["segments"]["RThigh"]["rotation_error_deg"], 1e-10)
+        self.assertLess(comparison["segments"]["RThigh"]["origin_error_mm"], 1e-10)
+        self.assertEqual(comparison["expected_segment_count"], 2)
+        self.assertEqual(comparison["serialized_segment_count"], 2)
+        self.assertEqual(comparison["parent_mismatches"], {})
+
+    def test_biomod_roundtrip_rejects_wrong_segment_parent(self) -> None:
+        biomod = """
+segment Pelvis
+    parent root
+    RTinMatrix 1
+    RT
+        1 0 0 0
+        0 1 0 0
+        0 0 1 0
+        0 0 0 1
+endsegment
+segment RThigh
+    parent root
+    RTinMatrix 1
+    RT
+        1 0 0 0
+        0 1 0 0
+        0 0 1 0
+        0 0 0 1
+endsegment
+"""
+
+        comparison = compare_template_frames_to_biomod(
+            {"Pelvis": np.eye(4), "RThigh": np.eye(4)},
+            biomod,
+            expected_parents={"Pelvis": "base", "RThigh": "Pelvis"},
+        )
+
+        self.assertEqual(comparison["status"], "mismatch")
+        self.assertEqual(
+            comparison["parent_mismatches"]["RThigh"],
+            {"expected": "Pelvis", "serialized": "root"},
+        )
+
+    def test_biomod_roundtrip_rejects_missing_expected_segment(self) -> None:
+        biomod = """
+segment Pelvis
+    parent root
+    RTinMatrix 1
+    RT
+        1 0 0 0
+        0 1 0 0
+        0 0 1 0
+        0 0 0 1
+endsegment
+"""
+
+        comparison = compare_template_frames_to_biomod(
+            {"Pelvis": np.eye(4), "RThigh": np.eye(4)}, biomod
+        )
+
+        self.assertEqual(comparison["status"], "mismatch")
+        self.assertEqual(comparison["missing_segments"], ["RThigh"])
+
+    def test_static_frame_pair_reports_rotation_origin_and_frame_quality(self) -> None:
+        source = np.eye(4)
+        angle = np.deg2rad(10.0)
+        target = np.eye(4)
+        target[:3, :3] = [
+            [np.cos(angle), -np.sin(angle), 0.0],
+            [np.sin(angle), np.cos(angle), 0.0],
+            [0.0, 0.0, 1.0],
+        ]
+        target[:3, 3] = [0.001, 0.002, 0.002]
+
+        result = evaluate_static_frame_pair(source, target)
+
+        self.assertEqual(result["status"], "available")
+        self.assertAlmostEqual(result["angular_deviation_deg"], 10.0)
+        self.assertAlmostEqual(result["origin_deviation_mm"], 3.0)
+        self.assertAlmostEqual(result["source_determinant"], 1.0)
+        self.assertAlmostEqual(result["target_determinant"], 1.0)
+
+    def test_biobuddy_sidecars_are_loaded_only_from_the_selected_biomod(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            biomod = Path(tmp) / "motive_57.bioMod"
+            biomod.write_text("version 4\n", encoding="utf-8")
+            biomod.with_suffix(".roundtrip.json").write_text(
+                json.dumps(
+                    {
+                        "status": "match",
+                        "biomod_sha256": hashlib.sha256(
+                            biomod.read_bytes()
+                        ).hexdigest(),
+                    }
+                ),
+                encoding="utf-8",
+            )
+            biomod.with_suffix(".isb_static.json").write_text(
+                json.dumps(
+                    {
+                        "status": "available",
+                        "segments": {},
+                        "biomod_sha256": hashlib.sha256(
+                            biomod.read_bytes()
+                        ).hexdigest(),
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            sidecars = load_biobuddy_audit_sidecars(biomod)
+
+        self.assertEqual(sidecars["biomod_verification"]["status"], "match")
+        self.assertEqual(sidecars["static_evaluation"]["status"], "available")
+
+    def test_stale_biobuddy_sidecar_is_rejected(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            biomod = Path(tmp) / "motive_57.bioMod"
+            biomod.write_text("version 4\n", encoding="utf-8")
+            biomod.with_suffix(".roundtrip.json").write_text(
+                json.dumps({"status": "match", "biomod_sha256": "stale"}),
+                encoding="utf-8",
+            )
+
+            sidecars = load_biobuddy_audit_sidecars(biomod)
+
+        self.assertEqual(sidecars["biomod_verification"]["status"], "stale")
 
 
 if __name__ == "__main__":

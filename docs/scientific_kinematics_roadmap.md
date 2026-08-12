@@ -178,7 +178,7 @@ identifiables dans le rapport genere.
 | G3 | Unites et axes | partiel | longueurs plausibles, matrices orthonormales et determinant positif |
 | G4 | Translation racine | partiel | rapport Captury/Motive separe avec offset lu et politiques forcees |
 | G5 | Recalage spatial | accepte avec centres reserves; validation anatomique en attente | calibration statique figee; centres de calibration exclus des metriques principales |
-| G6 | ISB D1-D3 | a construire | origine, axes, landmarks et matrice source vers ISB par segment |
+| G6 | ISB D1-D3 | accepte pour diagnostic BioBuddy | cibles Wu versionnees, roundtrip bioMod et evaluation statique; Captury/Motive proprietaires restent inconnus |
 | G7 | ISB D4 rotations | refuse | `R_lab_proximal.T @ R_lab_distal` corrige avant extraction Euler selon le contrat colonne |
 | G8 | ISB D5 translations | non applicable actuellement | translation articulaire distale exprimee dans le repere proximal ISB si elle est analysee |
 | G9 | BioBuddy dynamique | refuse | IK de chaque essai, residus et absence de fallback silencieux |
@@ -319,8 +319,9 @@ examiner pour les comparaisons de marqueurs et la visualisation.
 
 ### Phase 3 - Reperes segmentaires anatomiques et ISB D1-D3
 
-**Etat:** tranche d'inventaire reproductible implementee; gate G6 encore
-refuse pour les deviations numeriques et la conformite.
+**Etat:** phase terminee le 2026-08-12; gate G6 acceptee pour un audit
+diagnostique BioBuddy, avec indisponibilites explicites et sans revendication
+de conformite D1 fondee sur un seuil arbitraire.
 
 Construire une matrice de correction source vers repere anatomique pour chaque
 segment et chaque cote. Pour BioBuddy, confronter les definitions du template
@@ -342,15 +343,20 @@ Le chemin et le SHA-256 du template importe sont enregistres afin de detecter
 les copies locales divergentes. Pour Captury et Motive, les definitions
 proprietaires restent `inconnu`.
 
-Une deviation angulaire n'est calculee que si le registre contient une matrice
-`source_to_isb_rotation` propre et justifiee. Une valeur nulle dans le rapport
-signifie donc "non disponible", jamais "aucune deviation". La deviation
-d'origine reste egalement indisponible tant qu'une origine source et une
-origine ISB appairiees ne sont pas definies. Avant d'accepter G6, il reste a
-versionner les reperes ISB cibles par segment, comparer symboliquement les
-landmarks/formules, tester template vers `.bioMod`, puis evaluer les repères
-sur le statique avec determinant, orthogonalite, direction des axes et
-distance des origines.
+`isb_segment_frames.json` versionne maintenant les cibles Wu 2002/2005, le DOI,
+la section, l'option retenue, l'origine et les axes. La comparaison symbolique
+BioBuddy classe les differences D2/D3 demontrees et garde D1
+`documente_non_evalue` quand une direction anatomique ne suffit pas a prouver
+la conformite. La creation Motive 57 ecrit un roundtrip
+`<modele>.roundtrip.json` des RT locaux template -> bioMod et une evaluation
+`<modele>.isb_static.json`. Sur P6, le roundtrip couvre les 15 segments; 7
+reperes ont une deviation angulaire, une distance d'origine en millimetres,
+les determinants et les erreurs d'orthogonalite. Thorax, tete, mains, pieds et
+bras superieurs restent explicitement indisponibles: T8 absent (TV7 n'est pas
+substitue), aucune cible tete selectionnee, HM2 n'est pas substitue au
+troisieme metacarpien, et les postures neutre de cheville et humerale option 2
+ne sont pas validees dans les metadonnees P6.
+Captury et Motive export restent `inconnu` faute de definition proprietaire.
 
 ### Phase 4 - Cinematique articulaire et ISB D4-D6
 
@@ -475,8 +481,10 @@ sans consulter le code de la GUI.
 | 2026-08-12 | Phase 2, premiere revue | agents independants Hooke et Singer | refuse | fingerprint incomplet, ordre des transformations mal documente, cache avec CSV vide, provenance et option GUI a corriger |
 | 2026-08-12 | Phase 2, revue apres corrections | agents independants Hooke et Singer | approuve | aucun finding bloquant; limites anatomiques explicites; Black, py_compile et validations ciblees reussis |
 | 2026-08-12 | Phase 3, cadrage D1-D3 | agent independant Copernicus | approuve sous conditions | audit traçable accepte; exige distinction definition/fonctionnel/fallback/repere bioMod et interdit toute conformite sans cible ISB versionnee et preuve numerique |
+| 2026-08-12 | Phase 3, fermeture G6 | agents independants Maxwell et Meitner | approuve sous conditions explicites | cibles Wu verifiees; roundtrip template-bioMod valide; aucune substitution T8/TV7 ou HM2/MC3 et Captury/Motive proprietaires maintenus inconnus |
 | 2026-08-12 | Phase 3, premiere revue d'implementation | agent independant Pascal | refuse | preuve D1-D3 par segment absente, indisponibilite du template non propagee aux lignes et exception occlusions-only mal documentee |
 | 2026-08-12 | Phase 3, revue apres corrections | agent independant Pascal | approuve | preuve par segment liee au SHA-256, statut runtime explicite, aucune deviation numerique inventee; 221 tests du depot, Black, py_compile, smoke P6 Static et smoke occlusions-only reussis |
+| 2026-08-12 | Phase 3, revue scientifique finale | agent independant Euler | approuve pour audit diagnostique BioBuddy | roundtrip strict des 15 segments incluant la hierarchie, sidecars lies au SHA-256, 7/15 evaluations anatomiques et 8 indisponibilites justifiees sans suraffirmation de conformite |
 
 Chaque prochaine entree de validation doit enregistrer la commande de test,
 l'environnement, le commit ou diff examine et le chemin de la sortie brute.

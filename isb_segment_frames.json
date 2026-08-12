@@ -1,0 +1,102 @@
+{
+  "schema_version": 1,
+  "registry_id": "isb-segment-frames-wu-2002-2005",
+  "interpretation": "Selected ISB target definitions for a reproducible D1-D3 audit. Left segments use the mirrored anatomical construction; a target is not evidence that an exporter implements it.",
+  "segments": {
+    "pelvis": {
+      "applicability": "applicable",
+      "selected_option": "pelvic coordinate system with functional hip joint centre",
+      "citation": {"doi": "10.1016/S0021-9290(01)00222-6", "section": "4.2-4.3", "pages": "545-546"},
+      "origin": {"definition": "ipsilateral hip joint centre", "landmarks": ["HJC"]},
+      "axes": {
+        "X": "anterior, in the plane defined by both ASIS and the midpoint of both PSIS",
+        "Y": "cranial, orthogonal to X and Z",
+        "Z": "right, along the line joining left ASIS to right ASIS"
+      }
+    },
+    "thorax": {
+      "applicability": "applicable",
+      "selected_option": "thorax technical coordinate system",
+      "citation": {"doi": "10.1016/j.jbiomech.2004.05.042", "section": "2.3.1", "pages": "982-983"},
+      "origin": {"definition": "incisura jugularis (IJ)", "landmarks": ["IJ"]},
+      "axes": {
+        "X": "anterior, orthogonal to Y and Z",
+        "Y": "upward from midpoint(PX,T8) to midpoint(IJ,C7)",
+        "Z": "right, normal to the plane IJ, C7 and midpoint(PX,T8)"
+      }
+    },
+    "head": {
+      "applicability": "non_applicable",
+      "selected_option": "not covered by the selected Wu 2002/2005 segment recommendations",
+      "citation": {"doi": "10.1016/j.jbiomech.2004.05.042", "section": "scope", "pages": "981-992"},
+      "origin": {"definition": "not specified in the selected target", "landmarks": []},
+      "axes": {}
+    },
+    "thigh": {
+      "applicability": "applicable",
+      "selected_option": "femoral coordinate system",
+      "citation": {"doi": "10.1016/S0021-9290(01)00222-6", "section": "4.4", "pages": "546"},
+      "origin": {"definition": "hip joint centre", "landmarks": ["HJC"]},
+      "axes": {
+        "X": "anterior, orthogonal to Y and Z",
+        "Y": "cranial from midpoint of femoral epicondyles to HJC",
+        "Z": "right, normal to the plane HJC and both femoral epicondyles"
+      }
+    },
+    "shank": {
+      "applicability": "applicable",
+      "selected_option": "tibia/fibula coordinate system",
+      "citation": {"doi": "10.1016/S0021-9290(01)00222-6", "section": "3.2-3.3", "pages": "544-545"},
+      "origin": {"definition": "midpoint of medial and lateral malleoli (IM)", "landmarks": ["MM", "LM"]},
+      "axes": {
+        "X": "anterior, normal to the tibial torsional plane",
+        "Y": "cranial, orthogonal to X and Z",
+        "Z": "right, from medial malleolus to lateral malleolus"
+      }
+    },
+    "foot": {
+      "applicability": "applicable",
+      "selected_option": "calcaneal coordinate system in neutral position",
+      "citation": {"doi": "10.1016/S0021-9290(01)00222-6", "section": "3.4", "pages": "545"},
+      "origin": {"definition": "inter-malleolar midpoint in neutral position", "landmarks": ["MM", "LM"]},
+      "axes": {
+        "X": "anterior, normal to the calcaneal frontal plane",
+        "Y": "cranial, parallel to the tibial longitudinal axis in neutral position",
+        "Z": "right, orthogonal to X and Y"
+      }
+    },
+    "upper_arm": {
+      "applicability": "applicable",
+      "selected_option": "humerus option 2 because forearm data are available",
+      "citation": {"doi": "10.1016/j.jbiomech.2004.05.042", "section": "2.3.5", "pages": "983-984"},
+      "origin": {"definition": "glenohumeral joint centre (GH)", "landmarks": ["GH"]},
+      "axes": {
+        "X": "anterior, orthogonal to Y and Z",
+        "Y": "proximal from elbow epicondyle midpoint to GH",
+        "Z": "right, normal to the plane formed by the humerus and forearm longitudinal axes with the elbow at 90 degrees in the sagittal plane and the forearm fully pronated"
+      }
+    },
+    "forearm": {
+      "applicability": "applicable",
+      "selected_option": "forearm coordinate system",
+      "citation": {"doi": "10.1016/j.jbiomech.2004.05.042", "section": "2.3.6", "pages": "984"},
+      "origin": {"definition": "ulnar styloid (US)", "landmarks": ["US"]},
+      "axes": {
+        "X": "anterior, normal to the plane US, RS and elbow midpoint",
+        "Y": "proximal from US to elbow epicondyle midpoint",
+        "Z": "right, orthogonal to X and Y"
+      }
+    },
+    "hand": {
+      "applicability": "surrogate",
+      "selected_option": "third metacarpal for global wrist motion",
+      "citation": {"doi": "10.1016/j.jbiomech.2004.05.042", "section": "2.3.7 and 3.3", "pages": "984, 988-989"},
+      "origin": {"definition": "midway between the base and head of the third metacarpal", "landmarks": ["MC3_base", "MC3_head"]},
+      "axes": {
+        "X": "anterior according to the third metacarpal construction",
+        "Y": "proximal from third metacarpal head to base",
+        "Z": "right, orthogonal to X and Y"
+      }
+    }
+  }
+}

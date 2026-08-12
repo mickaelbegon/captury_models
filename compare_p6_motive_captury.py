@@ -67,7 +67,11 @@ from kinematic_conventions import (
     load_kinematic_conventions,
     segment_source_names,
 )
-from isb_segment_audit import build_isb_d1_d3_audit, write_isb_d1_d3_audit
+from isb_segment_audit import (
+    build_isb_d1_d3_audit,
+    load_biobuddy_audit_sidecars,
+    write_isb_d1_d3_audit,
+)
 from kinematic_rotations import (
     assess_rotation_source_equivalence,
     canonicalize_segment_rotation_mapping,
@@ -4003,7 +4007,12 @@ def main() -> None:
         print(f"Provenance: {provenance_path}")
         return
 
-    isb_audit = build_isb_d1_d3_audit(load_kinematic_conventions())
+    biobuddy_audit_evidence = load_biobuddy_audit_sidecars(args.biobuddy_biomod)
+    isb_audit = build_isb_d1_d3_audit(
+        load_kinematic_conventions(),
+        biomod_verification=biobuddy_audit_evidence["biomod_verification"],
+        static_evaluation=biobuddy_audit_evidence["static_evaluation"],
+    )
     isb_audit_paths = write_isb_d1_d3_audit(args.out_dir, isb_audit)
     scientific_artifacts = {
         "scientific/isb_d1_d3_json": isb_audit_paths["json"],

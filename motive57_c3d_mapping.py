@@ -221,7 +221,10 @@ def _link_or_copy(source: Path, destination: Path) -> None:
     if destination.exists() or destination.is_symlink():
         destination.unlink()
     try:
-        os.symlink(source, destination)
+        # The destination lives in an unrelated temporary directory.  A relative
+        # source would otherwise be resolved from that directory and create a
+        # broken link even though the selected C3D exists.
+        os.symlink(source.resolve(), destination)
     except OSError:
         shutil.copy2(source, destination)
 

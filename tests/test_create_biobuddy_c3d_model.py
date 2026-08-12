@@ -34,6 +34,7 @@ class CreateBioBuddyC3dModelTests(unittest.TestCase):
             return SimpleNamespace(
                 model=_FakeModel(),
                 preset=SimpleNamespace(value="motive_57"),
+                static_data=object(),
             )
 
         fake_api = {
@@ -48,7 +49,19 @@ class CreateBioBuddyC3dModelTests(unittest.TestCase):
             with patch(
                 "create_biobuddy_c3d_model._load_biobuddy_c3d_api",
                 return_value=fake_api,
-            ), redirect_stdout(io.StringIO()):
+            ), patch(
+                "create_biobuddy_c3d_model.compare_real_model_to_biomod",
+                return_value={
+                    "status": "match",
+                    "segments": {},
+                    "biomod_sha256": "synthetic",
+                },
+            ), patch(
+                "create_biobuddy_c3d_model.evaluate_biobuddy_static_against_isb",
+                return_value={"status": "available", "segments": {}},
+            ), redirect_stdout(
+                io.StringIO()
+            ):
                 create_biobuddy_c3d_model(folder, preset="motive_57", output=output)
 
         self.assertEqual(
@@ -61,6 +74,7 @@ class CreateBioBuddyC3dModelTests(unittest.TestCase):
             "create_model": lambda *args, **kwargs: SimpleNamespace(
                 model=_FakeModel(),
                 preset=SimpleNamespace(value="motive_57"),
+                static_data=object(),
             ),
             "default_static_virtual_points": lambda _preset: ("HipCenter",),
         }
@@ -73,7 +87,19 @@ class CreateBioBuddyC3dModelTests(unittest.TestCase):
             with patch(
                 "create_biobuddy_c3d_model._load_biobuddy_c3d_api",
                 return_value=fake_api,
-            ), redirect_stdout(stream):
+            ), patch(
+                "create_biobuddy_c3d_model.compare_real_model_to_biomod",
+                return_value={
+                    "status": "match",
+                    "segments": {},
+                    "biomod_sha256": "synthetic",
+                },
+            ), patch(
+                "create_biobuddy_c3d_model.evaluate_biobuddy_static_against_isb",
+                return_value={"status": "available", "segments": {}},
+            ), redirect_stdout(
+                stream
+            ):
                 create_biobuddy_c3d_model(folder, preset="motive_57", output=output)
 
         log = stream.getvalue()
