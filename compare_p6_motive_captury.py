@@ -85,12 +85,13 @@ from joint_kinematics import (
     frame_corrections_from_static_audit,
     write_joint_kinematics_audit,
 )
+from captury_c3d_angles import analyze_captury_angle_channels
 
 DEFAULT_DATA_ROOT = Path("local_trials/2026-06-30_P6_flat")
 DEFAULT_OUTPUT_ROOT = Path("out_p6_motive_captury_comparison")
 ANGLE_LABEL_REGEX = r"(?i)(^.*angles?$|^.*_angle[s]?$|angle)"
 FOOT_MARKER_PATTERN = r"(LFCC|RFCC|LFM|RFM|LDP|RDP|Foot|Toe|Heel)"
-CACHE_VERSION = 7
+CACHE_VERSION = 8
 ROTATION_SEQUENCE_ZXY = "ZXY"
 DEFAULT_ALIGNMENT_CALIBRATION_CENTRES = (
     "Hips",
@@ -110,6 +111,8 @@ SCIENTIFIC_IMPLEMENTATION_FILES = {
     "isb_segment_audit_code": Path(__file__).with_name("isb_segment_audit.py"),
     "spatial_calibration_code": Path(__file__).with_name("spatial_calibration.py"),
     "mocap_alignment_code": Path(__file__).with_name("mocap_alignment.py"),
+    "captury_c3d_angle_decoder": Path(__file__).with_name("captury_c3d_angles.py"),
+    "captury_c3d_angle_registry": Path(__file__).with_name("captury_c3d_angles.json"),
 }
 
 
@@ -287,6 +290,7 @@ def required_trial_outputs(
         trial_dir / "kinematics_q_timeseries.npz",
         trial_dir / "captury_c3d_angle_metrics.csv",
         trial_dir / "captury_c3d_angle_timeseries.npz",
+        trial_dir / "captury_c3d_angle_decode.json",
         trial_dir / "segment_rotation_metrics.csv",
         trial_dir / "segment_rotation_timeseries.npz",
         trial_dir / "joint_kinematics_d4_d6.json",
@@ -643,6 +647,14 @@ def comparison_derived_artifacts(
             artifacts[f"{trial}/kinematics/d4_d6_timeseries"] = Path(
                 joint_kinematics_timeseries
             )
+        for output_name in (
+            "captury_c3d_angle_decode",
+            "captury_c3d_angle_metrics",
+            "captury_c3d_angle_timeseries",
+        ):
+            output_path = report.get("outputs", {}).get(output_name)
+            if output_path:
+                artifacts[f"{trial}/kinematics/{output_name}"] = Path(output_path)
     return artifacts
 
 
@@ -2149,21 +2161,33 @@ def captury_c3d_angle_rows(
     c3d_angle_unit: str,
     cut_start_s: float | None,
     cut_end_s: float | None,
-) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]], dict[str, Any]]:
     split = split_c3d_points(
         captury_c3d,
         bvh_unit_scale_to_m=0.001,
         angle_label_regex=angle_label_regex,
     )
+    decode_report = analyze_captury_angle_channels(
+        split.c3d, requested_unit=c3d_angle_unit
+    )
     if not split.angle_labels or split.angle_data.size == 0:
-        return [], []
+        return [], [], decode_report
     mask = time_window_mask(split.time, cut_start_s, cut_end_s)
     time = split.time[mask]
-    angle_deg = split.angle_data[:, :, mask] * c3d_angle_scale_to_deg(c3d_angle_unit)
+    angle_deg = split.angle_data[:, :, mask] * float(
+        decode_report["value_scale_to_deg"]
+    )
     summary_rows: list[dict[str, Any]] = []
     timeseries_rows: list[dict[str, Any]] = []
     axis_names = ("X", "Y", "Z")
+    channel_by_point_index = {
+        int(channel["point_index"]): channel
+        for channel in decode_report["channels"]
+        if channel["point_index"] is not None
+    }
     for angle_index, angle_label in enumerate(split.angle_labels):
+        source_point_index = split.angle_indices[angle_index]
+        decoded_channel = channel_by_point_index.get(source_point_index, {})
         safe_label = sanitize_channel_name(angle_label, f"angle_{angle_index}")
         for axis_index, axis_name in enumerate(axis_names):
             values = angle_deg[axis_index, angle_index, :]
@@ -2179,6 +2203,13 @@ def captury_c3d_angle_rows(
                     "source": "captury_c3d",
                     "c3d_angle_label": angle_label,
                     "c3d_angle_axis": axis_name,
+                    "articulation": decoded_channel.get("articulation"),
+                    "identity_decoded": bool(
+                        decoded_channel.get("identity_decoded", False)
+                    ),
+                    "component_semantics_decoded": False,
+                    "eligible_for_anatomical_agreement": False,
+                    "angle_unit_source": decode_report["unit"].get("source"),
                     "c3d_mean_deg": float(np.mean(finite)),
                     "c3d_sd_deg": float(np.std(finite)),
                     "c3d_min_deg": float(np.min(finite)),
@@ -2192,9 +2223,13 @@ def captury_c3d_angle_rows(
                         "time": float(time_value),
                         "q_name": q_name,
                         "captury_c3d": float(values[frame_index]),
+                        "articulation": decoded_channel.get("articulation"),
+                        "source_component": axis_name,
+                        "component_semantics_decoded": False,
+                        "eligible_for_anatomical_agreement": False,
                     }
                 )
-    return summary_rows, timeseries_rows
+    return summary_rows, timeseries_rows, decode_report
 
 
 def c3d_angle_inventory(path: Path, angle_label_regex: str) -> dict[str, Any]:
@@ -3543,7 +3578,7 @@ def compare_trial(
     q_rows, q_ts_rows = q_metric_rows_with_optional_biobuddy(
         bundle.name, q_captury_metrics, q_motive_metrics, biobuddy_run
     )
-    c3d_angle_rows, c3d_angle_ts_rows = captury_c3d_angle_rows(
+    c3d_angle_rows, c3d_angle_ts_rows, c3d_angle_decode_report = captury_c3d_angle_rows(
         bundle.name,
         bundle.captury_c3d,
         args.angle_label_regex,
@@ -3685,6 +3720,10 @@ def compare_trial(
     write_table_npz(trial_dir / "kinematics_q_timeseries.npz", q_ts_rows)
     write_rows(trial_dir / "captury_c3d_angle_metrics.csv", c3d_angle_rows)
     write_table_npz(trial_dir / "captury_c3d_angle_timeseries.npz", c3d_angle_ts_rows)
+    c3d_angle_decode_path = trial_dir / "captury_c3d_angle_decode.json"
+    c3d_angle_decode_path.write_text(
+        json.dumps(c3d_angle_decode_report, indent=2), encoding="utf-8"
+    )
     write_rows(trial_dir / "segment_rotation_metrics.csv", segment_rows)
     write_table_npz(trial_dir / "segment_rotation_timeseries.npz", segment_ts_rows)
     write_rows(trial_dir / "model_dimensions.csv", dimension_rows)
@@ -3770,6 +3809,7 @@ def compare_trial(
             "captury_c3d_angle_timeseries": str(
                 trial_dir / "captury_c3d_angle_timeseries.npz"
             ),
+            "captury_c3d_angle_decode": str(c3d_angle_decode_path),
             "segment_rotation_metrics": str(trial_dir / "segment_rotation_metrics.csv"),
             "segment_rotation_timeseries": str(
                 trial_dir / "segment_rotation_timeseries.npz"
@@ -3819,6 +3859,7 @@ def compare_trial(
             "captury": c3d_angle_inventory(bundle.captury_c3d, args.angle_label_regex),
             "motive": c3d_angle_inventory(bundle.motive_c3d, args.angle_label_regex),
         },
+        "captury_c3d_angle_decode": c3d_angle_decode_report,
         "duplicate_label_inventory": {
             "captury": duplicate_label_inventory(bundle.captury_c3d),
             "motive": duplicate_label_inventory(bundle.motive_c3d),
@@ -3990,7 +4031,11 @@ def parse_args() -> argparse.Namespace:
         "--c3d-angle-unit",
         choices=["deg", "rad"],
         default="deg",
-        help="Unit used by Captury C3D angle channels stored in POINT.",
+        help=(
+            "Unit used by Captury C3D angle channels stored in POINT. Captury P6 "
+            "does not expose dedicated angle-unit metadata, so the default 'deg' "
+            "is an explicit assumption."
+        ),
     )
     parser.add_argument(
         "--segment-reference",

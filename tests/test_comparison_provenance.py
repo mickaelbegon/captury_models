@@ -89,6 +89,8 @@ class ComparisonProvenanceTests(unittest.TestCase):
                 "isb_segment_audit_code",
                 "spatial_calibration_code",
                 "mocap_alignment_code",
+                "captury_c3d_angle_decoder",
+                "captury_c3d_angle_registry",
             },
         )
         self.assertNotEqual(first["digest"], second["digest"])
@@ -182,6 +184,9 @@ class ComparisonProvenanceTests(unittest.TestCase):
                     "spatial_calibration": "/tmp/spatial_calibration.json",
                     "joint_kinematics_d4_d6": "/tmp/joint_d4_d6.json",
                     "joint_kinematics_d4_d6_timeseries": "/tmp/joint_d4_d6.npz",
+                    "captury_c3d_angle_decode": "/tmp/captury_angles.json",
+                    "captury_c3d_angle_metrics": "/tmp/captury_angles.csv",
+                    "captury_c3d_angle_timeseries": "/tmp/captury_angles.npz",
                 },
                 "skin_marker_correspondence": {"map_source": "automatic_proposal"},
                 "bvh_fbx_rotation_audit": {
@@ -216,6 +221,15 @@ class ComparisonProvenanceTests(unittest.TestCase):
                 ),
                 "Static/kinematics/d4_d6_json": Path("/tmp/joint_d4_d6.json"),
                 "Static/kinematics/d4_d6_timeseries": Path("/tmp/joint_d4_d6.npz"),
+                "Static/kinematics/captury_c3d_angle_decode": Path(
+                    "/tmp/captury_angles.json"
+                ),
+                "Static/kinematics/captury_c3d_angle_metrics": Path(
+                    "/tmp/captury_angles.csv"
+                ),
+                "Static/kinematics/captury_c3d_angle_timeseries": Path(
+                    "/tmp/captury_angles.npz"
+                ),
             },
         )
 

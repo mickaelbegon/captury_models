@@ -523,6 +523,7 @@ Main outputs:
 - `out_p6_motive_captury_comparison/<trial>/kinematics_q_timeseries.npz`
 - `out_p6_motive_captury_comparison/<trial>/captury_c3d_angle_metrics.csv`
 - `out_p6_motive_captury_comparison/<trial>/captury_c3d_angle_timeseries.npz`
+- `out_p6_motive_captury_comparison/<trial>/captury_c3d_angle_decode.json`
 - `out_p6_motive_captury_comparison/<trial>/<system>/<source>/<system>_<source>_root_translation_policy.json`
 - `out_p6_motive_captury_comparison/<trial>/motive_marker_occlusions.csv`
 - `out_p6_motive_captury_comparison/<trial>/trial_events_contacts.csv`
@@ -585,7 +586,9 @@ python compare_p6_motive_captury.py \
   --out-dir out_p6_motive_captury_ik_check
 ```
 
-Kinematic comparisons in `kinematics_q_metrics.csv` are intentionally conservative: they compare matching generalized-coordinate names from the generated BioBuddy models. Translation channels are useful for gross motion checks. Rotation channels are written in radians in the CSV outputs, then converted to degrees in the GUI for readability. Captury and Motive BVH/FBX exports may use different local segment frames, Euler sequences or axis signs, so angular differences should be interpreted as diagnostic rather than direct biomechanical agreement. Captury C3D angle channels are inventoried when present, excluded from marker processing, stored in `captury_c3d_angle_timeseries.npz`, and appended to the kinematics GUI as `CapturyC3D_*` channels. The Motive C3D files inspected here do not expose matching C3D angle channels. Captury duplicate C3D labels are inventoried in `run_report.json`; current marker correspondences average duplicate labels until they are renamed more explicitly.
+Kinematic comparisons in `kinematics_q_metrics.csv` are intentionally conservative: they compare matching generalized-coordinate names from the generated BioBuddy models. Translation channels are useful for gross motion checks. Rotation channels are written in radians in the CSV outputs, then converted to degrees in the GUI for readability. Captury and Motive BVH/FBX exports may use different local segment frames, Euler sequences or axis signs, so angular differences should be interpreted as diagnostic rather than direct biomechanical agreement.
+
+Captury C3D angle channels are excluded from marker processing, stored in `captury_c3d_angle_timeseries.npz`, and appended to the kinematics GUI as `CapturyC3D_*` channels. The versioned `captury_c3d_angles.json` registry maps the 13 abbreviated `POINT:LABELS` channels to their `POINT:ANGLES` names and anatomical articulations. This decodes channel identity only: Captury P6 files do not provide a dedicated angle-unit parameter, Euler sequence, signs, or anatomical meaning for X/Y/Z. The GUI/CLI `deg` or `rad` selection is therefore recorded as an explicit assumption, and every raw component remains `eligible_for_anatomical_agreement=false`. `captury_c3d_angle_decode.json` reports constants, exact duplicate curves, discontinuities and out-of-range values for each trial. In P6 Static, the decoder finds exact copies across several shoulder/elbow/wrist components and constant `left_elbow/Y` and `left_wrist/Z`; these channels must not be interpreted as independent anatomical DoFs. The Motive C3D files inspected here do not expose matching C3D angle channels. Captury duplicate marker labels are inventoried separately in `run_report.json`; current marker correspondences average duplicate labels until they are renamed more explicitly.
 
 ## Local Marker Test
 

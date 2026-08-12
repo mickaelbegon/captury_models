@@ -1,0 +1,33 @@
+{
+  "schema_version": 1,
+  "registry_id": "captury-c3d-angle-channels",
+  "identity_status": "decoded_from_p6_c3d_metadata",
+  "component_semantics_status": "unknown",
+  "rotation_sequence": null,
+  "eligible_for_anatomical_agreement": false,
+  "evidence": [
+    "Captury P6 POINT:LABELS abbreviations",
+    "Captury P6 POINT:ANGLES long names",
+    "Trailing channel order shared by the inspected P6 trials"
+  ],
+  "limitations": [
+    "No dedicated angle-unit parameter is present in the inspected P6 files.",
+    "The Euler sequence, component signs and anatomical meanings of X/Y/Z are not documented.",
+    "POINT:UNITS describes point coordinates and must not be used as the angle unit."
+  ],
+  "channels": [
+    {"articulation": "right_hip", "point_label": "RHip", "parameter_name": "RHipAngles"},
+    {"articulation": "left_hip", "point_label": "LHip", "parameter_name": "LHipAngles"},
+    {"articulation": "right_knee", "point_label": "RKne", "parameter_name": "RKneeAngles"},
+    {"articulation": "left_knee", "point_label": "LKne", "parameter_name": "LKneeAngles"},
+    {"articulation": "right_ankle", "point_label": "RAnk", "parameter_name": "RAnkleAngles"},
+    {"articulation": "left_ankle", "point_label": "LAnk", "parameter_name": "LAnkleAngles"},
+    {"articulation": "right_shoulder", "point_label": "RSho", "parameter_name": "RShoulderAngles"},
+    {"articulation": "left_shoulder", "point_label": "LSho", "parameter_name": "LShoulderAngles"},
+    {"articulation": "right_elbow", "point_label": "RElb", "parameter_name": "RElbowAngles"},
+    {"articulation": "left_elbow", "point_label": "LElb", "parameter_name": "LElbowAngles"},
+    {"articulation": "right_wrist", "point_label": "RWri", "parameter_name": "RWristAngles"},
+    {"articulation": "left_wrist", "point_label": "LWri", "parameter_name": "LWristAngles"},
+    {"articulation": "neck", "point_label": "Neck", "parameter_name": "Neck"}
+  ]
+}

@@ -419,6 +419,22 @@ uniplanaires controles.
 **Gate:** un canal non decode reste visible comme donnees brutes, mais est
 exclu des metriques d'accord anatomique.
 
+**Etat au 2026-08-12:** gate diagnostique atteint. Le registre versionne
+`captury_c3d_angles.json` relie les 13 abbreviations `POINT:LABELS`, les noms
+longs `POINT:ANGLES` et les articulations. Il ne definit volontairement ni
+sequence Euler, ni signes, ni semantique anatomique X/Y/Z. Le decodeur
+`captury_c3d_angles.py` ignore `POINT:UNITS=mm` pour les angles, enregistre
+`deg`/`rad` comme hypothese CLI lorsqu'aucune metadata dediee n'existe et ecrit
+`captury_c3d_angle_decode.json`. Les courbes brutes restent visibles avec
+`eligible_for_anatomical_agreement=false`.
+
+Le smoke P6 Static identifie 13 canaux, trois groupes de composantes exactement
+dupliquees et deux composantes constantes (`left_elbow/Y`, `left_wrist/Z`).
+Les essais synthetiques couvrent metadata, degres/radians, duplication,
+constance, discontinuite, plage et mouvement uniplanaire. La conformite
+anatomique reste refusee jusqu'a obtention d'une documentation fournisseur ou
+d'un protocole controle permettant d'identifier sequence, signes et axes.
+
 ### Phase 6 - BioBuddy comme troisieme modele dynamique
 
 Executer la QLD statique puis l'IK batch sur tous les essais Motive. Enregistrer
@@ -521,6 +537,7 @@ sans consulter le code de la GUI.
 | 2026-08-12 | Phase 3, revue scientifique finale | agent independant Euler | approuve pour audit diagnostique BioBuddy | roundtrip strict des 15 segments incluant la hierarchie, sidecars lies au SHA-256, 7/15 evaluations anatomiques et 8 indisponibilites justifiees sans suraffirmation de conformite |
 | 2026-08-12 | Phase 4, premiere revue | agent independant Planck | refuse G7 final; accepte partiellement le diagnostic | corrections non tracees, equivalence JCS non testee, signes non appliques et smoke anterieur au diff |
 | 2026-08-12 | Phase 4, revue apres corrections | agent independant Planck | accepte G7 diagnostique; refuse G7 final ISB | matrices et SHA traces, axes JCS/signatures testees, signes appliques, singularites/quaternions conserves, smoke final P6; G6 reste diagnostique |
+| 2026-08-12 | Phase 5, tests, smoke et revue finale | Codex + agent independant Planck | gate diagnostique approuve | 259 tests, 2 subtests, `black --check`, `py_compile` et smoke P6 Static dans `/tmp/captury_phase5_smoke_final`; 13 identites decodees, unite `deg` explicitement assumee, trois groupes dupliques et deux composantes constantes; JSON/CSV/NPZ traces dans la provenance; accord anatomique refuse |
 
 Chaque prochaine entree de validation doit enregistrer la commande de test,
 l'environnement, le commit ou diff examine et le chemin de la sortie brute.
