@@ -1,0 +1,146 @@
+{
+  "schema_version": 1,
+  "registry_id": "isb-joint-kinematics-d4-d6",
+  "matrix_convention": "column_vectors",
+  "relative_rotation": "R_proximal_distal = (R_lab_proximal @ C_proximal).T @ (R_lab_distal @ C_distal)",
+  "euler_convention": {
+    "rotations": "active",
+    "axes": "intrinsic",
+    "composition": "R = R_axis1(angle1) @ R_axis2(angle2) @ R_axis3(angle3)",
+    "unit": "rad_internal_deg_display",
+    "unwrap": "numpy.unwrap independently per Euler component",
+    "singularity_policy": "retain SO(3) matrix and geodesic result; flag Euler components as singular or near_singular"
+  },
+  "zero_definition": "zero joint rotation means aligned proximal and distal target anatomical coordinate systems in the declared neutral reference configuration",
+  "D5_translation": {
+    "definition": "q_proximal = R_lab_proximal.T @ (p_lab_distal_common - p_lab_proximal_common)",
+    "required_common_point": true,
+    "unit": "source_length_unit",
+    "citation": {
+      "doi": "10.1016/S0021-9290(01)00222-6",
+      "section": "General JCS and joint-displacement recommendation"
+    }
+  },
+  "articulations": {
+    "ankle": {
+      "proximal": "shank",
+      "distal": "foot",
+      "type": "JCS",
+      "sequence": "ZXY",
+      "components": ["dorsiflexion_plantarflexion", "inversion_eversion", "internal_external_rotation"],
+      "positive_signs": ["dorsiflexion", "inversion", "internal_rotation"],
+      "laterality": {
+        "right": {"component_signs": [1, 1, 1], "preprocessing": "none"},
+        "left": {"component_signs": [1, 1, 1], "preprocessing": "construct_left_anatomical_frames_with_ISB_axis_directions"}
+      },
+      "D4_status": "conforme_target",
+      "D6_status": "non_applicable",
+      "citation": {"doi": "10.1016/S0021-9290(01)00222-6", "section": "3.5"}
+    },
+    "hip": {
+      "proximal": "pelvis",
+      "distal": "thigh",
+      "type": "JCS",
+      "sequence": "ZXY",
+      "components": ["flexion_extension", "adduction_abduction", "internal_external_rotation"],
+      "positive_signs": ["flexion", "adduction", "internal_rotation"],
+      "laterality": {
+        "right": {"component_signs": [1, 1, 1], "preprocessing": "none"},
+        "left": {"component_signs": [1, 1, 1], "preprocessing": "construct_left_anatomical_frames_with_ISB_axis_directions"}
+      },
+      "D4_status": "conforme_target",
+      "D6_status": "non_applicable",
+      "citation": {"doi": "10.1016/S0021-9290(01)00222-6", "section": "4.5"}
+    },
+    "spine": {
+      "proximal": "proximal_vertebra",
+      "distal": "distal_vertebra",
+      "type": "JCS",
+      "sequence": "ZXY",
+      "components": ["flexion_extension", "lateral_bending", "axial_rotation"],
+      "positive_signs": ["flexion", "right_lateral_bending", "left_axial_rotation"],
+      "laterality": {
+        "right": {"component_signs": [1, 1, 1], "preprocessing": "not_applicable"},
+        "left": {"component_signs": [1, 1, 1], "preprocessing": "not_applicable"}
+      },
+      "D4_status": "conforme_target",
+      "D6_status": "non_applicable",
+      "citation": {"doi": "10.1016/S0021-9290(01)00222-6", "section": "5.3"}
+    },
+    "knee": {
+      "proximal": "thigh",
+      "distal": "shank",
+      "type": "JCS",
+      "sequence": "ZXY",
+      "components": ["flexion_extension", "adduction_abduction", "internal_external_rotation"],
+      "positive_signs": ["flexion", "adduction", "internal_rotation"],
+      "laterality": {
+        "right": {"component_signs": [1, 1, 1], "preprocessing": "none"},
+        "left": {"component_signs": [1, 1, 1], "preprocessing": "construct_left_anatomical_frames_with_consistent_axis_directions"}
+      },
+      "D4_status": "conforme_target",
+      "D6_status": "non_applicable",
+      "citation": {"doi": "10.1115/1.3138397", "section": "Joint coordinate system"}
+    },
+    "elbow": {
+      "proximal": "upper_arm",
+      "distal": "forearm",
+      "type": "JCS",
+      "sequence": "ZXY",
+      "components": ["flexion_extension", "carrying_angle", "pronation_supination"],
+      "positive_signs": ["flexion", "defined_by_floating_axis", "pronation"],
+      "laterality": {
+        "right": {"component_signs": [1, 1, 1], "preprocessing": "none"},
+        "left": {"component_signs": [1, 1, 1], "preprocessing": "mirror_positions_across_sagittal_plane_before_frame_construction"}
+      },
+      "D4_status": "conforme_target",
+      "D6_status": "non_applicable",
+      "citation": {"doi": "10.1016/j.jbiomech.2004.05.042", "section": "3.4.1"}
+    },
+    "wrist": {
+      "proximal": "forearm_or_radius",
+      "distal": "hand_or_metacarpal",
+      "type": "JCS",
+      "sequence": "ZXY",
+      "components": ["flexion_extension", "radial_ulnar_deviation", "pronation_supination"],
+      "positive_signs": ["flexion", "ulnar_deviation", "pronation"],
+      "laterality": {
+        "right": {"component_signs": [1, 1, 1], "preprocessing": "none"},
+        "left": {"component_signs": [1, 1, 1], "preprocessing": "mirror_positions_across_sagittal_plane_before_frame_construction"}
+      },
+      "D4_status": "conforme_target",
+      "D6_status": "non_applicable",
+      "citation": {"doi": "10.1016/j.jbiomech.2004.05.042", "section": "4.4.1"}
+    },
+    "glenohumeral": {
+      "proximal": "scapula",
+      "distal": "upper_arm",
+      "type": "Euler",
+      "sequence": "YXY",
+      "components": ["plane_of_elevation", "elevation", "axial_rotation"],
+      "positive_signs": ["toward_flexion_plane", "negative_elevation_by_ISB_axis_choice", "internal_rotation"],
+      "laterality": {
+        "right": {"component_signs": [1, 1, 1], "preprocessing": "none"},
+        "left": {"component_signs": [1, 1, 1], "preprocessing": "mirror_positions_across_sagittal_plane_before_frame_construction"}
+      },
+      "D4_status": "conforme_target",
+      "D6_status": "conforme_target",
+      "citation": {"doi": "10.1016/j.jbiomech.2004.05.042", "section": "2.4.4"}
+    },
+    "thoracohumeral": {
+      "proximal": "thorax",
+      "distal": "upper_arm",
+      "type": "Euler",
+      "sequence": "YXY",
+      "components": ["plane_of_elevation", "elevation", "axial_rotation"],
+      "positive_signs": ["toward_flexion_plane", "negative_elevation_by_ISB_axis_choice", "internal_rotation"],
+      "laterality": {
+        "right": {"component_signs": [1, 1, 1], "preprocessing": "none"},
+        "left": {"component_signs": [1, 1, 1], "preprocessing": "mirror_positions_across_sagittal_plane_before_frame_construction"}
+      },
+      "D4_status": "conforme_target",
+      "D6_status": "deviation",
+      "citation": {"doi": "10.1016/j.jbiomech.2004.05.042", "section": "2.4.7"}
+    }
+  }
+}

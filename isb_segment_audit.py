@@ -545,14 +545,16 @@ def evaluate_static_frame_pair(
         raise ValueError("Static source and target frames must both be 4x4")
     source_rotation = source[:3, :3]
     target_rotation = target[:3, :3]
+    source_proper = _closest_proper_rotation(source_rotation)
+    target_proper = _closest_proper_rotation(target_rotation)
     angular_deviation_deg, rotation_vector_deg = _rotation_deviation(
-        _closest_proper_rotation(target_rotation).T
-        @ _closest_proper_rotation(source_rotation)
+        target_proper.T @ source_proper
     )
     return {
         "status": "available",
         "angular_deviation_deg": angular_deviation_deg,
         "rotation_vector_deg": rotation_vector_deg,
+        "source_to_target_rotation": (source_proper.T @ target_proper).tolist(),
         "origin_deviation_mm": float(
             np.linalg.norm(source[:3, 3] - target[:3, 3]) * 1000.0
         ),

@@ -179,7 +179,7 @@ identifiables dans le rapport genere.
 | G4 | Translation racine | partiel | rapport Captury/Motive separe avec offset lu et politiques forcees |
 | G5 | Recalage spatial | accepte avec centres reserves; validation anatomique en attente | calibration statique figee; centres de calibration exclus des metriques principales |
 | G6 | ISB D1-D3 | accepte pour diagnostic BioBuddy | cibles Wu versionnees, roundtrip bioMod et evaluation statique; Captury/Motive proprietaires restent inconnus |
-| G7 | ISB D4 rotations | refuse | `R_lab_proximal.T @ R_lab_distal` corrige avant extraction Euler selon le contrat colonne |
+| G7 | ISB D4 rotations | accepte pour diagnostic BioBuddy hanche/genou; final ISB refuse | matrices parent-enfant corrigees, axes JCS, signes, singularites, roundtrip et provenance; G6 et corrections des autres sources/articulations restent incomplets |
 | G8 | ISB D5 translations | non applicable actuellement | translation articulaire distale exprimee dans le repere proximal ISB si elle est analysee |
 | G9 | BioBuddy dynamique | refuse | IK de chaque essai, residus et absence de fallback silencieux |
 | G10 | Synchronisation | a construire | lag, evenements communs, erreur residuelle et cycles documentes |
@@ -360,6 +360,12 @@ Captury et Motive export restent `inconnu` faute de definition proprietaire.
 
 ### Phase 4 - Cinematique articulaire et ISB D4-D6
 
+**Etat:** phase terminee le 2026-08-12; G7 accepte comme diagnostic pour les
+hanches et genoux BioBuddy disposant de deux corrections de repere justifiees.
+G7 final ISB reste refuse tant que les repères D1-D3 ne sont pas valides comme
+conformes et que les autres sources restent proprietaires. Les matrices
+relatives restent diagnostiques pour Captury/Motive et les autres articulations.
+
 Calculer les rotations parent-enfant corrigees puis extraire une convention
 commune propre a chaque articulation. Les matrices/quaternions restent
 disponibles pour une mesure geodesique independante de la sequence Euler.
@@ -371,6 +377,34 @@ cas combines, singularites, unwrap, droite/gauche et roundtrip matrice-Euler.
 signes et unite. L'epaule distingue thoracohumeral et glenohumeral; D6 est
 rapporte separement. Un angle glenohumeral n'est pas produit lorsque le modele
 ne contient pas de scapula.
+
+**Implemente le 2026-08-12:** `isb_joint_kinematics.json` versionne les cibles
+Wu/Grood-Suntay, les segments proximal/distal, les sequences, les composantes,
+les signes et le traitement gauche/droite. `joint_kinematics.py` applique les
+corrections par multiplication droite, calcule
+`R_proximal_distal = R_lab_proximal.T @ R_lab_distal`, extrait les angles
+Euler/Cardan intrinseques, matérialise les axes fixe proximal, flottant et fixe
+distal du JCS, applique les signes explicites, effectue l'unwrap et conserve
+les flags de singularite ainsi que l'erreur de roundtrip geodesique. La translation D5 est
+definie et testee comme difference d'un point commun exprimee dans le repere
+proximal, mais reste `non_applicable` dans le batch faute de translation
+articulaire reconstruite.
+
+Le batch ecrit `joint_kinematics_d4_d6.json` et un NPZ compresse. Sur le smoke
+P6 Static de 20 frames, BioBuddy produit les hanches et genoux droit/gauche en
+ZXY, avec les corrections et le SHA-256 du sidecar statique enregistres, sans
+singularite et avec une erreur maximale de roundtrip inferieure a
+`2.3e-14 deg`. Captury et Motive conservent leurs 13 rotations relatives SO(3)
+mais aucune composante Euler anatomique n'est emise car leurs corrections de
+repere source vers ISB restent inconnues. L'epaule BioBuddy est explicitement
+`thoracohumeral` avec D6 `deviation`; aucun angle glenohumeral n'est invente en
+l'absence de scapula.
+
+La revue independante finale accepte ce gate diagnostique. Elle maintient G7
+final ISB refuse parce que les corrections anatomiques proviennent de l'audit
+G6 diagnostique. Le JSON D4-D6 conserve les matrices proximal/distal appliquees,
+le chemin et le SHA-256 du sidecar statique, ainsi que le SHA-256 du bioMod; le
+manifeste final hashe egalement les sorties JSON/NPZ.
 
 ### Phase 5 - Decodeur des angles C3D Captury
 
@@ -485,6 +519,8 @@ sans consulter le code de la GUI.
 | 2026-08-12 | Phase 3, premiere revue d'implementation | agent independant Pascal | refuse | preuve D1-D3 par segment absente, indisponibilite du template non propagee aux lignes et exception occlusions-only mal documentee |
 | 2026-08-12 | Phase 3, revue apres corrections | agent independant Pascal | approuve | preuve par segment liee au SHA-256, statut runtime explicite, aucune deviation numerique inventee; 221 tests du depot, Black, py_compile, smoke P6 Static et smoke occlusions-only reussis |
 | 2026-08-12 | Phase 3, revue scientifique finale | agent independant Euler | approuve pour audit diagnostique BioBuddy | roundtrip strict des 15 segments incluant la hierarchie, sidecars lies au SHA-256, 7/15 evaluations anatomiques et 8 indisponibilites justifiees sans suraffirmation de conformite |
+| 2026-08-12 | Phase 4, premiere revue | agent independant Planck | refuse G7 final; accepte partiellement le diagnostic | corrections non tracees, equivalence JCS non testee, signes non appliques et smoke anterieur au diff |
+| 2026-08-12 | Phase 4, revue apres corrections | agent independant Planck | accepte G7 diagnostique; refuse G7 final ISB | matrices et SHA traces, axes JCS/signatures testees, signes appliques, singularites/quaternions conserves, smoke final P6; G6 reste diagnostique |
 
 Chaque prochaine entree de validation doit enregistrer la commande de test,
 l'environnement, le commit ou diff examine et le chemin de la sortie brute.

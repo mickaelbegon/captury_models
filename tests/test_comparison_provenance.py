@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import unittest
 import argparse
+import hashlib
 import tempfile
 from pathlib import Path
 from unittest.mock import patch
@@ -14,6 +15,15 @@ import compare_p6_motive_captury as comparison
 
 
 class ComparisonProvenanceTests(unittest.TestCase):
+    def test_file_sha256_hashes_sidecar_content(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "evidence.json"
+            path.write_bytes(b"phase-4-evidence")
+
+            digest = comparison.file_sha256(path)
+
+        self.assertEqual(digest, hashlib.sha256(b"phase-4-evidence").hexdigest())
+
     def test_cache_fingerprint_tracks_scientific_implementation_files(self) -> None:
         bundle = comparison.TrialBundle(
             "Static",
@@ -74,6 +84,8 @@ class ComparisonProvenanceTests(unittest.TestCase):
                 "kinematic_conventions_registry",
                 "kinematic_conventions_code",
                 "kinematic_rotations_code",
+                "joint_kinematics_registry",
+                "joint_kinematics_code",
                 "isb_segment_audit_code",
                 "spatial_calibration_code",
                 "mocap_alignment_code",
@@ -168,6 +180,8 @@ class ComparisonProvenanceTests(unittest.TestCase):
                 "outputs": {
                     "skin_marker_correspondence_proposal": "/tmp/proposal.json",
                     "spatial_calibration": "/tmp/spatial_calibration.json",
+                    "joint_kinematics_d4_d6": "/tmp/joint_d4_d6.json",
+                    "joint_kinematics_d4_d6_timeseries": "/tmp/joint_d4_d6.npz",
                 },
                 "skin_marker_correspondence": {"map_source": "automatic_proposal"},
                 "bvh_fbx_rotation_audit": {
@@ -200,6 +214,8 @@ class ComparisonProvenanceTests(unittest.TestCase):
                 "Static/alignment/spatial_calibration": Path(
                     "/tmp/spatial_calibration.json"
                 ),
+                "Static/kinematics/d4_d6_json": Path("/tmp/joint_d4_d6.json"),
+                "Static/kinematics/d4_d6_timeseries": Path("/tmp/joint_d4_d6.npz"),
             },
         )
 

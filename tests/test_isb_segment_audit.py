@@ -415,6 +415,11 @@ endsegment
         self.assertAlmostEqual(result["origin_deviation_mm"], 3.0)
         self.assertAlmostEqual(result["source_determinant"], 1.0)
         self.assertAlmostEqual(result["target_determinant"], 1.0)
+        np.testing.assert_allclose(
+            np.asarray(result["source_to_target_rotation"]),
+            target[:3, :3],
+            atol=1e-10,
+        )
 
     def test_biobuddy_sidecars_are_loaded_only_from_the_selected_biomod(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

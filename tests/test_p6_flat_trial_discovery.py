@@ -37,6 +37,7 @@ try:
         rotate_segment_frames_180_x,
         root_alignment_score_mm,
         sanitize_channel_name,
+        segment_rotation_metric_rows,
         segment_relative_rotation_curves,
         split_static_calibration_trial,
         spatial_calibration_from_report,
@@ -76,6 +77,7 @@ except ImportError as exc:  # pragma: no cover - depends on optional scientific 
     rotate_segment_frames_180_x = None
     root_alignment_score_mm = None
     sanitize_channel_name = None
+    segment_rotation_metric_rows = None
     segment_relative_rotation_curves = None
     split_static_calibration_trial = None
     spatial_calibration_from_report = None
@@ -220,10 +222,13 @@ class FlatTrialDiscoveryTests(unittest.TestCase):
         self.assertIn("captury_c3d_angle_timeseries.npz", outputs)
         self.assertIn("segment_rotation_metrics.csv", outputs)
         self.assertIn("segment_rotation_timeseries.npz", outputs)
+        self.assertIn("joint_kinematics_d4_d6.json", outputs)
+        self.assertIn("joint_kinematics_d4_d6.npz", outputs)
         self.assertIn("skin_marker_correspondence_timeseries.npz", outputs)
         self.assertNotIn("joint_centre_timeseries.csv", outputs)
         self.assertNotIn("kinematics_q_timeseries.csv", outputs)
         self.assertNotIn("segment_rotation_timeseries.csv", outputs)
+        self.assertNotIn("joint_kinematics_d4_d6.csv", outputs)
 
         audit_outputs = [
             str(path)
@@ -562,6 +567,26 @@ endsegment
         np.testing.assert_allclose(
             curves["SegRel_LeftKnee"][:, 0], [0.0, 0.0, angle], atol=1e-10
         )
+
+    def test_segment_metrics_project_small_biorbd_rotation_roundoff(self) -> None:
+        assert segment_rotation_metric_rows is not None
+        noisy = np.eye(3)
+        noisy[0, 0] += 1.0e-6
+
+        rows, timeseries, report = segment_rotation_metric_rows(
+            "Static",
+            {
+                "motive": {"Pelvis": np.eye(3)[:, :, None]},
+                "biobuddy": {"Pelvis": noisy[:, :, None]},
+            },
+            {"motive": np.asarray([0.0]), "biobuddy": np.asarray([0.0])},
+            "motive",
+        )
+
+        self.assertEqual(report["status"], "ok")
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(len(timeseries), 1)
+        self.assertLess(rows[0]["max_global_deg"], 1e-8)
 
     def test_c3d_angle_scale_to_deg_handles_rad_and_deg(self) -> None:
         assert c3d_angle_scale_to_deg is not None

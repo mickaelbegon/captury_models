@@ -74,17 +74,23 @@ from isb_segment_audit import (
 )
 from kinematic_rotations import (
     assess_rotation_source_equivalence,
+    canonicalize_rotation_series,
     canonicalize_segment_rotation_mapping,
     change_lab_basis,
     compare_segment_rotation_mappings,
     rotation_vector as canonical_rotation_vector,
+)
+from joint_kinematics import (
+    audit_joint_kinematics_source,
+    frame_corrections_from_static_audit,
+    write_joint_kinematics_audit,
 )
 
 DEFAULT_DATA_ROOT = Path("local_trials/2026-06-30_P6_flat")
 DEFAULT_OUTPUT_ROOT = Path("out_p6_motive_captury_comparison")
 ANGLE_LABEL_REGEX = r"(?i)(^.*angles?$|^.*_angle[s]?$|angle)"
 FOOT_MARKER_PATTERN = r"(LFCC|RFCC|LFM|RFM|LDP|RDP|Foot|Toe|Heel)"
-CACHE_VERSION = 6
+CACHE_VERSION = 7
 ROTATION_SEQUENCE_ZXY = "ZXY"
 DEFAULT_ALIGNMENT_CALIBRATION_CENTRES = (
     "Hips",
@@ -99,10 +105,23 @@ SCIENTIFIC_IMPLEMENTATION_FILES = {
     ),
     "kinematic_conventions_code": Path(__file__).with_name("kinematic_conventions.py"),
     "kinematic_rotations_code": Path(__file__).with_name("kinematic_rotations.py"),
+    "joint_kinematics_registry": Path(__file__).with_name("isb_joint_kinematics.json"),
+    "joint_kinematics_code": Path(__file__).with_name("joint_kinematics.py"),
     "isb_segment_audit_code": Path(__file__).with_name("isb_segment_audit.py"),
     "spatial_calibration_code": Path(__file__).with_name("spatial_calibration.py"),
     "mocap_alignment_code": Path(__file__).with_name("mocap_alignment.py"),
 }
+
+
+def file_sha256(path: Path | str) -> str:
+    """Return a streaming SHA-256 digest for one reproducibility artifact."""
+
+    digest = hashlib.sha256()
+    with Path(path).expanduser().open("rb") as stream:
+        for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
 
 MODEL_JOINT_MARKER_PROXIES = {
     "Hips": ("LIAS", "RIAS", "LIPS", "RIPS"),
@@ -270,6 +289,8 @@ def required_trial_outputs(
         trial_dir / "captury_c3d_angle_timeseries.npz",
         trial_dir / "segment_rotation_metrics.csv",
         trial_dir / "segment_rotation_timeseries.npz",
+        trial_dir / "joint_kinematics_d4_d6.json",
+        trial_dir / "joint_kinematics_d4_d6.npz",
         trial_dir / "model_dimensions.csv",
         trial_dir / "motive_marker_occlusions.csv",
         trial_dir / "skin_marker_correspondence_proposal.json",
@@ -611,6 +632,16 @@ def comparison_derived_artifacts(
         if spatial_calibration:
             artifacts[f"{trial}/alignment/spatial_calibration"] = Path(
                 spatial_calibration
+            )
+        joint_kinematics = report.get("outputs", {}).get("joint_kinematics_d4_d6")
+        if joint_kinematics:
+            artifacts[f"{trial}/kinematics/d4_d6_json"] = Path(joint_kinematics)
+        joint_kinematics_timeseries = report.get("outputs", {}).get(
+            "joint_kinematics_d4_d6_timeseries"
+        )
+        if joint_kinematics_timeseries:
+            artifacts[f"{trial}/kinematics/d4_d6_timeseries"] = Path(
+                joint_kinematics_timeseries
             )
     return artifacts
 
@@ -1209,6 +1240,28 @@ def segment_relative_q_metric_rows(
     return summary_rows, timeseries_rows
 
 
+def _source_joint_articulations(
+    source_id: str,
+    source_format: str,
+) -> dict[str, dict[str, str]]:
+    """Map registry articulations to names present in one exporter format."""
+
+    registry = load_kinematic_conventions()
+    source = registry["sources"][source_id]
+    segment_names = segment_source_names(registry, source_id, source_format)
+    result: dict[str, dict[str, str]] = {}
+    for articulation_id, articulation in source["articulations"].items():
+        proximal = articulation["proximal"]
+        distal = articulation["distal"]
+        if proximal == "unknown" or distal == "unknown":
+            continue
+        result[articulation_id] = {
+            "proximal": segment_names[proximal],
+            "distal": segment_names[distal],
+        }
+    return result
+
+
 def nearest_time_indices(
     source_time: np.ndarray, target_time: np.ndarray
 ) -> np.ndarray:
@@ -1390,11 +1443,19 @@ def segment_rotation_metric_rows(
             set(reference_rotations).intersection(source_rotations)
         )
         for segment in common_segments:
+            reference_series, reference_quality = canonicalize_rotation_series(
+                reference_rotations[segment],
+                context=f"segment metric {reference_source}/{segment}",
+            )
+            source_series, source_quality = canonicalize_rotation_series(
+                source_rotations[segment],
+                context=f"segment metric {source}/{segment}",
+            )
             values: list[dict[str, Any]] = []
             for frame, source_frame in enumerate(source_indices):
                 vector_rad = rotation_deviation_vector(
-                    reference_rotations[segment][:, :, frame],
-                    source_rotations[segment][:, :, source_frame],
+                    reference_series[:, :, frame],
+                    source_series[:, :, source_frame],
                 )
                 vector_deg = np.degrees(vector_rad)
                 global_deg = float(np.linalg.norm(vector_deg))
@@ -1435,6 +1496,12 @@ def segment_rotation_metric_rows(
                     "p95_abs_x_deg": float(np.nanpercentile(abs_x, 95)),
                     "p95_abs_y_deg": float(np.nanpercentile(abs_y, 95)),
                     "p95_abs_z_deg": float(np.nanpercentile(abs_z, 95)),
+                    "reference_max_projection_frobenius": reference_quality[
+                        "max_projection_frobenius"
+                    ],
+                    "source_max_projection_frobenius": source_quality[
+                        "max_projection_frobenius"
+                    ],
                 }
             )
     report["status"] = "ok" if summary_rows else "no_common_segments"
@@ -3515,6 +3582,48 @@ def compare_trial(
         },
         args.segment_reference,
     )
+    joint_kinematics_audits: dict[str, dict[str, Any]] = {
+        "captury": audit_joint_kinematics_source(
+            "captury_model",
+            cap_rotation_metrics,
+            captury_metrics.time,
+            _source_joint_articulations("captury_model", captury.source_kind),
+            {},
+        ),
+        "motive": audit_joint_kinematics_source(
+            "motive_model",
+            mot_rotation_metrics,
+            motive_metrics.time,
+            _source_joint_articulations("motive_model", motive.source_kind),
+            {},
+        ),
+    }
+    if biobuddy_run is not None:
+        biobuddy_evidence = load_biobuddy_audit_sidecars(args.biobuddy_biomod)
+        biobuddy_static_sidecar = Path(args.biobuddy_biomod).with_suffix(
+            ".isb_static.json"
+        )
+        biobuddy_frame_corrections = frame_corrections_from_static_audit(
+            biobuddy_evidence["static_evaluation"]
+        )
+        joint_kinematics_audits["biobuddy"] = audit_joint_kinematics_source(
+            "biobuddy_motive57",
+            biobuddy_run.rotations_native,
+            biobuddy_run.time,
+            _source_joint_articulations("biobuddy_motive57", "biomod"),
+            biobuddy_frame_corrections,
+            frame_correction_provenance={
+                "path": str(biobuddy_static_sidecar),
+                "sidecar_sha256": file_sha256(biobuddy_static_sidecar),
+                "biomod_sha256": biobuddy_evidence["static_evaluation"].get(
+                    "biomod_sha256"
+                ),
+                "status": biobuddy_evidence["static_evaluation"].get("status"),
+            },
+        )
+    joint_kinematics_paths = write_joint_kinematics_audit(
+        trial_dir, joint_kinematics_audits
+    )
     occlusion_rows, occlusion_figure = analyze_motive_occlusions(
         bundle.motive_c3d,
         trial_dir,
@@ -3665,6 +3774,10 @@ def compare_trial(
             "segment_rotation_timeseries": str(
                 trial_dir / "segment_rotation_timeseries.npz"
             ),
+            "joint_kinematics_d4_d6": str(joint_kinematics_paths["json"]),
+            "joint_kinematics_d4_d6_timeseries": str(
+                joint_kinematics_paths["timeseries"]
+            ),
             "motive_marker_occlusions": str(trial_dir / "motive_marker_occlusions.csv"),
             "trial_events_contacts": str(trial_dir / "trial_events_contacts.csv"),
             "model_dimensions": str(trial_dir / "model_dimensions.csv"),
@@ -3687,6 +3800,13 @@ def compare_trial(
         },
         "trial_events": event_report,
         "segment_rotations": segment_report,
+        "joint_kinematics_d4_d6": {
+            source: {
+                "source_id": audit["source_id"],
+                "articulations": audit["articulations"],
+            }
+            for source, audit in joint_kinematics_audits.items()
+        },
         "bvh_fbx_rotation_audit": {
             "captury": captury_source_audit,
             "motive": motive_source_audit,
