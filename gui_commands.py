@@ -80,7 +80,9 @@ def normalize_root_offset_mode(value: object) -> str:
 def append_root_offset_mode(args: list[str], values: Mapping[str, object]) -> None:
     value = normalize_root_offset_mode(values.get("root_offset_mode", ""))
     if value:
-        args.extend(["--root-offset-mode", value])
+        args.extend(["--root-offset-mode", value, "--motive-root-offset-mode", value])
+        if value != "auto":
+            args.extend(["--captury-root-offset-mode", value])
 
 
 def split_lines(value: object) -> list[str]:

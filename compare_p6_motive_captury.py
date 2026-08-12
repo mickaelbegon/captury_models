@@ -57,6 +57,11 @@ from mocap_labels import (
 )
 from model_comparison_metrics import joint_center_error_xyz, waveform_metrics
 from run_biobuddy_c3d_ik import run_direct_biobuddy_ik
+from spatial_calibration import (
+    RowRigidTransform,
+    SpatialCalibration,
+    fit_held_out_centre_alignment,
+)
 from kinematic_conventions import (
     build_provenance_manifest,
     load_kinematic_conventions,
@@ -74,8 +79,14 @@ DEFAULT_DATA_ROOT = Path("local_trials/2026-06-30_P6_flat")
 DEFAULT_OUTPUT_ROOT = Path("out_p6_motive_captury_comparison")
 ANGLE_LABEL_REGEX = r"(?i)(^.*angles?$|^.*_angle[s]?$|angle)"
 FOOT_MARKER_PATTERN = r"(LFCC|RFCC|LFM|RFM|LDP|RDP|Foot|Toe|Heel)"
-CACHE_VERSION = 5
+CACHE_VERSION = 6
 ROTATION_SEQUENCE_ZXY = "ZXY"
+DEFAULT_ALIGNMENT_CALIBRATION_CENTRES = (
+    "Hips",
+    "Head",
+    "LeftShoulder",
+    "RightShoulder",
+)
 SCIENTIFIC_IMPLEMENTATION_FILES = {
     "comparison_batch": Path(__file__),
     "kinematic_conventions_registry": Path(__file__).with_name(
@@ -83,6 +94,8 @@ SCIENTIFIC_IMPLEMENTATION_FILES = {
     ),
     "kinematic_conventions_code": Path(__file__).with_name("kinematic_conventions.py"),
     "kinematic_rotations_code": Path(__file__).with_name("kinematic_rotations.py"),
+    "spatial_calibration_code": Path(__file__).with_name("spatial_calibration.py"),
+    "mocap_alignment_code": Path(__file__).with_name("mocap_alignment.py"),
 }
 
 MODEL_JOINT_MARKER_PROXIES = {
@@ -140,10 +153,12 @@ def file_fingerprint(path: Path | None) -> dict[str, Any] | None:
 
 
 def _static_alignment_cache_payload(
-    transform: tuple[np.ndarray, np.ndarray] | None,
+    transform: SpatialCalibration | tuple[np.ndarray, np.ndarray] | None,
 ) -> dict[str, Any] | None:
     if transform is None:
         return None
+    if isinstance(transform, SpatialCalibration):
+        return transform.to_dict()
     rotation, translation = transform
     return {
         "rotation": np.asarray(rotation, dtype=float).round(12).tolist(),
@@ -154,7 +169,9 @@ def _static_alignment_cache_payload(
 def trial_cache_fingerprint(
     bundle: TrialBundle,
     args: argparse.Namespace,
-    static_alignment_transform: tuple[np.ndarray, np.ndarray] | None = None,
+    static_alignment_transform: (
+        SpatialCalibration | tuple[np.ndarray, np.ndarray] | None
+    ) = None,
 ) -> dict[str, Any]:
     payload = {
         "cache_version": CACHE_VERSION,
@@ -186,6 +203,8 @@ def trial_cache_fingerprint(
             "motive_unit_scale_to_m": args.motive_unit_scale_to_m,
             "biobuddy_unit_scale_to_m": args.biobuddy_unit_scale_to_m,
             "root_offset_mode": args.root_offset_mode,
+            "captury_root_offset_mode": getattr(args, "captury_root_offset_mode", None),
+            "motive_root_offset_mode": getattr(args, "motive_root_offset_mode", None),
             "angle_label_regex": args.angle_label_regex,
             "c3d_angle_unit": args.c3d_angle_unit,
             "landmark_map": (
@@ -200,6 +219,13 @@ def trial_cache_fingerprint(
             "disable_static_model_alignment": bool(args.disable_static_model_alignment),
             "disable_motive_marker_alignment": bool(
                 args.disable_motive_marker_alignment
+            ),
+            "spatial_alignment_mode": getattr(
+                args, "spatial_alignment_mode", "held_out_centres"
+            ),
+            "alignment_calibration_centres": list(
+                getattr(args, "alignment_calibration_centre", [])
+                or DEFAULT_ALIGNMENT_CALIBRATION_CENTRES
             ),
             "joint_filter": list(args.joint_filter),
             "no_mesh": bool(args.no_mesh),
@@ -229,6 +255,9 @@ def required_trial_outputs(
         trial_dir / f"{safe_trial}_motive_with_capjc_motjc.c3d",
         trial_dir / "joint_centre_metrics.csv",
         trial_dir / "joint_centre_timeseries.npz",
+        trial_dir / "alignment_calibration_centre_metrics.csv",
+        trial_dir / "alignment_calibration_centre_timeseries.npz",
+        trial_dir / "spatial_calibration.json",
         trial_dir / "kinematics_q_metrics.csv",
         trial_dir / "kinematics_q_timeseries.npz",
         trial_dir / "captury_c3d_angle_metrics.csv",
@@ -254,11 +283,19 @@ def required_trial_outputs(
     return outputs
 
 
+def required_output_may_be_empty(path: Path) -> bool:
+    """Return whether an empty file is a valid, complete scientific output."""
+
+    return path.name == "skin_marker_correspondence_metrics.csv"
+
+
 def cached_trial_report(
     trial_dir: Path,
     bundle: TrialBundle,
     args: argparse.Namespace,
-    static_alignment_transform: tuple[np.ndarray, np.ndarray] | None = None,
+    static_alignment_transform: (
+        SpatialCalibration | tuple[np.ndarray, np.ndarray] | None
+    ) = None,
 ) -> dict[str, Any] | None:
     if args.no_cache:
         return None
@@ -281,7 +318,11 @@ def cached_trial_report(
         bundle.name,
         include_rotation_audit=include_rotation_audit,
     ):
-        if not output_path.exists() or output_path.stat().st_size == 0:
+        if not output_path.exists():
+            return None
+        if output_path.stat().st_size == 0 and not required_output_may_be_empty(
+            output_path
+        ):
             return None
     if args.run_ik_batch and "motive_ik_batch" not in report:
         return None
@@ -300,6 +341,50 @@ def static_transform_from_report(
         return np.asarray(rotation, dtype=float), np.asarray(translation, dtype=float)
     except (TypeError, ValueError):
         return None
+
+
+def spatial_calibration_from_report(
+    report: Mapping[str, Any],
+) -> SpatialCalibration | None:
+    """Load the versioned static calibration embedded in a trial report."""
+
+    values = report.get("spatial_calibration")
+    if not isinstance(values, Mapping):
+        return None
+    try:
+        return SpatialCalibration.from_dict(values)
+    except (KeyError, TypeError, ValueError):
+        return None
+
+
+def selected_root_offset_mode(run: ModelRun) -> str:
+    """Return the CLI policy equivalent to a model run's selected convention."""
+
+    selected = run.root_offset_policy.get("selected_mode")
+    if selected == "subtract_static_offset_from_root_q":
+        return "subtract"
+    if selected == "keep_root_q_as_file":
+        return "keep"
+    raise ValueError(f"Unsupported selected root-offset policy: {selected!r}")
+
+
+def requested_root_offset_mode(
+    args: argparse.Namespace,
+    system: str,
+    calibration: SpatialCalibration | None,
+) -> str:
+    """Resolve a system-specific policy, forcing the static choice on dynamics."""
+
+    if calibration is not None:
+        frozen = (
+            calibration.captury_root_offset_mode
+            if system == "captury"
+            else calibration.motive_root_offset_mode
+        )
+        if frozen in {"keep", "subtract"}:
+            return frozen
+    specific = getattr(args, f"{system}_root_offset_mode", None)
+    return specific or args.root_offset_mode
 
 
 def safe_name(value: str) -> str:
@@ -472,6 +557,18 @@ def provenance_trials_with_static(
     return result
 
 
+def split_static_calibration_trial(
+    trials: list[TrialBundle], static_trial_name: str
+) -> tuple[TrialBundle | None, list[TrialBundle]]:
+    """Separate the declared static calibration from evaluation trials."""
+
+    static_bundle = next(
+        (bundle for bundle in trials if bundle.name == static_trial_name), None
+    )
+    dynamic_trials = [bundle for bundle in trials if bundle.name != static_trial_name]
+    return static_bundle, dynamic_trials
+
+
 def comparison_derived_artifacts(
     reports: list[dict[str, Any]],
 ) -> dict[str, Path]:
@@ -503,6 +600,11 @@ def comparison_derived_artifacts(
             )
             if proposal:
                 artifacts[f"{trial}/markers/automatic_proposal"] = Path(proposal)
+        spatial_calibration = report.get("outputs", {}).get("spatial_calibration")
+        if spatial_calibration:
+            artifacts[f"{trial}/alignment/spatial_calibration"] = Path(
+                spatial_calibration
+            )
     return artifacts
 
 
@@ -748,6 +850,7 @@ def build_model_run_with_rotation_audit(
     system: str,
     args: argparse.Namespace,
     trial_dir: Path,
+    root_offset_mode: str | None = None,
 ) -> tuple[ModelRun, dict[str, Any]]:
     """Build the selected export and optionally audit BVH/FBX equivalence.
 
@@ -777,7 +880,7 @@ def build_model_run_with_rotation_audit(
                 if system == "captury"
                 else args.motive_unit_scale_to_m
             ),
-            root_offset_mode=args.root_offset_mode,
+            root_offset_mode=root_offset_mode or args.root_offset_mode,
             model_to_c3d_axis=args.model_to_c3d_axis,
             angle_label_regex=args.angle_label_regex,
         )
@@ -1743,13 +1846,17 @@ def centre_metric_rows(
     captury_time: np.ndarray,
     motive_time: np.ndarray,
     joint_filters: list[str] | None = None,
+    excluded_joints: set[str] | None = None,
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
     summary_rows: list[dict[str, Any]] = []
     timeseries_rows: list[dict[str, Any]] = []
     cap_on_motive = interpolate_centres_to_time(
         captury_centres_mm, captury_time, motive_time
     )
-    common = sorted(set(cap_on_motive).intersection(motive_centres_mm))
+    excluded = excluded_joints or set()
+    common = sorted(
+        set(cap_on_motive).intersection(motive_centres_mm).difference(excluded)
+    )
     metric_joints = common
     if joint_filters:
         import re
@@ -3048,8 +3155,8 @@ def compare_trial(
     bundle: TrialBundle,
     out_root: Path,
     args: argparse.Namespace,
-    static_alignment_transform: tuple[np.ndarray, np.ndarray] | None = None,
-) -> tuple[dict[str, Any], tuple[np.ndarray, np.ndarray] | None]:
+    static_alignment_transform: SpatialCalibration | None = None,
+) -> tuple[dict[str, Any], SpatialCalibration]:
     trial_dir = out_root / safe_name(bundle.name)
     trial_dir.mkdir(parents=True, exist_ok=True)
     cache_fingerprint = trial_cache_fingerprint(
@@ -3070,13 +3177,24 @@ def compare_trial(
             visualize_enriched_c3d(
                 Path(enriched_c3d), args.rerun_wait_seconds, args.headless
             )
-        cached_transform = static_transform_from_report(cached_report)
-        return cached_report, static_alignment_transform or cached_transform
+        cached_calibration = spatial_calibration_from_report(cached_report)
+        if cached_calibration is None:
+            raise RuntimeError(
+                f"Cached report for {bundle.name} has no spatial calibration. "
+                "Re-run with --no-cache."
+            )
+        return cached_report, static_alignment_transform or cached_calibration
+    captury_root_mode = requested_root_offset_mode(
+        args, "captury", static_alignment_transform
+    )
+    motive_root_mode = requested_root_offset_mode(
+        args, "motive", static_alignment_transform
+    )
     captury, captury_source_audit = build_model_run_with_rotation_audit(
-        bundle, "captury", args, trial_dir
+        bundle, "captury", args, trial_dir, captury_root_mode
     )
     motive, motive_source_audit = build_model_run_with_rotation_audit(
-        bundle, "motive", args, trial_dir
+        bundle, "motive", args, trial_dir, motive_root_mode
     )
     cap_c3d_mm = centres_to_c3d_mm(
         captury.centres_native, captury.unit_scale_to_m, args.model_to_c3d_axis
@@ -3085,32 +3203,77 @@ def compare_trial(
         motive.centres_native, motive.unit_scale_to_m, args.model_to_c3d_axis
     )
     alignment_report: dict[str, Any]
+    spatial_calibration = static_alignment_transform
     if args.disable_static_model_alignment:
-        rotation = np.eye(3)
-        translation = np.zeros(3)
+        captury_to_motive = RowRigidTransform.identity()
+        rotation = captury_to_motive.rotation
+        translation = captury_to_motive.translation
         alignment_report = {
             "status": "disabled_static_model_alignment",
             "rotation": rotation.tolist(),
             "translation_mm": translation.tolist(),
             "note": "Captury centres are kept in their converted C3D frame without Captury -> Motive model alignment.",
         }
-        static_alignment_transform = (rotation, translation)
-    elif static_alignment_transform is None:
-        rotation, translation, alignment_report = static_alignment(
-            cap_c3d_mm, mot_c3d_mm
-        )
-        static_alignment_transform = (rotation, translation)
+    elif spatial_calibration is None:
+        alignment_mode = getattr(args, "spatial_alignment_mode", "held_out_centres")
+        if alignment_mode == "legacy_all_centres":
+            rotation, translation, alignment_report = static_alignment(
+                cap_c3d_mm, mot_c3d_mm
+            )
+            captury_to_motive = RowRigidTransform(rotation, translation)
+            alignment_report.update(
+                {
+                    "method": "legacy_all_common_centres_kabsch_rows",
+                    "protocol_status": "circular_diagnostic_only",
+                    "calibration_centres": alignment_report.get("used_centres", []),
+                    "evaluation_centres": [],
+                }
+            )
+        else:
+            requested_centres = tuple(
+                getattr(args, "alignment_calibration_centre", [])
+                or DEFAULT_ALIGNMENT_CALIBRATION_CENTRES
+            )
+            captury_to_motive, alignment_report = fit_held_out_centre_alignment(
+                cap_c3d_mm, mot_c3d_mm, requested_centres
+            )
+            if alignment_report["status"] != "ok":
+                raise RuntimeError(
+                    "Static held-out centre alignment failed: "
+                    f"{alignment_report['status']}. Calibration centres: "
+                    f"{alignment_report.get('calibration_centres', [])}."
+                )
+            rotation = captury_to_motive.rotation
+            translation = captury_to_motive.translation
+            alignment_report["protocol_status"] = "non_circular_held_out"
     else:
-        rotation, translation = static_alignment_transform
+        captury_to_motive = spatial_calibration.captury_to_motive
+        rotation = captury_to_motive.rotation
+        translation = captury_to_motive.translation
         alignment_report = {
-            "status": "reused_static_alignment",
+            "status": "reused_frozen_static_alignment",
+            "method": "frozen_static_calibration",
+            "protocol_status": spatial_calibration.status,
+            "calibration_centres": list(spatial_calibration.calibration_centres),
+            "evaluation_centres": list(spatial_calibration.evaluation_centres),
             "rotation": rotation.tolist(),
             "translation_mm": translation.tolist(),
         }
     cap_aligned_mm = apply_alignment(cap_c3d_mm, rotation, translation)
-    if args.disable_motive_marker_alignment:
-        model_marker_rotation = np.eye(3)
-        model_marker_translation = np.zeros(3)
+    if spatial_calibration is not None:
+        motive_to_c3d = spatial_calibration.motive_to_c3d
+        model_marker_rotation = motive_to_c3d.rotation
+        model_marker_translation = motive_to_c3d.translation
+        model_marker_report = {
+            "status": "reused_frozen_static_alignment",
+            "method": "frozen_static_calibration",
+            "rotation": model_marker_rotation.tolist(),
+            "translation_mm": model_marker_translation.tolist(),
+        }
+    elif args.disable_motive_marker_alignment:
+        motive_to_c3d = RowRigidTransform.identity()
+        model_marker_rotation = motive_to_c3d.rotation
+        model_marker_translation = motive_to_c3d.translation
         model_marker_report = {
             "status": "disabled_motive_marker_alignment",
             "method": "identity",
@@ -3121,6 +3284,27 @@ def compare_trial(
     else:
         model_marker_rotation, model_marker_translation, model_marker_report = (
             model_to_motive_marker_alignment(mot_c3d_mm, motive.time, bundle.motive_c3d)
+        )
+        motive_to_c3d = RowRigidTransform(
+            model_marker_rotation, model_marker_translation
+        )
+    if spatial_calibration is None:
+        calibration_centres = tuple(alignment_report.get("calibration_centres", []))
+        evaluation_centres = tuple(alignment_report.get("evaluation_centres", []))
+        status = str(
+            alignment_report.get("protocol_status", alignment_report["status"])
+        )
+        if status == "circular_diagnostic_only":
+            evaluation_centres = ()
+        spatial_calibration = SpatialCalibration(
+            static_trial=bundle.name,
+            calibration_centres=calibration_centres,
+            evaluation_centres=evaluation_centres,
+            captury_to_motive=captury_to_motive,
+            motive_to_c3d=motive_to_c3d,
+            status=status,
+            captury_root_offset_mode=selected_root_offset_mode(captury),
+            motive_root_offset_mode=selected_root_offset_mode(motive),
         )
     marker_rotation, marker_translation = compose_row_alignment(
         rotation, translation, model_marker_rotation, model_marker_translation
@@ -3213,6 +3397,27 @@ def compare_trial(
         captury_metrics.time,
         motive_metrics.time,
         args.joint_filter,
+        excluded_joints=(
+            set(spatial_calibration.calibration_centres)
+            if spatial_calibration.status == "non_circular_held_out"
+            else set()
+        ),
+    )
+    calibration_centre_names = set(spatial_calibration.calibration_centres)
+    calibration_centre_rows, calibration_centre_ts_rows = centre_metric_rows(
+        bundle.name,
+        {
+            name: values
+            for name, values in cap_aligned_metrics_mm.items()
+            if name in calibration_centre_names
+        },
+        {
+            name: values
+            for name, values in mot_metrics_mm.items()
+            if name in calibration_centre_names
+        },
+        captury_metrics.time,
+        motive_metrics.time,
     )
     if biobuddy_run is not None:
         bio_centres_mm = centres_to_c3d_mm(
@@ -3345,6 +3550,18 @@ def compare_trial(
     )
     write_rows(trial_dir / "joint_centre_metrics.csv", centre_rows)
     write_table_npz(trial_dir / "joint_centre_timeseries.npz", centre_ts_rows)
+    write_rows(
+        trial_dir / "alignment_calibration_centre_metrics.csv",
+        calibration_centre_rows,
+    )
+    write_table_npz(
+        trial_dir / "alignment_calibration_centre_timeseries.npz",
+        calibration_centre_ts_rows,
+    )
+    spatial_calibration_path = trial_dir / "spatial_calibration.json"
+    spatial_calibration_path.write_text(
+        json.dumps(spatial_calibration.to_dict(), indent=2), encoding="utf-8"
+    )
     write_rows(trial_dir / "kinematics_q_metrics.csv", q_rows)
     write_table_npz(trial_dir / "kinematics_q_timeseries.npz", q_ts_rows)
     write_rows(trial_dir / "captury_c3d_angle_metrics.csv", c3d_angle_rows)
@@ -3416,9 +3633,17 @@ def compare_trial(
             "motive_frames": int(motive_metrics.time.shape[0]),
         },
         "alignment": alignment_report,
+        "spatial_calibration": spatial_calibration.to_dict(),
         "outputs": {
             "enriched_c3d": str(enriched_c3d),
             "joint_centre_metrics": str(trial_dir / "joint_centre_metrics.csv"),
+            "alignment_calibration_centre_metrics": str(
+                trial_dir / "alignment_calibration_centre_metrics.csv"
+            ),
+            "alignment_calibration_centre_timeseries": str(
+                trial_dir / "alignment_calibration_centre_timeseries.npz"
+            ),
+            "spatial_calibration": str(spatial_calibration_path),
             "kinematics_q_metrics": str(trial_dir / "kinematics_q_metrics.csv"),
             "captury_c3d_angle_metrics": str(
                 trial_dir / "captury_c3d_angle_metrics.csv"
@@ -3492,7 +3717,7 @@ def compare_trial(
     (trial_dir / "run_report.json").write_text(
         json.dumps(report, indent=2), encoding="utf-8"
     )
-    return report, static_alignment_transform
+    return report, spatial_calibration
 
 
 def parse_args() -> argparse.Namespace:
@@ -3561,6 +3786,42 @@ def parse_args() -> argparse.Namespace:
         help=(
             "How to handle static BVH/FBX root offsets: auto scores both "
             "subtract and keep conventions against the matching C3D marker cloud."
+        ),
+    )
+    parser.add_argument(
+        "--captury-root-offset-mode",
+        choices=["auto", "subtract", "keep"],
+        default="keep",
+        help=(
+            "Captury root-translation policy (default: keep). Dynamic trials "
+            "reuse the Static choice."
+        ),
+    )
+    parser.add_argument(
+        "--motive-root-offset-mode",
+        choices=["auto", "subtract", "keep"],
+        default=None,
+        help=(
+            "Motive root-translation policy. When omitted, inherits "
+            "--root-offset-mode; dynamic trials reuse the Static choice."
+        ),
+    )
+    parser.add_argument(
+        "--spatial-alignment-mode",
+        choices=["held_out_centres", "legacy_all_centres"],
+        default="held_out_centres",
+        help=(
+            "Static Captury-to-Motive calibration protocol. The default reserves "
+            "calibration centres and excludes them from primary evaluation metrics."
+        ),
+    )
+    parser.add_argument(
+        "--alignment-calibration-centre",
+        action="append",
+        default=[],
+        help=(
+            "Exact joint-centre name reserved for static alignment. Repeatable. "
+            "Defaults to Hips, Head, LeftShoulder and RightShoulder."
         ),
     )
     parser.add_argument(
@@ -3736,30 +3997,30 @@ def main() -> None:
         print(f"Provenance: {provenance_path}")
         return
 
-    static_bundle = next(
-        (bundle for bundle in discovered_trials if bundle.name == args.static_trial),
-        None,
+    static_bundle, _ = split_static_calibration_trial(
+        discovered_trials, args.static_trial
     )
-    static_transform: tuple[np.ndarray, np.ndarray] | None = None
+    if static_bundle is None:
+        raise RuntimeError(
+            f"Static calibration trial {args.static_trial!r} was not found. "
+            "Choose it with --static-trial before comparing dynamic trials."
+        )
+    static_requested = not args.trial or any(
+        bundle.name == args.static_trial for bundle in trials
+    )
+    _, trials = split_static_calibration_trial(trials, args.static_trial)
+    static_transform: SpatialCalibration | None = None
     reports: list[dict[str, Any]] = []
     provenance_reports: list[dict[str, Any]] = []
-    if static_bundle is not None and not args.trial:
-        static_report, static_transform = compare_trial(
-            static_bundle, args.out_dir, args, static_alignment_transform=None
-        )
+    static_output_root = (
+        args.out_dir if static_requested else args.out_dir / "_static_alignment"
+    )
+    static_report, static_transform = compare_trial(
+        static_bundle, static_output_root, args, static_alignment_transform=None
+    )
+    provenance_reports.append(static_report)
+    if static_requested:
         reports.append(static_report)
-        provenance_reports.append(static_report)
-        trials = [bundle for bundle in trials if bundle.name != static_bundle.name]
-    elif static_bundle is not None and all(
-        bundle.name != static_bundle.name for bundle in trials
-    ):
-        static_report, static_transform = compare_trial(
-            static_bundle,
-            args.out_dir / "_static_alignment",
-            args,
-            static_alignment_transform=None,
-        )
-        provenance_reports.append(static_report)
     for bundle in trials:
         report, static_transform = compare_trial(
             bundle, args.out_dir, args, static_alignment_transform=static_transform

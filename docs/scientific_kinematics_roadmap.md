@@ -177,7 +177,7 @@ identifiables dans le rapport genere.
 | G2 | Angles Captury | refuse | parent/distal, sequence, convention, signes et pose neutre documentes |
 | G3 | Unites et axes | partiel | longueurs plausibles, matrices orthonormales et determinant positif |
 | G4 | Translation racine | partiel | rapport Captury/Motive separe avec offset lu et politiques forcees |
-| G5 | Recalage spatial | refuse | calibration independante figee avant l'evaluation des centres |
+| G5 | Recalage spatial | accepte avec centres reserves; validation anatomique en attente | calibration statique figee; centres de calibration exclus des metriques principales |
 | G6 | ISB D1-D3 | a construire | origine, axes, landmarks et matrice source vers ISB par segment |
 | G7 | ISB D4 rotations | refuse | `R_lab_proximal.T @ R_lab_distal` corrige avant extraction Euler selon le contrat colonne |
 | G8 | ISB D5 translations | non applicable actuellement | translation articulaire distale exprimee dans le repere proximal ISB si elle est analysee |
@@ -274,12 +274,18 @@ tolerance ISB ni une validation anatomique.
 
 ### Phase 2 - Recalage spatial non circulaire
 
-Separer les transformations suivantes:
+**Etat:** protocole a centres reserves implemente; G5 accepte pour la
+comparaison diagnostique Captury vers Motive des centres non reserves. La
+validation anatomique reste en attente car les centres de calibration sont
+derives des modeles et non des landmarks mesures independamment.
 
-1. conversion unite et axes du fichier;
-2. interpretation de la translation de racine;
-3. calibration statique source vers laboratoire Motive;
-4. comparaison dynamique sans nouveau recalage.
+Separer les transformations suivantes dans leur ordre reel d'application:
+
+1. interpretation de la translation de racine dans les `q` natifs;
+2. cinematique directe dans le repere modele natif;
+3. conversion unite et axes du fichier vers le C3D;
+4. calibration statique source vers laboratoire Motive;
+5. comparaison dynamique sans nouveau recalage.
 
 **Tests avant modification:** transformations synthetiques connues, invariance
 des distances, ordre de composition et comparaison avec/sans un landmark
@@ -288,6 +294,28 @@ reserve.
 **Gate:** les centres servant de variable de resultat ne sont pas utilises
 pour ajuster la transformation qui minimise leur propre erreur. Les erreurs
 avant et apres chaque etape sont conservees.
+
+**Implemente le 2026-08-12:** le mode par defaut ajuste une transformation
+rigide sur `Hips`, `Head`, `LeftShoulder` et `RightShoulder` du seul essai
+`Static`. Ces quatre centres sont ensuite exclus de
+`joint_centre_metrics.csv` et conserves dans le diagnostic distinct
+`alignment_calibration_centre_metrics.csv`. Les 18 autres centres communs
+constituent le jeu d'evaluation. Les transformations Captury vers Motive et
+Motive vers C3D ainsi que les politiques de translation racine Captury/Motive
+sont serialisees dans `spatial_calibration.json`, puis reutilisees sans
+reestimation sur chaque essai dynamique. Le mode
+`legacy_all_centres` demeure disponible comme diagnostic explicitement
+circulaire.
+
+Sur le smoke P6 BVH `Static`/`Marche_001`, la mediane statique est de
+19.7 mm sur les quatre centres de calibration et de 44.8 mm sur les 18 centres
+tenus a l'ecart. Les deux matrices et les deux translations du rapport
+`Marche_001` sont numeriquement identiques a celles du statique; les politiques
+de translation racine sont egalement figees. Le recalage Motive vers C3D
+utilise encore des proxies issus des marqueurs Motive. Comme cette seconde
+transformation est appliquee en commun aux centres Captury et Motive, elle ne
+modifie pas leur distance paire a paire, mais sa validite anatomique reste a
+examiner pour les comparaisons de marqueurs et la visualisation.
 
 ### Phase 3 - Reperes segmentaires anatomiques et ISB D1-D3
 
@@ -421,6 +449,9 @@ sans consulter le code de la GUI.
 | 2026-08-12 | Phase 0, revue apres corrections | agent independant Sagan | approuve | Smoke P6 `Static`: quatre entrees et trois artefacts derives hashes; aucun finding bloquant |
 | 2026-08-12 | Phase 1, premiere revue | agent independant Laplace | refuse | cache sans registre scientifique, hypothese temporelle implicite, contrat `globalJCS` et roundtrip NPZ non testes, artefacts d'audit absents de la provenance |
 | 2026-08-12 | Phase 1, revue apres corrections | agent independant Laplace | approuve | 199 tests du depot, mini-`bioMod` connu, cache version 5, NPZ relu et smoke P6 `Static`; aucun finding bloquant |
+| 2026-08-12 | Phase 2, tests et smoke | Codex | reussi | 211 tests du depot; P6 `Static` puis `Marche_001`; matrices et politiques statiques figees, centres reserves absents des metriques principales, cache relu et calibration hashee dans la provenance |
+| 2026-08-12 | Phase 2, premiere revue | agents independants Hooke et Singer | refuse | fingerprint incomplet, ordre des transformations mal documente, cache avec CSV vide, provenance et option GUI a corriger |
+| 2026-08-12 | Phase 2, revue apres corrections | agents independants Hooke et Singer | approuve | aucun finding bloquant; limites anatomiques explicites; Black, py_compile et validations ciblees reussis |
 
 Chaque prochaine entree de validation doit enregistrer la commande de test,
 l'environnement, le commit ou diff examine et le chemin de la sortie brute.

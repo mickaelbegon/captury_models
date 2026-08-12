@@ -38,9 +38,13 @@ try:
         root_alignment_score_mm,
         sanitize_channel_name,
         segment_relative_rotation_curves,
+        split_static_calibration_trial,
+        spatial_calibration_from_report,
         static_transform_from_report,
+        requested_root_offset_mode,
         time_window_mask,
         trial_cache_fingerprint,
+        required_output_may_be_empty,
         yaw_alignment_rows,
     )
 except ImportError as exc:  # pragma: no cover - depends on optional scientific env
@@ -73,9 +77,13 @@ except ImportError as exc:  # pragma: no cover - depends on optional scientific 
     root_alignment_score_mm = None
     sanitize_channel_name = None
     segment_relative_rotation_curves = None
+    split_static_calibration_trial = None
+    spatial_calibration_from_report = None
     static_transform_from_report = None
+    requested_root_offset_mode = None
     time_window_mask = None
     trial_cache_fingerprint = None
+    required_output_may_be_empty = None
     yaw_alignment_rows = None
     IMPORT_ERROR = exc
 else:
@@ -86,6 +94,37 @@ else:
     IMPORT_ERROR is not None, f"optional dependencies missing: {IMPORT_ERROR}"
 )
 class FlatTrialDiscoveryTests(unittest.TestCase):
+    def test_static_calibration_trial_is_removed_from_dynamic_order(self) -> None:
+        assert split_static_calibration_trial is not None
+        static = TrialBundle(
+            "Static", Path("cap.c3d"), None, None, Path("mot.c3d"), None, None
+        )
+        walk = TrialBundle(
+            "Marche_001",
+            Path("cap_walk.c3d"),
+            None,
+            None,
+            Path("mot_walk.c3d"),
+            None,
+            None,
+        )
+
+        calibration, dynamic = split_static_calibration_trial([walk, static], "Static")
+
+        self.assertIs(calibration, static)
+        self.assertEqual([bundle.name for bundle in dynamic], ["Marche_001"])
+
+    def test_root_policy_defaults_keep_captury_and_auto_score_motive(self) -> None:
+        assert requested_root_offset_mode is not None
+        args = argparse.Namespace(
+            root_offset_mode="auto",
+            captury_root_offset_mode="keep",
+            motive_root_offset_mode=None,
+        )
+
+        self.assertEqual(requested_root_offset_mode(args, "captury", None), "keep")
+        self.assertEqual(requested_root_offset_mode(args, "motive", None), "auto")
+
     def test_comparison_inputs_include_only_selected_model_files(self) -> None:
         assert TrialBundle is not None
         assert comparison_input_files is not None
@@ -173,6 +212,9 @@ class FlatTrialDiscoveryTests(unittest.TestCase):
         outputs = [path.name for path in required_trial_outputs(Path("out"), "Static")]
 
         self.assertIn("joint_centre_timeseries.npz", outputs)
+        self.assertIn("alignment_calibration_centre_metrics.csv", outputs)
+        self.assertIn("alignment_calibration_centre_timeseries.npz", outputs)
+        self.assertIn("spatial_calibration.json", outputs)
         self.assertIn("kinematics_q_timeseries.npz", outputs)
         self.assertIn("captury_c3d_angle_metrics.csv", outputs)
         self.assertIn("captury_c3d_angle_timeseries.npz", outputs)
@@ -191,6 +233,14 @@ class FlatTrialDiscoveryTests(unittest.TestCase):
         ]
         self.assertIn("out/captury/bvh_fbx_rotation_audit.npz", audit_outputs)
         self.assertIn("out/motive/bvh_fbx_rotation_audit.json", audit_outputs)
+
+    def test_empty_skin_marker_metrics_are_valid_cache_outputs(self) -> None:
+        assert required_output_may_be_empty is not None
+
+        self.assertTrue(
+            required_output_may_be_empty(Path("skin_marker_correspondence_metrics.csv"))
+        )
+        self.assertFalse(required_output_may_be_empty(Path("run_report.json")))
 
     def test_dimension_rows_from_centres_supports_biobuddy_source(self) -> None:
         assert dimension_rows_from_centres is not None
@@ -290,6 +340,31 @@ class FlatTrialDiscoveryTests(unittest.TestCase):
         vector = rotation_deviation_vector(np.eye(3), rotation_x)
 
         np.testing.assert_allclose(vector, [angle, 0.0, 0.0], atol=1e-10)
+
+    def test_centre_metrics_can_exclude_reserved_calibration_centres(self) -> None:
+        assert centre_metric_rows is not None
+
+        time = np.asarray([0.0, 1.0])
+        captury = {
+            "Hips": np.asarray([[1.0, 1.0], [0.0, 0.0], [0.0, 0.0]]),
+            "LeftLeg": np.asarray([[2.0, 2.0], [0.0, 0.0], [0.0, 0.0]]),
+        }
+        motive = {
+            "Hips": np.zeros((3, 2)),
+            "LeftLeg": np.zeros((3, 2)),
+        }
+
+        summary, timeseries = centre_metric_rows(
+            "Static",
+            captury,
+            motive,
+            time,
+            time,
+            excluded_joints={"Hips"},
+        )
+
+        self.assertEqual([row["joint"] for row in summary], ["LeftLeg"])
+        self.assertEqual(sorted(set(row["joint"] for row in timeseries)), ["LeftLeg"])
 
     def test_rotation_deviation_vector_is_finite_at_180_degrees(self) -> None:
         assert rotation_deviation_vector is not None
@@ -684,6 +759,51 @@ endsegment
         rotation, translation = transform
         np.testing.assert_allclose(rotation, np.eye(3))
         np.testing.assert_allclose(translation, [1.0, 2.0, 3.0])
+
+    def test_spatial_calibration_report_freezes_system_root_policies(self) -> None:
+        assert spatial_calibration_from_report is not None
+        assert requested_root_offset_mode is not None
+
+        report = {
+            "spatial_calibration": {
+                "schema_version": 1,
+                "status": "ok",
+                "static_trial": "Static",
+                "calibration_centres": [
+                    "Hips",
+                    "Head",
+                    "LeftShoulder",
+                    "RightShoulder",
+                ],
+                "evaluation_centres": ["LeftLeg", "RightLeg"],
+                "root_translation_policy": {
+                    "captury": "keep",
+                    "motive": "subtract",
+                },
+                "captury_to_motive": {
+                    "rotation": np.eye(3).tolist(),
+                    "translation_mm": [1.0, 2.0, 3.0],
+                },
+                "motive_to_c3d": {
+                    "rotation": np.eye(3).tolist(),
+                    "translation_mm": [4.0, 5.0, 6.0],
+                },
+            }
+        }
+        calibration = spatial_calibration_from_report(report)
+        self.assertIsNotNone(calibration)
+        args = argparse.Namespace(
+            root_offset_mode="auto",
+            captury_root_offset_mode="subtract",
+            motive_root_offset_mode="keep",
+        )
+
+        self.assertEqual(
+            requested_root_offset_mode(args, "captury", calibration), "keep"
+        )
+        self.assertEqual(
+            requested_root_offset_mode(args, "motive", calibration), "subtract"
+        )
 
     def test_occlusion_rows_use_vectorized_missing_points_and_residuals(self) -> None:
         assert occlusion_rows_from_points is not None

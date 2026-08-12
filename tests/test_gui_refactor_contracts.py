@@ -145,6 +145,20 @@ class GuiRefactorContracts(unittest.TestCase):
 
         option_index = args.index("--root-offset-mode")
         self.assertEqual(args[option_index + 1], "keep")
+        captury_index = args.index("--captury-root-offset-mode")
+        motive_index = args.index("--motive-root-offset-mode")
+        self.assertEqual(args[captury_index + 1], "keep")
+        self.assertEqual(args[motive_index + 1], "keep")
+
+    def test_auto_root_offset_preserves_captury_keep_default(self) -> None:
+        gui = make_gui_stub()
+        gui.vars["root_offset_mode"].set(ROOT_OFFSET_MODE_LABELS["auto"])
+
+        args = CapturyBioBuddyGui._p6_args(gui)
+
+        self.assertIn("--root-offset-mode", args)
+        self.assertIn("--motive-root-offset-mode", args)
+        self.assertNotIn("--captury-root-offset-mode", args)
 
     def test_empty_csv_reads_as_empty_dataframe(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

@@ -256,7 +256,7 @@ Useful generated files include:
 
 ## Root Translation Policy
 
-Captury exports may store a static root offset in the skeleton while also storing root position channels in laboratory coordinates. The scripts default to `--root-offset-mode auto`: they build both interpretations of the root translation q, with and without subtracting the static root offset, then keep the better overlay. The single-trial BVH/FBX pipeline scores in native model units. The Captury/Motive P6 pipeline first converts model centres to the C3D frame with `--model-to-c3d-axis`, scores both interpretations in millimetres against the matching C3D marker cloud, and writes the chosen policy in each trial report.
+Captury exports may store a static root offset in the skeleton while also storing root position channels in laboratory coordinates. The generic policy remains `--root-offset-mode auto`: it builds both interpretations of the root translation q, with and without subtracting the static root offset, then keeps the better overlay. In the Captury/Motive comparison, Captury explicitly defaults to `--captury-root-offset-mode keep`, while Motive inherits the generic `auto` policy. The single-trial BVH/FBX pipeline scores in native model units. The Captury/Motive P6 pipeline first converts model centres to the C3D frame with `--model-to-c3d-axis`, scores automatic interpretations in millimetres against the matching C3D marker cloud, and writes the chosen policy in each trial report.
 
 The selected policy is written to:
 
@@ -265,6 +265,18 @@ The selected policy is written to:
 - `out_p6_motive_captury_comparison/<trial>/<system>/<source>/<system>_<source>_root_translation_policy.json`
 
 Use `--root-offset-mode subtract` or `--root-offset-mode keep` to force either convention. In the GUI this is the `Offset racine` selector with explicit labels: choose the best C3D overlay automatically, subtract the static root offset, or keep the file root translations. The automatic mode is preferred for debugging because it documents both scores instead of silently assuming one convention.
+
+For the Captury/Motive comparison, the policies can be controlled independently
+with `--captury-root-offset-mode` and `--motive-root-offset-mode`. Captury defaults
+to `keep`; Motive defaults to the generic `auto` policy. Their selected values
+are frozen from the static calibration and reused on dynamic trials.
+
+The default spatial calibration is non-circular: it reserves `Hips`, `Head`,
+`LeftShoulder`, and `RightShoulder` for the Static Captury-to-Motive rigid fit,
+then excludes them from primary joint-centre metrics. Override the reserved set
+by repeating `--alignment-calibration-centre NAME`. The legacy fit on all common
+centres is available only as an explicit diagnostic with
+`--spatial-alignment-mode legacy_all_centres`.
 
 `plot_c3d_initial_offset.py` is a separate raw-C3D diagnostic and does not use
 `--root-offset-mode`. It treats Motive and Captury independently so that offsets
@@ -495,6 +507,9 @@ Main outputs:
 - `out_p6_motive_captury_comparison/<trial>/joint_centre_metrics.csv`
 - `out_p6_motive_captury_comparison/<trial>/kinematics_q_metrics.csv`
 - `out_p6_motive_captury_comparison/<trial>/joint_centre_timeseries.npz`
+- `out_p6_motive_captury_comparison/<trial>/alignment_calibration_centre_metrics.csv`
+- `out_p6_motive_captury_comparison/<trial>/alignment_calibration_centre_timeseries.npz`
+- `out_p6_motive_captury_comparison/<trial>/spatial_calibration.json`
 - `out_p6_motive_captury_comparison/<trial>/kinematics_q_timeseries.npz`
 - `out_p6_motive_captury_comparison/<trial>/captury_c3d_angle_metrics.csv`
 - `out_p6_motive_captury_comparison/<trial>/captury_c3d_angle_timeseries.npz`

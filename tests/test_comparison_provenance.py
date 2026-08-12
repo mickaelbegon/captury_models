@@ -74,6 +74,8 @@ class ComparisonProvenanceTests(unittest.TestCase):
                 "kinematic_conventions_registry",
                 "kinematic_conventions_code",
                 "kinematic_rotations_code",
+                "spatial_calibration_code",
+                "mocap_alignment_code",
             },
         )
         self.assertNotEqual(first["digest"], second["digest"])
@@ -163,7 +165,8 @@ class ComparisonProvenanceTests(unittest.TestCase):
                     "motive": {"biomod": "/tmp/motive.bioMod"},
                 },
                 "outputs": {
-                    "skin_marker_correspondence_proposal": "/tmp/proposal.json"
+                    "skin_marker_correspondence_proposal": "/tmp/proposal.json",
+                    "spatial_calibration": "/tmp/spatial_calibration.json",
                 },
                 "skin_marker_correspondence": {"map_source": "automatic_proposal"},
                 "bvh_fbx_rotation_audit": {
@@ -193,6 +196,9 @@ class ComparisonProvenanceTests(unittest.TestCase):
                     "/tmp/captury_audit.npz"
                 ),
                 "Static/markers/automatic_proposal": Path("/tmp/proposal.json"),
+                "Static/alignment/spatial_calibration": Path(
+                    "/tmp/spatial_calibration.json"
+                ),
             },
         )
 
