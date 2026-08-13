@@ -87,6 +87,7 @@ class ComparisonProvenanceTests(unittest.TestCase):
                 "joint_kinematics_registry",
                 "joint_kinematics_code",
                 "isb_segment_audit_code",
+                "isb_compliance_report_code",
                 "spatial_calibration_code",
                 "mocap_alignment_code",
                 "captury_c3d_angle_decoder",

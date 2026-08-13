@@ -27,6 +27,8 @@ Small workspace for comparing Captury BVH/FBX skeleton exports with C3D marker d
 - `isb_segment_frames.json`: versioned Wu 2002/2005 ISB target-frame registry used by the D1-D3 audit.
 - `isb_joint_kinematics.json`: versioned joint sequences, signs and D4-D6 targets used by the matrix-first joint audit.
 - `joint_kinematics.py`: corrected parent-child rotations, Euler/Cardan extraction, singularity flags and proximal-frame D5 translations.
+- `isb_compliance_report.py`: normalized D1-D6 report and versioned curve-reproducibility manifest.
+- `gui_isb_report.py`: presentation-only filtering and table formatting for the GUI ISB report.
 - `docs/refactor_roadmap.md`: staged refactor plan with the test-first and agent-validation rule for each phase.
 - `docs/scientific_kinematics_roadmap.md`: scientific work plan for harmonizing Captury, Motive and BioBuddy kinematics, including the ISB D1-D6 audit gates.
 - `environment_bvh_c3d_biobuddy.yml`: conda environment definition.
@@ -113,7 +115,7 @@ The GUI tabs are organized for the Captury/Motive analysis:
 - `Marqueurs`: compare reasonable Motive/Captury skin-marker correspondences.
 - `Cinématiques`: compare available model q/angle channels, inspect DoF waveforms over time and optionally run batch IK.
 - `Visualisation`: launch the enriched C3D/Rerun visualization or run headless.
-- `Critique`: review the sensitive algorithms and assumptions before interpreting distances or angles.
+- `Critique`: filter the D1-D6 table by source, deviation, segment/articulation target and status, inspect confidence/blockers, then review the sensitive algorithms and assumptions before interpreting distances or angles.
 - `Avancé`: inspect the Python executable, script paths and compatibility options.
 
 The metric tabs contain embedded Matplotlib graphs instead of PNG previews. Each graph panel has a hierarchical selector (`trial -> metric -> component`) so a metric can be plotted globally or narrowed to a specific marker, segment, joint, landmark or q component. In the `Segments` tab, selecting a segment displays global and X/Y/Z rotation-deviation curves over time from `segment_rotation_timeseries.npz`; selecting a broader metric displays absolute-deviation boxplots by segment/source. Segment deviations are computed from `R_ref.T @ R_source` with the rotation-vector log map, then displayed in degrees. In the `Centres` tab, selecting a metric displays one time-distribution boxplot per joint centre from `joint_centre_timeseries.npz`; selecting a single joint displays its error curves over time, with Euclidean distance and absolute X/Y/Z components. In the `Cinématiques` tab, selecting one DoF displays its Motive, Captury and difference waveforms over time; selecting one Captury C3D angle channel displays the exported Captury C3D angle waveform. Selecting a metric such as `bias_rad`, `mae_rad`, `rmse_rad` or `c3d_mean_deg` displays one boxplot per DoF/channel. Rotation metrics and rotation waveforms are converted to degrees for display, while the output files keep the raw radian values when they come from model q.
@@ -127,6 +129,22 @@ The D1-D3 audit inventories every source and segment. `isb_segment_frames.json` 
 Creating a Motive 57 model now writes two SHA-bound evidence sidecars beside the model: `<model>.roundtrip.json` verifies all serialized parent-local `RT` matrices against the BioBuddy real model, and `<model>.isb_static.json` records static angular deviation, origin deviation in millimetres, determinants and orthogonality. On P6, 7 of 15 BioBuddy segment frames are numerically evaluable without undocumented substitutions. Thorax is withheld because Wu requires T8 while Motive 57 provides TV7; head has no selected target; both hands are withheld because HM2 is not silently substituted for the selected third-metacarpal surrogate. Feet and upper arms are withheld because the neutral-ankle and option-2 humerus calibration postures prescribed by Wu are not validated in P6 metadata. These missing evaluations remain explicit and do not mean zero error. When `compare_p6_motive_captury.py` receives the same model through `--biobuddy-biomod`, it embeds matching sidecars in `isb_d1_d3_audit.json`; stale sidecars are rejected by SHA-256.
 
 Each trial also writes `joint_kinematics_d4_d6.json` and `joint_kinematics_d4_d6.npz`. The JSON states proximal/distal segments, applied correction matrices, target sequence, anatomical components, signs, D4-D6 status, singular-frame count, roundtrip error and SHA-256 evidence; the compressed NPZ preserves relative SO(3) matrices, JCS axes, quaternions, rotation magnitudes and available Euler series. Native Captury/Motive relative matrices remain diagnostic because their source-to-anatomical corrections are unknown. With the current P6 BioBuddy static evidence, both hips and knees can be expressed in the target `ZXY` convention as a diagnostic. This is not final ISB conformity because the underlying D1-D3 frames remain diagnostically, rather than independently anatomically, validated. The remaining BioBuddy joints stay unavailable when either segment frame is not justified. Shoulder motion is labelled `thoracohumeral` and D6 deviation; no glenohumeral angle is emitted because the model has no scapula. D5 remains non-applicable until a common joint point is reconstructed independently in proximal and distal frames.
+
+At the end of a full batch, `isb_d1_d6_report.json` and
+`isb_d1_d6_table.npz` consolidate D1-D3 segment evidence and per-trial D4-D6
+joint evidence. Captury BVH/FBX, Captury C3D angles, Motive BVH/FBX and
+BioBuddy remain four distinct sources: an unavailable source produces explicit
+blocking rows and never falls back to another model. The report records the raw
+status, normalized status, confidence, evidence and blocker codes. The
+`Critique` tab renders this table side by side and keeps global D1-D3 rows
+visible while filtering a selected trial.
+
+`comparison_reproducibility_manifest.json` fingerprints every JSON/NPZ
+scientific artifact exposed by a trial report. It records paths relative to the
+output root, SHA-256 hashes, NPZ keys/shapes/dtypes, transformation references
+and curve recipes. Table-like NPZ files and hierarchical D4-D6 angle series can
+therefore be reloaded without GUI code. The manifest reproduces stored curves;
+it does not turn unknown conventions into anatomically harmonized data.
 
 The detected-file tables show the vertical-axis convention used by the GUI: BVH/FBX model files are treated as `+Y modèle`, while C3D files are displayed and written in `+Z labo`.
 
@@ -165,9 +183,10 @@ BioBuddy template searches for `*Func_LHip.c3d`. At launch time the wrapper
 creates a temporary calibration folder with template-compatible symlinks/copies,
 then calls BioBuddy on that prepared folder.
 
-The `Critique` tab lists the main assumptions that should be checked before
-interpreting results: FBX/BVH-to-C3D registration, Captury/Motive/BioBuddy model
-coherence, vertical-axis orientation, unit scaling and joint-angle extraction.
+Below the D1-D6 table, the `Critique` tab lists the main assumptions that should
+be checked before interpreting results: FBX/BVH-to-C3D registration,
+Captury/Motive/BioBuddy model coherence, vertical-axis orientation, unit
+scaling and joint-angle extraction.
 
 In the `Découpage` tab, drag horizontally on a contact/movement graph to define the manual phase of interest. The selected time span is shaded on the graph and copied into `Début manuel (s)` / `Fin manuelle (s)`.
 

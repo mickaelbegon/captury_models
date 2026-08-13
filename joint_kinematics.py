@@ -375,10 +375,14 @@ def audit_joint_kinematics_source(
     for articulation_id, endpoints in articulations.items():
         proximal = str(endpoints["proximal"])
         distal = str(endpoints["distal"])
+        proximal_segment_id = endpoints.get("proximal_segment_id")
+        distal_segment_id = endpoints.get("distal_segment_id")
         if proximal not in rotations or distal not in rotations:
             metadata[str(articulation_id)] = {
                 "proximal": proximal,
                 "distal": distal,
+                "proximal_segment_id": proximal_segment_id,
+                "distal_segment_id": distal_segment_id,
                 "status": "unavailable_missing_segment",
                 "missing_segments": sorted(
                     name for name in (proximal, distal) if name not in rotations
@@ -406,6 +410,8 @@ def audit_joint_kinematics_source(
         row: dict[str, Any] = {
             "proximal": proximal,
             "distal": distal,
+            "proximal_segment_id": proximal_segment_id,
+            "distal_segment_id": distal_segment_id,
             "target": target_id,
             "type": target["type"],
             "sequence": target["sequence"],

@@ -10,6 +10,7 @@ try:
 
     from compare_p6_motive_captury import (
         TrialBundle,
+        _source_joint_articulations,
         comparison_input_files,
         provenance_trials_with_static,
         captury_flat_trial_name,
@@ -56,6 +57,7 @@ try:
     )
 except ImportError as exc:  # pragma: no cover - depends on optional scientific env
     TrialBundle = None
+    _source_joint_articulations = None
     comparison_input_files = None
     provenance_trials_with_static = None
     captury_flat_trial_name = None
@@ -108,6 +110,18 @@ else:
     IMPORT_ERROR is not None, f"optional dependencies missing: {IMPORT_ERROR}"
 )
 class FlatTrialDiscoveryTests(unittest.TestCase):
+    def test_source_joint_articulations_preserve_canonical_and_exporter_names(
+        self,
+    ) -> None:
+        assert _source_joint_articulations is not None
+
+        right_hip = _source_joint_articulations("captury_model", "fbx")["right_hip"]
+
+        self.assertEqual(right_hip["proximal"], "Hips")
+        self.assertEqual(right_hip["distal"], "RightUpLeg")
+        self.assertEqual(right_hip["proximal_segment_id"], "pelvis")
+        self.assertEqual(right_hip["distal_segment_id"], "right_thigh")
+
     def test_finite_range_preserves_missing_trajectories_without_warning(
         self,
     ) -> None:

@@ -76,6 +76,12 @@ from isb_segment_audit import (
     load_biobuddy_audit_sidecars,
     write_isb_d1_d3_audit,
 )
+from isb_compliance_report import (
+    build_isb_d1_d6_report,
+    build_reproducibility_manifest,
+    write_isb_d1_d6_report,
+    write_reproducibility_manifest,
+)
 from kinematic_rotations import (
     assess_rotation_source_equivalence,
     canonicalize_rotation_series,
@@ -106,7 +112,7 @@ DEFAULT_DATA_ROOT = Path("local_trials/2026-06-30_P6_flat")
 DEFAULT_OUTPUT_ROOT = Path("out_p6_motive_captury_comparison")
 ANGLE_LABEL_REGEX = r"(?i)(^.*angles?$|^.*_angle[s]?$|angle)"
 FOOT_MARKER_PATTERN = r"(LFCC|RFCC|LFM|RFM|LDP|RDP|Foot|Toe|Heel)"
-CACHE_VERSION = 11
+CACHE_VERSION = 12
 ROTATION_SEQUENCE_ZXY = "ZXY"
 DEFAULT_ALIGNMENT_CALIBRATION_CENTRES = (
     "Hips",
@@ -124,6 +130,7 @@ SCIENTIFIC_IMPLEMENTATION_FILES = {
     "joint_kinematics_registry": Path(__file__).with_name("isb_joint_kinematics.json"),
     "joint_kinematics_code": Path(__file__).with_name("joint_kinematics.py"),
     "isb_segment_audit_code": Path(__file__).with_name("isb_segment_audit.py"),
+    "isb_compliance_report_code": Path(__file__).with_name("isb_compliance_report.py"),
     "spatial_calibration_code": Path(__file__).with_name("spatial_calibration.py"),
     "mocap_alignment_code": Path(__file__).with_name("mocap_alignment.py"),
     "captury_c3d_angle_decoder": Path(__file__).with_name("captury_c3d_angles.py"),
@@ -1515,6 +1522,8 @@ def _source_joint_articulations(
         result[articulation_id] = {
             "proximal": segment_names[proximal],
             "distal": segment_names[distal],
+            "proximal_segment_id": proximal,
+            "distal_segment_id": distal,
         }
     return result
 
@@ -4400,6 +4409,7 @@ def compare_trial(
         "outputs": {
             "enriched_c3d": str(enriched_c3d),
             "joint_centre_metrics": str(trial_dir / "joint_centre_metrics.csv"),
+            "joint_centre_timeseries": str(trial_dir / "joint_centre_timeseries.npz"),
             "alignment_calibration_centre_metrics": str(
                 trial_dir / "alignment_calibration_centre_metrics.csv"
             ),
@@ -4408,6 +4418,7 @@ def compare_trial(
             ),
             "spatial_calibration": str(spatial_calibration_path),
             "kinematics_q_metrics": str(trial_dir / "kinematics_q_metrics.csv"),
+            "kinematics_q_timeseries": str(trial_dir / "kinematics_q_timeseries.npz"),
             "captury_c3d_angle_metrics": str(
                 trial_dir / "captury_c3d_angle_metrics.csv"
             ),
@@ -4830,8 +4841,9 @@ def main() -> None:
         return
 
     biobuddy_audit_evidence = load_biobuddy_audit_sidecars(args.biobuddy_biomod)
+    convention_registry = load_kinematic_conventions()
     isb_audit = build_isb_d1_d3_audit(
-        load_kinematic_conventions(),
+        convention_registry,
         biomod_verification=biobuddy_audit_evidence["biomod_verification"],
         static_evaluation=biobuddy_audit_evidence["static_evaluation"],
     )
@@ -4995,6 +5007,23 @@ def main() -> None:
             "scientific/population_aggregation": population_report_path,
         }
     )
+    isb_d1_d6_report = build_isb_d1_d6_report(
+        isb_audit, provenance_reports, convention_registry
+    )
+    isb_d1_d6_paths = write_isb_d1_d6_report(args.out_dir, isb_d1_d6_report)
+    reproducibility_manifest = build_reproducibility_manifest(
+        args.out_dir, provenance_reports
+    )
+    reproducibility_manifest_path = write_reproducibility_manifest(
+        args.out_dir, reproducibility_manifest
+    )
+    scientific_artifacts.update(
+        {
+            "scientific/isb_d1_d6_json": isb_d1_d6_paths["json"],
+            "scientific/isb_d1_d6_table": isb_d1_d6_paths["table"],
+            "scientific/reproducibility_manifest": reproducibility_manifest_path,
+        }
+    )
     figures = (
         {
             "joint_centres": [],
@@ -5064,6 +5093,11 @@ def main() -> None:
                     "summary": str(isb_audit_paths["json"]),
                     "table": str(isb_audit_paths["table"]),
                 },
+                "isb_d1_d6_report": {
+                    "summary": str(isb_d1_d6_paths["json"]),
+                    "table": str(isb_d1_d6_paths["table"]),
+                },
+                "reproducibility_manifest": str(reproducibility_manifest_path),
                 "figures": figures,
                 "population_aggregation": population_report,
                 "reports": reports,
@@ -5085,6 +5119,8 @@ def main() -> None:
         print(f"Figures: {args.out_dir / 'figures'}")
     print(f"Report: {args.out_dir / 'run_report.json'}")
     print(f"ISB D1-D3 audit: {isb_audit_paths['json']}")
+    print(f"ISB D1-D6 report: {isb_d1_d6_paths['json']}")
+    print(f"Reproducibility manifest: {reproducibility_manifest_path}")
     print(f"Provenance: {provenance_path}")
 
 

@@ -184,7 +184,7 @@ identifiables dans le rapport genere.
 | G9 | BioBuddy dynamique | partiel: statique reconstruit, dynamique refuse | IK de chaque essai, residus et absence de fallback silencieux |
 | G10 | Synchronisation | accepte pour lag constant diagnostique; derive et contacts force-plate non valides | lag, evenements communs, erreur residuelle et cycles documentes |
 | G11 | Metriques | partiel | SO(3), waveform, ROM, timing et agregation essai puis participant |
-| G12 | Rapport reproductible | a construire | tableau D1-D6 avec preuve associee a chaque statut |
+| G12 | Rapport reproductible | accepte techniquement; conclusions ISB finales conditionnees par G2/G6/G7 | tableau D1-D6, preuve, confiance, blocages, hashes et recettes de courbes versionnees |
 
 Un gate `partiel` signifie que du code existe mais que la preuve scientifique
 reste incomplete. Un gate `refuse` interdit son utilisation dans une
@@ -593,6 +593,18 @@ fallback interdit et roundtrip des rapports.
 **Gate:** le rapport permet a un lecteur externe de reproduire chaque courbe
 sans consulter le code de la GUI.
 
+**Implemente le 2026-08-13:** `isb_d1_d6_report.json` et
+`isb_d1_d6_table.npz` normalisent les audits D1-D3 par segment et D4-D6 par
+essai/articulation. Les quatre sources restent distinctes; une source absente,
+une sequence Euler inconnue ou une correction anatomique manquante est
+explicitement bloquante et ne declenche aucun fallback. L'onglet `Critique`
+permet de filtrer source, deviation et statut, et affiche niveau de confiance
+et motif de blocage. `comparison_reproducibility_manifest.json` conserve les
+chemins relatifs, SHA-256, cles/formes/types NPZ, references de recalage et
+recettes de courbes pour les tables temporelles et les series hierarchiques
+D4-D6. Le gate G12 est techniquement atteint pour reproduire les donnees
+stockees; il ne leve pas les refus scientifiques G2/G6/G7.
+
 ## Jeux de validation minimum
 
 - `Static`: axes, zero, dimensions, origine et recalage seulement;
@@ -640,6 +652,9 @@ sans consulter le code de la GUI.
 | 2026-08-12 | Phase 4, revue apres corrections | agent independant Planck | accepte G7 diagnostique; refuse G7 final ISB | matrices et SHA traces, axes JCS/signatures testees, signes appliques, singularites/quaternions conserves, smoke final P6; G6 reste diagnostique |
 | 2026-08-12 | Phase 5, tests, smoke et revue finale | Codex + agent independant Planck | gate diagnostique approuve | 259 tests, 2 subtests, `black --check`, `py_compile` et smoke P6 Static dans `/tmp/captury_phase5_smoke_final`; 13 identites decodees, unite `deg` explicitement assumee, trois groupes dupliques et deux composantes constantes; JSON/CSV/NPZ traces dans la provenance; accord anatomique refuse |
 | 2026-08-13 | Phase 8, metriques et incertitudes | Codex + agent independant Confucius | PASS diagnostique | 322 tests, 2 subtests, `black --check`, `py_compile` et smoke P6 Marche_001 dans `/tmp/captury_models_phase8_final`; 102 waveforms dont 83 eligibles, 19 bloquees explicitement; erreurs geodesiques SO(3) avec SLERP; angles C3D harmonises en degres sans echelle spatiale; LoA/Pearson/CCC exclus de la population; 102 lignes population toutes finies et statut `insufficient_participants` pour P6 seul; aucun finding bloquant final |
+| 2026-08-13 | Phase 9, tests avant integration | Codex + agent independant Carson | contrat approuve | 68 tests cibles; schema normalise D1-D6, absence de fallback, sources manquantes, distinction bloque/non applicable et reconstruction de courbes table/hierarchiques couvertes |
+| 2026-08-13 | Phase 9, premiere revue d'implementation | agent independant Tesla | refuse | blocage D4 fonde sur les noms exporteur plutot que sur les identifiants anatomiques canoniques; references de transformation portees par les recettes non validees directement |
+| 2026-08-13 | Phase 9, revue apres corrections | Codex + agent independant Tesla | gate G12 technique approuve | 338 tests et 2 subtests; endpoints D4 canoniques 52/52 sur P6 Static; manifeste sans erreur, courbe de 773 points relue sans GUI; references spatiales, temporelles et qualite validees par recette; `black --check`, `py_compile` et `git diff --check` reussis apres formatage; smoke `/tmp/captury_models_phase9_final4` |
 
 Chaque prochaine entree de validation doit enregistrer la commande de test,
 l'environnement, le commit ou diff examine et le chemin de la sortie brute.
