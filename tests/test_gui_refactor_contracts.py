@@ -20,6 +20,7 @@ from captury_biobuddy_gui import (
     vertical_axis_label,
 )
 from gui_graphs import (
+    GRAPH_CONFIGS,
     joint_centre_error_boxplot_series,
     joint_centre_error_boxplot_series_between,
     joint_centre_error_timeseries,
@@ -338,6 +339,15 @@ class GuiRefactorContracts(unittest.TestCase):
         self.assertEqual(
             CapturyBioBuddyGui._metric_display_name("bias_rad"), "bias_deg"
         )
+        self.assertEqual(
+            CapturyBioBuddyGui._metric_display_name("reference_rom_rad"),
+            "reference_rom_deg",
+        )
+        self.assertIn(
+            "median_geodesic_deg",
+            GRAPH_CONFIGS["segments"]["metrics"],
+        )
+        self.assertEqual(GRAPH_CONFIGS["kinematics"]["groups"], ("source", "q_name"))
         converted = CapturyBioBuddyGui._values_for_display(
             pd.Series([np.pi / 2.0]), "motive", q_name="Knee_rotZ"
         )

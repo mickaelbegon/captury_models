@@ -549,6 +549,33 @@ inversion de signe, faible amplitude et donnees manquantes.
 **Gate:** aucune correlation/NRMSE n'est affichee sans amplitude minimale;
 aucune statistique de population ne traite les frames comme sujets.
 
+**Implementation (2026-08-13):** les courbes temporelles source/difference
+restent dans les NPZ, tandis que les tables publient biais, MAE, RMSE, limites
+d'accord descriptives intra-essai, ROM, gain lineaire et decalage temporel des
+extrema. Les deviations globales segmentaires sont maintenant nommees
+explicitement erreurs geodesiques SO(3), avec conservation des anciens noms
+`global_deg` pour compatibilite. Correlation, CCC et NRMSE sont indisponibles
+si une courbe a moins de 1 degre d'amplitude (ou l'equivalent en radians),
+moins de 10 paires ou moins de 80 % de couverture. Les agregations moyennent
+d'abord les valeurs d'un essai nomme pour chaque participant puis appliquent
+un bootstrap en grappes sur les participants; les noms d'essais distincts ne
+sont jamais fusionnes (les familles de repetitions restent a declarer
+explicitement) et un identifiant manquant bloque le resume de population. Un
+seul participant donne `insufficient_participants`. Les limites d'accord
+frame-level, Pearson et CCC sont exclues
+de l'agregation populationnelle en attendant un modele de mesures repetees ou
+une transformation appropriee. Les q natifs gardent les erreurs absolues mais
+leurs metriques normalisees/de forme sont bloquees tant que l'unite physique et
+un seuil d'amplitude defendable ne sont pas declares. Les gaps internes ne sont
+plus combles dans le calcul de couverture, et les rotations segmentaires sont
+re-echantillonnees par SLERP plutot que par voisin temporel le plus proche.
+`metric_sensitivity.json` rapporte uniquement les contre-factuels calcules:
+politique de translation racine, lag temporel, centres de calibration versus
+centres reserves et audit BVH/FBX optionnel. La sensibilite a une convention
+anatomique non construite reste `not_computed`. L'analyse detaillee des residus
+IK demeure explicitement reportee, conformement a la decision de traiter les
+58,7 mm dans une phase scientifique separee.
+
 ### Phase 9 - Rapport ISB et interface
 
 Ajouter dans le GUI et dans les rapports:
@@ -612,6 +639,7 @@ sans consulter le code de la GUI.
 | 2026-08-12 | Phase 4, premiere revue | agent independant Planck | refuse G7 final; accepte partiellement le diagnostic | corrections non tracees, equivalence JCS non testee, signes non appliques et smoke anterieur au diff |
 | 2026-08-12 | Phase 4, revue apres corrections | agent independant Planck | accepte G7 diagnostique; refuse G7 final ISB | matrices et SHA traces, axes JCS/signatures testees, signes appliques, singularites/quaternions conserves, smoke final P6; G6 reste diagnostique |
 | 2026-08-12 | Phase 5, tests, smoke et revue finale | Codex + agent independant Planck | gate diagnostique approuve | 259 tests, 2 subtests, `black --check`, `py_compile` et smoke P6 Static dans `/tmp/captury_phase5_smoke_final`; 13 identites decodees, unite `deg` explicitement assumee, trois groupes dupliques et deux composantes constantes; JSON/CSV/NPZ traces dans la provenance; accord anatomique refuse |
+| 2026-08-13 | Phase 8, metriques et incertitudes | Codex + agent independant Confucius | PASS diagnostique | 322 tests, 2 subtests, `black --check`, `py_compile` et smoke P6 Marche_001 dans `/tmp/captury_models_phase8_final`; 102 waveforms dont 83 eligibles, 19 bloquees explicitement; erreurs geodesiques SO(3) avec SLERP; angles C3D harmonises en degres sans echelle spatiale; LoA/Pearson/CCC exclus de la population; 102 lignes population toutes finies et statut `insufficient_participants` pour P6 seul; aucun finding bloquant final |
 
 Chaque prochaine entree de validation doit enregistrer la commande de test,
 l'environnement, le commit ou diff examine et le chemin de la sortie brute.

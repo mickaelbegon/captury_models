@@ -150,6 +150,17 @@ class TemporalSynchronizationTests(unittest.TestCase):
 
         np.testing.assert_allclose(interpolated, [[0.0, 5.0, 10.0]])
 
+    def test_interpolation_preserves_long_internal_missing_gap(self) -> None:
+        source_time = np.arange(6, dtype=float)
+        target_time = np.arange(0.0, 5.1, 0.5)
+        values = np.asarray([[0.0, 1.0, np.nan, np.nan, 4.0, 5.0]])
+
+        interpolated = interpolate_finite_array(
+            values, source_time, target_time, max_gap_s=1.1
+        )
+
+        self.assertTrue(np.isnan(interpolated[0, 4:7]).all())
+
     def test_periodic_ambiguous_peak_is_not_applied(self) -> None:
         reference_time = np.arange(0.0, 8.0, 1.0 / 120.0)
         captury_time = np.arange(0.0, 8.0, 1.0 / 100.0)

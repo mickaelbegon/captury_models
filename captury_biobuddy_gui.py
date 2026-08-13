@@ -3040,8 +3040,9 @@ class CapturyBioBuddyGui(tk.Tk):
             filters = dict(payloads[0]["filters"])
             q_name = str(filters.get("q_name", ""))
             trial = str(filters.get("trial", ""))
+            source = str(filters.get("source", ""))
             if q_name and trial:
-                self._draw_kinematics_timeseries(axes, trial, q_name)
+                self._draw_kinematics_timeseries(axes, trial, q_name, source)
                 panel["figure"].tight_layout()
                 canvas.draw_idle()
                 return
@@ -3050,7 +3051,7 @@ class CapturyBioBuddyGui(tk.Tk):
         canvas.draw_idle()
 
     def _draw_kinematics_timeseries(
-        self, axes: object, trial: str, q_name: str
+        self, axes: object, trial: str, q_name: str, source: str = ""
     ) -> None:
         path = self._kinematics_timeseries_path(trial)
         dataframe = self._read_timeseries_table(
@@ -3063,6 +3064,8 @@ class CapturyBioBuddyGui(tk.Tk):
             axes.set_title("Aucune cinématique temporelle")
             return
         values = dataframe[dataframe["q_name"].astype(str) == q_name].copy()
+        if source and "source" in values.columns:
+            values = values[values["source"].astype(str) == source]
         if values.empty:
             axes.set_title(f"Aucune donnée temporelle: {q_name}")
             return
@@ -3075,7 +3078,7 @@ class CapturyBioBuddyGui(tk.Tk):
             y = self._values_for_display(y, column, q_name=q_name)
             color = (
                 data_source_color(column)
-                if column in {"captury", "motive", "captury_c3d"}
+                if column in {"captury", "motive", "biobuddy", "captury_c3d"}
                 else "#64748b"
             )
             axes.plot(values["time"], y, label=column, color=color)
@@ -3084,7 +3087,8 @@ class CapturyBioBuddyGui(tk.Tk):
             and values["captury_c3d"].astype(float).notna().any()
         )
         unit = "deg" if self._is_rotation_q_name(q_name) or has_c3d_angles else "native"
-        axes.set_title(f"{trial} - {q_name}")
+        source_suffix = f" - {source}" if source else ""
+        axes.set_title(f"{trial} - {q_name}{source_suffix}")
         axes.set_xlabel("Temps (s)")
         axes.set_ylabel(unit)
         axes.legend()
@@ -3119,7 +3123,14 @@ class CapturyBioBuddyGui(tk.Tk):
                 series.append(
                     {
                         "metric": metric,
-                        "label": filters["q_name"],
+                        "label": " / ".join(
+                            value
+                            for value in (
+                                filters.get("source", ""),
+                                filters["q_name"],
+                            )
+                            if value
+                        ),
                         "values": values.to_numpy(),
                     }
                 )

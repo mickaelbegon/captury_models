@@ -93,6 +93,7 @@ class ComparisonProvenanceTests(unittest.TestCase):
                 "captury_c3d_angle_registry",
                 "biobuddy_ik_code",
                 "temporal_synchronization_code",
+                "comparison_metrics_code",
             },
         )
         self.assertNotEqual(first["digest"], second["digest"])

@@ -81,7 +81,11 @@ def composite_joint_centre_speed(
 
 
 def interpolate_finite_signal(
-    values: np.ndarray, source_time: np.ndarray, target_time: np.ndarray
+    values: np.ndarray,
+    source_time: np.ndarray,
+    target_time: np.ndarray,
+    *,
+    max_gap_s: float | None = None,
 ) -> np.ndarray:
     finite = np.isfinite(values) & np.isfinite(source_time)
     if np.count_nonzero(finite) < 2:
@@ -91,11 +95,25 @@ def interpolate_finite_signal(
         target_time > source_time[finite][-1]
     )
     result[outside] = np.nan
+    finite_time = source_time[finite]
+    gap_limit = (
+        float(max_gap_s)
+        if max_gap_s is not None
+        else 1.5 * float(np.median(np.diff(source_time)))
+    )
+    if finite_time.size >= 2 and np.isfinite(gap_limit):
+        for left, right in zip(finite_time[:-1], finite_time[1:], strict=True):
+            if right - left > gap_limit:
+                result[(target_time > left) & (target_time < right)] = np.nan
     return result
 
 
 def interpolate_finite_array(
-    values: np.ndarray, source_time: np.ndarray, target_time: np.ndarray
+    values: np.ndarray,
+    source_time: np.ndarray,
+    target_time: np.ndarray,
+    *,
+    max_gap_s: float | None = None,
 ) -> np.ndarray:
     """Interpolate the last axis and return NaN outside temporal overlap."""
 
@@ -108,7 +126,10 @@ def interpolate_finite_array(
         )
     flat = array.reshape(-1, array.shape[-1])
     interpolated = np.vstack(
-        [interpolate_finite_signal(row, source, target) for row in flat]
+        [
+            interpolate_finite_signal(row, source, target, max_gap_s=max_gap_s)
+            for row in flat
+        ]
     )
     return interpolated.reshape(*array.shape[:-1], target.size)
 

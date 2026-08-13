@@ -24,7 +24,11 @@ try:
         file_fingerprint,
         finite_range,
         foot_contact_from_markers,
+        infer_participant_identifier,
         marker_proxy_centres_from_c3d,
+        metric_quality_report,
+        metric_sensitivity_report,
+        normalize_summary_source,
         marker_indices_by_clean_label,
         model_to_c3d_matrix,
         motive_flat_trial_name,
@@ -66,7 +70,11 @@ except ImportError as exc:  # pragma: no cover - depends on optional scientific 
     file_fingerprint = None
     finite_range = None
     foot_contact_from_markers = None
+    infer_participant_identifier = None
     marker_proxy_centres_from_c3d = None
+    metric_quality_report = None
+    metric_sensitivity_report = None
+    normalize_summary_source = None
     marker_indices_by_clean_label = None
     model_to_c3d_matrix = None
     motive_flat_trial_name = None
@@ -122,6 +130,134 @@ class FlatTrialDiscoveryTests(unittest.TestCase):
         self.assertFalse(np.any(contacts))
         self.assertTrue(np.all(np.isnan(z)))
         self.assertTrue(np.all(np.isnan(speed)))
+
+    def test_participant_identifier_is_inferred_only_when_sources_agree(self) -> None:
+        assert infer_participant_identifier is not None
+
+        self.assertEqual(
+            infer_participant_identifier(
+                Path("Captury/Walk_P6.c3d"), Path("Motive/P6_Walk.c3d")
+            ),
+            "P6",
+        )
+        self.assertIsNone(
+            infer_participant_identifier(
+                Path("Captury/Walk_P6.c3d"), Path("Motive/P7_Walk.c3d")
+            )
+        )
+        self.assertIsNone(infer_participant_identifier(Path("Captury/Walk.c3d")))
+
+    def test_nan_source_is_replaced_before_population_aggregation(self) -> None:
+        assert normalize_summary_source is not None
+        rows = [{"source": np.nan}, {}, {"source": "biobuddy_ik"}]
+
+        normalize_summary_source(rows, "captury")
+
+        self.assertEqual(
+            [row["source"] for row in rows], ["captury", "captury", "biobuddy_ik"]
+        )
+
+    def test_metric_quality_report_counts_ineligible_waveforms(self) -> None:
+        assert metric_quality_report is not None
+        report = metric_quality_report(
+            [
+                {"waveform_status": "ok", "shape_metrics_eligible": True},
+                {
+                    "waveform_status": "low_reference_amplitude",
+                    "shape_metrics_eligible": False,
+                },
+                {
+                    "waveform_status": "insufficient_coverage",
+                    "shape_metrics_eligible": False,
+                },
+                {"source": "captury_c3d", "c3d_mean_deg": 12.0},
+            ]
+        )
+
+        self.assertEqual(report["waveforms"], 3)
+        self.assertEqual(report["eligible_waveforms"], 1)
+        self.assertEqual(report["ineligible_waveforms"], 2)
+        self.assertEqual(report["status_counts"]["low_reference_amplitude"], 1)
+
+    def test_sensitivity_report_uses_only_computed_counterfactuals(self) -> None:
+        assert metric_sensitivity_report is not None
+        report = metric_sensitivity_report(
+            root_policies={
+                "captury": {
+                    "score_mm_subtract_static_offset": 10.0,
+                    "score_mm_keep_file_translation": 25.0,
+                    "selected_mode": "subtract_static_offset_from_root_q",
+                }
+            },
+            temporal={
+                "normalized_rmse_before": 0.4,
+                "normalized_rmse_after": 0.2,
+                "estimated_lag_s": 0.1,
+                "lag_s": 0.1,
+            },
+            evaluation_centre_rows=[{"median_error_mm": 30.0}],
+            calibration_centre_rows=[{"median_error_mm": 5.0}],
+            rotation_audits={},
+        )
+
+        self.assertEqual(report["root_translation"]["captury"]["status"], "computed")
+        self.assertAlmostEqual(
+            report["root_translation"]["captury"]["score_difference_mm"], 15.0
+        )
+        self.assertEqual(report["temporal_lag"]["status"], "computed")
+        self.assertEqual(report["bvh_fbx_source"]["status"], "not_computed")
+
+    def test_segment_rotation_metrics_name_global_so3_error_as_geodesic(self) -> None:
+        reference = np.repeat(np.eye(3)[:, :, None], 2, axis=2)
+        test = reference.copy()
+        angle = np.deg2rad(10.0)
+        test[:, :, 1] = np.asarray(
+            [
+                [np.cos(angle), -np.sin(angle), 0.0],
+                [np.sin(angle), np.cos(angle), 0.0],
+                [0.0, 0.0, 1.0],
+            ]
+        )
+        rows, timeseries, _report = segment_rotation_metric_rows(
+            "Walk",
+            {"biobuddy": {"pelvis": reference}, "captury": {"pelvis": test}},
+            {"biobuddy": np.asarray([0.0, 1.0]), "captury": np.asarray([0.0, 1.0])},
+            "biobuddy",
+        )
+
+        self.assertAlmostEqual(rows[0]["max_geodesic_deg"], 10.0)
+        self.assertAlmostEqual(timeseries[1]["geodesic_deg"], 10.0)
+
+    def test_segment_rotation_metrics_use_slerp_at_different_frame_rates(self) -> None:
+        def rotation_z(angle: float) -> np.ndarray:
+            return np.asarray(
+                [
+                    [np.cos(angle), -np.sin(angle), 0.0],
+                    [np.sin(angle), np.cos(angle), 0.0],
+                    [0.0, 0.0, 1.0],
+                ]
+            )
+
+        reference = np.stack(
+            [rotation_z(angle) for angle in (0.0, np.pi / 4.0, np.pi / 2.0)],
+            axis=2,
+        )
+        source = np.stack([rotation_z(0.0), rotation_z(np.pi / 2.0)], axis=2)
+
+        rows, timeseries, _report = segment_rotation_metric_rows(
+            "Walk",
+            {"biobuddy": {"pelvis": reference}, "captury": {"pelvis": source}},
+            {
+                "biobuddy": np.asarray([0.0, 0.5, 1.0]),
+                "captury": np.asarray([0.0, 1.0]),
+            },
+            "biobuddy",
+        )
+
+        self.assertAlmostEqual(rows[0]["max_geodesic_deg"], 0.0, places=10)
+        np.testing.assert_allclose(
+            [row["geodesic_deg"] for row in timeseries], 0.0, atol=1e-10
+        )
 
     def test_missing_biobuddy_segment_reference_never_falls_back_to_motive(
         self,
@@ -280,6 +416,8 @@ class FlatTrialDiscoveryTests(unittest.TestCase):
         self.assertIn("temporal_phase_normalized.npz", outputs)
         self.assertIn("phase_normalized_scientific_timeseries.npz", outputs)
         self.assertIn("contact_cycles.json", outputs)
+        self.assertIn("metric_quality.json", outputs)
+        self.assertIn("metric_sensitivity.json", outputs)
         self.assertNotIn("joint_centre_timeseries.csv", outputs)
         self.assertNotIn("kinematics_q_timeseries.csv", outputs)
         self.assertNotIn("segment_rotation_timeseries.csv", outputs)
