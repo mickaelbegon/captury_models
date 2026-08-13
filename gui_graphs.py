@@ -104,6 +104,11 @@ EVENT_METRICS = (
     "right_foot_speed_mm_s",
     "left_contact",
     "right_contact",
+    "motive_composite_speed",
+    "captury_composite_speed",
+    "difference",
+    "reference",
+    "moving",
 )
 KINEMATIC_RAD_METRICS = {"bias_rad", "mae_rad", "rmse_rad"}
 KINEMATIC_TIMESERIES_COLUMNS = ("motive", "captury", "captury_c3d", "difference")

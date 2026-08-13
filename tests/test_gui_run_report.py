@@ -37,6 +37,12 @@ class GuiRunReportTests(unittest.TestCase):
             "segment_orientation_corrections": {
                 "applied": ["captury_thigh_y_axis_from_hip_to_knee_cor"]
             },
+            "temporal_synchronization": {
+                "status": "ok",
+                "lag_s": 0.125,
+                "correlation_after": 0.98,
+                "peak_prominence": 0.12,
+            },
         }
 
         summary = summarize_run_report(report)
@@ -48,6 +54,8 @@ class GuiRunReportTests(unittest.TestCase):
         self.assertIn("Référence segments: biobuddy -> motive", summary)
         self.assertIn("fallback_missing_reference", summary)
         self.assertIn("captury_thigh_y_axis_from_hip_to_knee_cor", summary)
+        self.assertIn("Synchronisation: ok", summary)
+        self.assertIn("+0.125000 s", summary)
 
     def test_summarize_run_report_handles_empty_report(self) -> None:
         self.assertEqual(summarize_run_report({}), "Aucun rapport sélectionné.")

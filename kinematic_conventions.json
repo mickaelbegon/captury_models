@@ -125,7 +125,7 @@
     "biobuddy_motive57": {
       "display_name": "BioBuddy Motive 57",
       "representation": "marker_based_biorbd_model",
-      "provenance": ["BioBuddy motive_57_template", "Motive calibration C3D", "biorbd QLD inverse kinematics"],
+      "provenance": ["BioBuddy motive_57_template", "Motive calibration C3D", "SciPy nonlinear TRF inverse kinematics"],
       "laboratory_frame": {"status": "documente_non_evalue", "evidence": ["Model built from Motive C3D coordinates"]},
       "length_unit": {"status": "documente_non_evalue", "value": "m", "evidence": ["BioBuddy/biorbd model creation contract; verify generated model"]},
       "segments": {

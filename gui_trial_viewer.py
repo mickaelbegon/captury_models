@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import csv
 import tkinter as tk
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Iterable
 
@@ -164,6 +164,7 @@ def transformed_marker_data(
         points=transformed,
         rate=data.rate,
         unit=data.unit,
+        time=None if data.time is None else np.asarray(data.time, dtype=float).copy(),
     )
 
 
@@ -277,6 +278,7 @@ def available_cor_layers(fieldnames: Iterable[str]) -> list[str]:
 class JointCentreChainData:
     layers: dict[str, dict[str, np.ndarray]]
     edges: list[tuple[str, str]]
+    times: dict[str, dict[str, np.ndarray]] = field(default_factory=dict)
 
     @property
     def n_frames(self) -> int:
@@ -310,6 +312,7 @@ def _load_joint_centre_chain_data_npz(path: Path) -> JointCentreChainData | None
         else np.arange(joint_values.shape[0], dtype=float)
     )
     layer_arrays: dict[str, dict[str, np.ndarray]] = {layer: {} for layer in layers}
+    layer_times: dict[str, dict[str, np.ndarray]] = {layer: {} for layer in layers}
     for layer in layers:
         required_columns = [f"{layer}_{axis}_mm" for axis in ("x", "y", "z")]
         if any(column not in arrays for column in required_columns):
@@ -328,11 +331,14 @@ def _load_joint_centre_chain_data_npz(path: Path) -> JointCentreChainData | None
             points = points[order]
             if points.size:
                 layer_arrays[layer][joint] = points
+                layer_times[layer][joint] = time_values[mask][order]
     all_joints = {joint for joints in layer_arrays.values() for joint in joints}
     if not all_joints:
         return None
     return JointCentreChainData(
-        layers=layer_arrays, edges=joint_chain_edges(all_joints)
+        layers=layer_arrays,
+        edges=joint_chain_edges(all_joints),
+        times=layer_times,
     )
 
 
@@ -369,14 +375,19 @@ def _load_joint_centre_chain_data_csv(path: Path) -> JointCentreChainData | None
                     continue
                 values[layer].setdefault(joint, []).append((time_value, point))
     layer_arrays: dict[str, dict[str, np.ndarray]] = {}
+    layer_times: dict[str, dict[str, np.ndarray]] = {}
     for layer, joints in values.items():
         layer_arrays[layer] = {}
+        layer_times[layer] = {}
         for joint, samples in joints.items():
             samples.sort(key=lambda item: item[0])
             layer_arrays[layer][joint] = np.vstack([point for _time, point in samples])
+            layer_times[layer][joint] = np.asarray(
+                [time for time, _point in samples], dtype=float
+            )
     all_joints = {joint for joints in layer_arrays.values() for joint in joints}
     edges = joint_chain_edges(all_joints)
-    return JointCentreChainData(layers=layer_arrays, edges=edges)
+    return JointCentreChainData(layers=layer_arrays, edges=edges, times=layer_times)
 
 
 class TkC3DTrialCanvas(tk.Canvas):
@@ -389,6 +400,7 @@ class TkC3DTrialCanvas(tk.Canvas):
         )
         self.data: C3DMarkerData | None = None
         self.marker_layers: dict[str, C3DMarkerData] = {}
+        self.marker_time_offsets_s: dict[str, float] = {}
         self.visible_marker_sources: set[str] = {"captury", "motive"}
         self.frame = 0
         self.camera = default_camera_matrix()
@@ -430,11 +442,20 @@ class TkC3DTrialCanvas(tk.Canvas):
             str(source).strip().lower(): data for source, data in layers.items()
         }
         self.marker_layers = normalized_layers
-        self.data = next(iter(normalized_layers.values()), None)
+        self.data = normalized_layers.get(
+            "motive", next(iter(normalized_layers.values()), None)
+        )
         self.frame = 0
         self.selected_label = None
         self.selected_markers = {}
         self.reset_camera()
+
+    def set_marker_time_offsets(self, offsets_s: dict[str, float]) -> None:
+        self.marker_time_offsets_s = {
+            str(source).strip().lower(): float(offset)
+            for source, offset in offsets_s.items()
+        }
+        self.redraw()
 
     def set_marker_source(self, source: str | None) -> None:
         self.marker_source = str(source or "motive").strip().lower()
@@ -472,6 +493,9 @@ class TkC3DTrialCanvas(tk.Canvas):
     @property
     def n_frames(self) -> int:
         if self.marker_layers:
+            reference = self.marker_layers.get("motive")
+            if reference is not None:
+                return reference.n_frames
             return max(data.n_frames for data in self.marker_layers.values())
         if self.data is not None:
             return self.data.n_frames
@@ -539,13 +563,15 @@ class TkC3DTrialCanvas(tk.Canvas):
             data = self.marker_layers.get(source)
             if data is None:
                 continue
-            axis = self._anatomical_left_axis_from_data(data)
+            axis = self._anatomical_left_axis_from_data(data, source)
             if axis is not None:
                 return axis
         return None
 
-    def _anatomical_left_axis_from_data(self, data: C3DMarkerData) -> np.ndarray | None:
-        points = self._marker_layer_points(data)
+    def _anatomical_left_axis_from_data(
+        self, data: C3DMarkerData, source: str | None = None
+    ) -> np.ndarray | None:
+        points = self._marker_layer_points(data, source)
         if points.size == 0:
             return None
         lookup: dict[str, list[int]] = {}
@@ -579,15 +605,36 @@ class TkC3DTrialCanvas(tk.Canvas):
             data = self.marker_layers.get(source)
             if data is None:
                 continue
-            layers.append(self._marker_layer_points(data))
+            layers.append(self._marker_layer_points(data, source))
         if not layers:
             return np.empty((3, 0))
         return np.column_stack(layers)
 
-    def _marker_layer_points(self, data: C3DMarkerData) -> np.ndarray:
+    def _reference_time_s(self) -> float:
+        reference = self.marker_layers.get("motive") or getattr(self, "data", None)
+        if reference is None or reference.n_frames <= 0:
+            return 0.0
+        if reference.time is not None and len(reference.time):
+            index = max(0, min(self.frame, reference.n_frames - 1))
+            return float(reference.time[index])
+        return float(self.frame) / max(float(reference.rate), 1e-12)
+
+    def _marker_layer_points(
+        self, data: C3DMarkerData, source: str | None = None
+    ) -> np.ndarray:
         if data.n_frames <= 0:
             return np.empty((3, 0))
-        frame = max(0, min(self.frame, data.n_frames - 1))
+        source_key = str(source or "motive").strip().lower()
+        offsets = getattr(self, "marker_time_offsets_s", {})
+        original_time = self._reference_time_s() - offsets.get(source_key, 0.0)
+        data_time = (
+            np.asarray(data.time, dtype=float)
+            if data.time is not None
+            else np.arange(data.n_frames, dtype=float) / max(float(data.rate), 1e-12)
+        )
+        if original_time < data_time[0] or original_time > data_time[-1]:
+            return np.full((3, len(data.labels)), np.nan, dtype=float)
+        frame = int(np.argmin(np.abs(data_time - original_time)))
         return data.points[:, :, frame]
 
     def _visible_chain_points_array(self) -> np.ndarray:
@@ -600,7 +647,7 @@ class TkC3DTrialCanvas(tk.Canvas):
             joints = self.chain_data.layers.get(layer)
             if not joints:
                 continue
-            frame_points = self._chain_frame_points(joints)
+            frame_points = self._chain_frame_points(joints, layer)
             if frame_points:
                 layers.append(np.column_stack(list(frame_points.values())))
         if not layers:
@@ -706,7 +753,7 @@ class TkC3DTrialCanvas(tk.Canvas):
         width: int,
         height: int,
     ) -> None:
-        points = self._marker_layer_points(data)
+        points = self._marker_layer_points(data, source)
         if points.size == 0:
             return
         screen, depth = project_points(
@@ -760,7 +807,7 @@ class TkC3DTrialCanvas(tk.Canvas):
             if not joints:
                 continue
             color = COR_LAYER_COLORS.get(layer, "#111827")
-            frame_points = self._chain_frame_points(joints)
+            frame_points = self._chain_frame_points(joints, layer)
             self._draw_chain_edges(frame_points, color, center, scale, width, height)
             self._draw_chain_points(frame_points, color, center, scale, width, height)
         if self.show_chain_axes:
@@ -768,7 +815,7 @@ class TkC3DTrialCanvas(tk.Canvas):
                 joints = self.chain_data.layers.get(layer) if self.chain_data else None
                 if not joints:
                     continue
-                frame_points = self._chain_frame_points(joints)
+                frame_points = self._chain_frame_points(joints, layer)
                 self._draw_chain_axes(layer, frame_points, center, scale, width, height)
 
     def _visible_chain_axis_layers(self) -> tuple[str, ...]:
@@ -785,17 +832,26 @@ class TkC3DTrialCanvas(tk.Canvas):
         return visible or available
 
     def _chain_frame_points(
-        self, joints: dict[str, np.ndarray]
+        self, joints: dict[str, np.ndarray], layer: str | None = None
     ) -> dict[str, np.ndarray]:
         points: dict[str, np.ndarray] = {}
-        c3d_frames = max(1, self.n_frames)
         for joint, values in joints.items():
             if values.size == 0:
                 continue
-            if c3d_frames <= 1 or values.shape[0] <= 1:
+            times = (
+                self.chain_data.times.get(str(layer), {}).get(joint)
+                if self.chain_data is not None and layer is not None
+                else None
+            )
+            if times is not None and len(times) == values.shape[0]:
+                reference_time = self._reference_time_s()
+                if reference_time < times[0] or reference_time > times[-1]:
+                    continue
+                index = int(np.argmin(np.abs(times - reference_time)))
+            elif self.n_frames <= 1 or values.shape[0] <= 1:
                 index = min(self.frame, values.shape[0] - 1)
             else:
-                ratio = self.frame / max(1, c3d_frames - 1)
+                ratio = self.frame / max(1, self.n_frames - 1)
                 index = int(round(ratio * (values.shape[0] - 1)))
             point = values[index]
             if np.all(np.isfinite(point)):

@@ -22,6 +22,8 @@ try:
         euler_matrix_from_sequence,
         euler_zxy_from_matrix,
         file_fingerprint,
+        finite_range,
+        foot_contact_from_markers,
         marker_proxy_centres_from_c3d,
         marker_indices_by_clean_label,
         model_to_c3d_matrix,
@@ -62,6 +64,8 @@ except ImportError as exc:  # pragma: no cover - depends on optional scientific 
     euler_matrix_from_sequence = None
     euler_zxy_from_matrix = None
     file_fingerprint = None
+    finite_range = None
+    foot_contact_from_markers = None
     marker_proxy_centres_from_c3d = None
     marker_indices_by_clean_label = None
     model_to_c3d_matrix = None
@@ -96,6 +100,52 @@ else:
     IMPORT_ERROR is not None, f"optional dependencies missing: {IMPORT_ERROR}"
 )
 class FlatTrialDiscoveryTests(unittest.TestCase):
+    def test_finite_range_preserves_missing_trajectories_without_warning(
+        self,
+    ) -> None:
+        assert finite_range is not None
+
+        ranges = finite_range(
+            np.asarray([[1.0, 4.0], [np.nan, np.nan], [-2.0, 3.0]]), axis=1
+        )
+
+        np.testing.assert_allclose(ranges[[0, 2]], [3.0, 5.0])
+        self.assertTrue(np.isnan(ranges[1]))
+
+    def test_missing_foot_markers_never_create_true_contacts(self) -> None:
+        assert foot_contact_from_markers is not None
+        contacts, z, speed, available = foot_contact_from_markers(
+            np.zeros((3, 2, 5)), [], 0.01
+        )
+
+        self.assertFalse(available)
+        self.assertFalse(np.any(contacts))
+        self.assertTrue(np.all(np.isnan(z)))
+        self.assertTrue(np.all(np.isnan(speed)))
+
+    def test_missing_biobuddy_segment_reference_never_falls_back_to_motive(
+        self,
+    ) -> None:
+        summary, timeseries, report = segment_rotation_metric_rows(
+            "Static",
+            {
+                "captury": {},
+                "motive": {"pelvis": np.eye(3)[:, :, None]},
+                "biobuddy": {},
+            },
+            {
+                "captury": np.asarray([]),
+                "motive": np.asarray([0.0]),
+                "biobuddy": np.asarray([]),
+            },
+            "biobuddy",
+        )
+
+        self.assertEqual(summary, [])
+        self.assertEqual(timeseries, [])
+        self.assertEqual(report["status"], "missing_reference")
+        self.assertNotIn("effective_reference", report)
+
     def test_static_calibration_trial_is_removed_from_dynamic_order(self) -> None:
         assert split_static_calibration_trial is not None
         static = TrialBundle(
@@ -225,6 +275,11 @@ class FlatTrialDiscoveryTests(unittest.TestCase):
         self.assertIn("joint_kinematics_d4_d6.json", outputs)
         self.assertIn("joint_kinematics_d4_d6.npz", outputs)
         self.assertIn("skin_marker_correspondence_timeseries.npz", outputs)
+        self.assertIn("temporal_synchronization.json", outputs)
+        self.assertIn("temporal_synchronization_timeseries.npz", outputs)
+        self.assertIn("temporal_phase_normalized.npz", outputs)
+        self.assertIn("phase_normalized_scientific_timeseries.npz", outputs)
+        self.assertIn("contact_cycles.json", outputs)
         self.assertNotIn("joint_centre_timeseries.csv", outputs)
         self.assertNotIn("kinematics_q_timeseries.csv", outputs)
         self.assertNotIn("segment_rotation_timeseries.csv", outputs)
@@ -329,6 +384,45 @@ class FlatTrialDiscoveryTests(unittest.TestCase):
             [(row["reference"][0], row["test"][0]) for row in pairs],
             [("RIAS", "Q_B"), ("LANK", "Q_C")],
         )
+
+    def test_marker_proposal_applies_captury_lag_before_interpolation(self) -> None:
+        assert propose_marker_correspondences_from_points is not None
+
+        motive_time = np.asarray([0.0, 0.5, 1.0, 1.5])
+        captury_time = motive_time - 0.5
+        trajectory = np.asarray(
+            [motive_time * 100.0, motive_time**2, motive_time * 0.0]
+        )
+        motive_points = trajectory[:, None, :]
+        captury_points = trajectory[:, None, :].copy()
+
+        synchronized, _ = propose_marker_correspondences_from_points(
+            ["LIAS"],
+            motive_points,
+            motive_time,
+            ["Q_A"],
+            captury_points,
+            captury_time,
+            np.eye(3),
+            np.zeros(3),
+            captury_lag_s=0.5,
+            max_median_error_mm=1e-9,
+        )
+        unsynchronized, _ = propose_marker_correspondences_from_points(
+            ["LIAS"],
+            motive_points,
+            motive_time,
+            ["Q_A"],
+            captury_points,
+            captury_time,
+            np.eye(3),
+            np.zeros(3),
+            captury_lag_s=0.0,
+            max_median_error_mm=1e-9,
+        )
+
+        self.assertEqual(len(synchronized), 1)
+        self.assertEqual(unsynchronized, [])
 
     def test_rotation_deviation_vector_reports_axis_angle_components(self) -> None:
         assert rotation_deviation_vector is not None
@@ -588,6 +682,30 @@ endsegment
         self.assertEqual(len(timeseries), 1)
         self.assertLess(rows[0]["max_global_deg"], 1e-8)
 
+    def test_segment_metrics_do_not_repeat_endpoints_outside_time_overlap(
+        self,
+    ) -> None:
+        assert segment_rotation_metric_rows is not None
+        rotations = np.repeat(np.eye(3)[:, :, None], 3, axis=2)
+
+        rows, timeseries, report = segment_rotation_metric_rows(
+            "Walk",
+            {
+                "motive": {"Pelvis": rotations},
+                "captury": {"Pelvis": rotations[:, :, 1:]},
+            },
+            {
+                "motive": np.asarray([0.0, 1.0, 2.0]),
+                "captury": np.asarray([1.0, 2.0]),
+            },
+            "motive",
+        )
+
+        self.assertEqual(report["status"], "ok")
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(len(timeseries), 2)
+        self.assertEqual([row["time"] for row in timeseries], [1.0, 2.0])
+
     def test_c3d_angle_scale_to_deg_handles_rad_and_deg(self) -> None:
         assert c3d_angle_scale_to_deg is not None
 
@@ -619,6 +737,25 @@ endsegment
         score = root_alignment_score_mm(centres, time, markers, time)
 
         self.assertAlmostEqual(score, 1.0)
+
+    def test_root_alignment_score_ignores_frames_outside_overlap(self) -> None:
+        assert root_alignment_score_mm is not None
+        source_time = np.asarray([1.0, 2.0])
+        c3d_time = np.asarray([0.0, 0.5, 1.0, 2.0])
+        centres = {"Hips": np.zeros((3, 2))}
+        markers = np.asarray(
+            [
+                [[0.0, 0.0, 100.0, 100.0]],
+                [[0.0, 0.0, 0.0, 0.0]],
+                [[0.0, 0.0, 0.0, 0.0]],
+            ]
+        )
+
+        score = root_alignment_score_mm(
+            centres, source_time, markers, c3d_time, max_frames=4
+        )
+
+        self.assertAlmostEqual(score, 100.0)
 
     def test_discover_flat_trials_matches_only_complete_c3d_pairs(self) -> None:
         assert discover_flat_trials is not None
@@ -731,6 +868,10 @@ endsegment
                 cut_mode="manual",
                 time_start=None,
                 time_end=None,
+                temporal_sync_mode="auto",
+                manual_lag_s=None,
+                max_lag_s=0.5,
+                phase_normalization_points=101,
                 no_figures=True,
             )
 
@@ -747,6 +888,9 @@ endsegment
             args.reexpress_rotations_zxy = True
             fifth = trial_cache_fingerprint(bundle, args)
             args.reexpress_rotations_zxy = False
+            args.temporal_sync_mode = "none"
+            unsynchronized = trial_cache_fingerprint(bundle, args)
+            args.temporal_sync_mode = "auto"
             args.root_offset_mode = "keep"
             third = trial_cache_fingerprint(bundle, args)
             args.root_offset_mode = "auto"
@@ -759,6 +903,7 @@ endsegment
             self.assertNotEqual(first["digest"], third["digest"])
             self.assertNotEqual(first["digest"], fourth["digest"])
             self.assertNotEqual(first["digest"], fifth["digest"])
+            self.assertNotEqual(first["digest"], unsynchronized["digest"])
 
     def test_file_fingerprint_records_missing_files(self) -> None:
         assert file_fingerprint is not None

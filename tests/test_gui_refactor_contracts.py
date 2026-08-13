@@ -50,6 +50,10 @@ def make_gui_stub() -> CapturyBioBuddyGui:
         "selected_trial",
         "p6_static_trial",
         "p6_cut_mode",
+        "p6_temporal_sync_mode",
+        "p6_manual_lag_s",
+        "p6_max_lag_s",
+        "p6_phase_normalization_points",
         "p6_time_start",
         "p6_time_end",
         "p6_joint_filter",
@@ -84,6 +88,10 @@ def make_gui_stub() -> CapturyBioBuddyGui:
     gui.vars["selected_trial"].set("Marche_001")
     gui.vars["p6_static_trial"].set("Static")
     gui.vars["p6_cut_mode"].set("manual")
+    gui.vars["p6_temporal_sync_mode"].set("manual")
+    gui.vars["p6_manual_lag_s"].set("0.125")
+    gui.vars["p6_max_lag_s"].set("0.5")
+    gui.vars["p6_phase_normalization_points"].set("101")
     gui.vars["p6_time_start"].set("0.5")
     gui.vars["p6_time_end"].set("2.0")
     gui.vars["p6_joint_filter"].set("Hip|Knee\nAnkle")
@@ -127,6 +135,11 @@ class GuiRefactorContracts(unittest.TestCase):
         self.assertIn("auto", args)
         self.assertIn("--time-start", args)
         self.assertIn("0.5", args)
+        self.assertIn("--temporal-sync-mode", args)
+        self.assertIn("manual", args)
+        self.assertIn("--manual-lag-s", args)
+        self.assertIn("0.125", args)
+        self.assertIn("--phase-normalization-points", args)
         self.assertIn("--c3d-angle-unit", args)
         self.assertIn("deg", args)
         self.assertIn("--biobuddy-biomod", args)
@@ -136,6 +149,52 @@ class GuiRefactorContracts(unittest.TestCase):
         self.assertIn("Ankle", args)
         self.assertIn("--no-cache", args)
         self.assertIn("--headless", args)
+
+    def test_viewer_uses_reference_time_and_captury_lag_across_rates(self) -> None:
+        viewer = object.__new__(TkC3DTrialCanvas)
+        viewer.frame = 2
+        viewer.marker_time_offsets_s = {"captury": 0.1}
+        motive = C3DMarkerData(
+            labels=["M"],
+            points=np.asarray(
+                [[[0.0, 1.0, 2.0]], [[0.0, 0.0, 0.0]], [[0.0, 0.0, 0.0]]]
+            ),
+            rate=10.0,
+            time=np.asarray([0.0, 0.1, 0.2]),
+        )
+        captury = C3DMarkerData(
+            labels=["C"],
+            points=np.asarray(
+                [[[10.0, 20.0, 30.0]], [[0.0, 0.0, 0.0]], [[0.0, 0.0, 0.0]]]
+            ),
+            rate=20.0,
+            time=np.asarray([0.0, 0.05, 0.1]),
+        )
+        viewer.data = motive
+        viewer.marker_layers = {"motive": motive, "captury": captury}
+
+        points = TkC3DTrialCanvas._marker_layer_points(viewer, captury, "captury")
+
+        np.testing.assert_allclose(points[:, 0], [30.0, 0.0, 0.0])
+
+    def test_chain_is_hidden_outside_its_saved_time_interval(self) -> None:
+        viewer = object.__new__(TkC3DTrialCanvas)
+        viewer.frame = 0
+        viewer.data = C3DMarkerData(
+            labels=["M"], points=np.zeros((3, 1, 1)), rate=10.0, time=np.asarray([0.0])
+        )
+        viewer.marker_layers = {"motive": viewer.data}
+        viewer.chain_data = JointCentreChainData(
+            layers={"captury": {"Hips": np.asarray([[1.0, 2.0, 3.0]])}},
+            edges=[],
+            times={"captury": {"Hips": np.asarray([1.0])}},
+        )
+
+        points = TkC3DTrialCanvas._chain_frame_points(
+            viewer, viewer.chain_data.layers["captury"], "captury"
+        )
+
+        self.assertEqual(points, {})
 
     def test_explicit_root_offset_label_maps_to_cli_value(self) -> None:
         gui = make_gui_stub()
@@ -214,6 +273,8 @@ class GuiRefactorContracts(unittest.TestCase):
         self.assertIn("/tmp/P6_Static.c3d", args)
         self.assertIn("--strip-marker-prefix", args)
         self.assertIn("Skeleton_001_", args)
+        self.assertIn("--cache-dir", args)
+        self.assertTrue(any(value.endswith("biobuddy_ik_cache") for value in args))
 
     def test_biobuddy_c3d_folder_defaults_to_p6_motive_folder(self) -> None:
         gui = make_gui_stub()

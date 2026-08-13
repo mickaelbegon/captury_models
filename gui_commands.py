@@ -202,7 +202,7 @@ def build_p6_args(values: Mapping[str, object]) -> list[str]:
     append_flag(args, values, "--no-cache", "p6_no_cache")
     append_flag(args, values, "--no-mesh", "p6_no_mesh")
     append_value(args, values, "--max-mesh-points", "p6_max_mesh_points")
-    append_flag(args, values, "--run-ik-batch", "p6_run_ik_batch")
+    append_flag(args, values, "--run-biobuddy-ik-batch", "p6_run_ik_batch")
     append_value(args, values, "--ik-max-frames", "p6_ik_max_frames")
     append_flag(args, values, "--visualize", "p6_visualize")
     append_value(args, values, "--visualize-trial", "p6_visualize_trial")
@@ -218,6 +218,15 @@ def append_p6_common_args(args: list[str], values: Mapping[str, object]) -> None
     append_value(args, values, "--cut-mode", "p6_cut_mode")
     append_value(args, values, "--time-start", "p6_time_start")
     append_value(args, values, "--time-end", "p6_time_end")
+    append_value(args, values, "--temporal-sync-mode", "p6_temporal_sync_mode")
+    append_value(args, values, "--manual-lag-s", "p6_manual_lag_s")
+    append_value(args, values, "--max-lag-s", "p6_max_lag_s")
+    append_value(
+        args,
+        values,
+        "--phase-normalization-points",
+        "p6_phase_normalization_points",
+    )
     append_value(args, values, "--model-source", "p6_model_source")
     append_root_offset_mode(args, values)
     append_value(args, values, "--model-to-c3d-axis", "p6_model_to_c3d_axis")
@@ -326,6 +335,8 @@ def build_biobuddy_c3d_ik_args(
         c3d_path,
         "--out-dir",
         str(Path(value_of(values, "p6_out_dir")) / "biobuddy_ik" / source_name),
+        "--cache-dir",
+        str(Path(value_of(values, "p6_out_dir")) / "biobuddy_ik_cache"),
         "--source-name",
         source_name,
         "--biomod-unit-scale-to-m",

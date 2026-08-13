@@ -35,6 +35,7 @@ class C3DMarkerData:
     points: np.ndarray
     rate: float
     unit: str = "mm"
+    time: np.ndarray | None = None
 
     @property
     def n_frames(self) -> int:
@@ -76,6 +77,7 @@ def load_c3d_marker_data(
         points=points,
         rate=rate,
         unit="mm",
+        time=np.arange(points.shape[2], dtype=float) / rate,
     )
 
 

@@ -397,6 +397,10 @@ class CapturyBioBuddyGui(tk.Tk):
             "selected_trial": ALL_TRIALS_LABEL,
             "p6_static_trial": "Static",
             "p6_cut_mode": "manual",
+            "p6_temporal_sync_mode": "auto",
+            "p6_manual_lag_s": "",
+            "p6_max_lag_s": "0.5",
+            "p6_phase_normalization_points": "101",
             "p6_time_start": "",
             "p6_time_end": "",
             "p6_joint_filter": "",
@@ -805,7 +809,7 @@ class CapturyBioBuddyGui(tk.Tk):
         batch_button = self._register_analysis_button(
             ttk.Button(
                 actions,
-                text="Batch cinématique inverse",
+                text="Batch IK non linéaire TRF",
                 command=self._run_p6_ik_batch,
             )
         )
@@ -845,17 +849,29 @@ class CapturyBioBuddyGui(tk.Tk):
         self._combo_row(
             panel,
             1,
+            "Synchronisation",
+            "p6_temporal_sync_mode",
+            ("auto", "manual", "none"),
+        )
+        self._entry_row(panel, 2, "Lag Captury manuel (s)", "p6_manual_lag_s")
+        self._entry_row(panel, 3, "Lag auto maximal (s)", "p6_max_lag_s")
+        self._entry_row(
+            panel, 4, "Points phase 0-100 %", "p6_phase_normalization_points"
+        )
+        self._combo_row(
+            panel,
+            5,
             "Mode découpage",
             "p6_cut_mode",
             ("manual", "movement", "full"),
         )
-        self._entry_row(panel, 2, "Début manuel (s)", "p6_time_start")
-        self._entry_row(panel, 3, "Fin manuelle (s)", "p6_time_end")
-        self._check(panel, 4, "Visualiser un essai enrichi", "p6_visualize")
-        self._entry_row(panel, 5, "Essai visualisé", "p6_visualize_trial")
+        self._entry_row(panel, 6, "Début manuel (s)", "p6_time_start")
+        self._entry_row(panel, 7, "Fin manuelle (s)", "p6_time_end")
+        self._check(panel, 8, "Visualiser un essai enrichi", "p6_visualize")
+        self._entry_row(panel, 9, "Essai visualisé", "p6_visualize_trial")
         ttk.Button(
             panel, text="Ouvrir visu 3D C3D", command=self._open_selected_trial_viewer
-        ).grid(row=6, column=0, columnspan=3, sticky="ew", padx=10, pady=6)
+        ).grid(row=10, column=0, columnspan=3, sticky="ew", padx=10, pady=6)
         self._analysis_action_row(tab, 1)
         self._build_graph_panel(tab, 2, "events")
 
@@ -2013,6 +2029,17 @@ class CapturyBioBuddyGui(tk.Tk):
             return None
         return captury_marker_transform_from_report(report)
 
+    def _selected_trial_temporal_lag_s(self) -> float:
+        report_path = self._selected_trial_report_path()
+        if report_path is None:
+            return 0.0
+        try:
+            report = json.loads(report_path.read_text(encoding="utf-8"))
+            synchronization = report.get("temporal_synchronization", {})
+            return float(synchronization.get("lag_s", 0.0))
+        except (OSError, TypeError, ValueError, json.JSONDecodeError):
+            return 0.0
+
     def _load_cached_joint_chain_data(self, path: Path) -> JointCentreChainData | None:
         key = self._c3d_cache_key(path)
         if key not in self.joint_chain_cache:
@@ -2079,6 +2106,9 @@ class CapturyBioBuddyGui(tk.Tk):
             self.viewer_frame_label_var.set("0 / 0")
             return
         self.embedded_viewer.set_marker_layers(layers)
+        self.embedded_viewer.set_marker_time_offsets(
+            {"captury": self._selected_trial_temporal_lag_s(), "motive": 0.0}
+        )
         self._update_visible_marker_layers()
         self._update_embedded_joint_chain()
         max_frame = max(0, self.embedded_viewer.n_frames - 1)
@@ -2468,25 +2498,142 @@ class CapturyBioBuddyGui(tk.Tk):
         root = self._graph_output_root()
         event_files = sorted(root.glob("*/trial_events_contacts.csv"))
         by_trial = {path.parent.name: path for path in event_files}
-        for trial in self._selected_graph_trials(by_trial):
+        synchronization_by_trial = {
+            path.parent.name: path
+            for path in root.glob("*/temporal_synchronization_timeseries.npz")
+        }
+        phase_by_trial = {
+            path.parent.name: path
+            for path in root.glob("*/temporal_phase_normalized.npz")
+        }
+        scientific_by_trial = {
+            path.parent.name: path
+            for path in root.glob("*/phase_normalized_scientific_timeseries.npz")
+        }
+        cycles_by_trial = {
+            path.parent.name: path for path in root.glob("*/contact_cycles.json")
+        }
+        all_trials = (
+            set(by_trial)
+            | set(synchronization_by_trial)
+            | set(phase_by_trial)
+            | set(scientific_by_trial)
+            | set(cycles_by_trial)
+        )
+        for trial in self._selected_graph_trials(all_trials):
             path = by_trial.get(trial)
-            if path is None:
-                continue
             trial_id = tree.insert("", tk.END, text=trial, open=True)
-            dataframe = self._read_csv_or_empty(path)
-            if dataframe.empty:
-                continue
-            for metric in graph_metric_columns(dataframe, EVENT_METRICS):
-                self._insert_graph_node(
-                    tree,
-                    graph_kind,
-                    trial_id,
-                    metric,
-                    {"trial": trial, "path": str(path)},
-                    metric=metric,
+            if path is not None:
+                dataframe = self._read_csv_or_empty(path)
+                for metric in graph_metric_columns(dataframe, EVENT_METRICS):
+                    self._insert_graph_node(
+                        tree,
+                        graph_kind,
+                        trial_id,
+                        metric,
+                        {"trial": trial, "path": str(path), "x": "time"},
+                        metric=metric,
+                    )
+            scientific = scientific_by_trial.get(trial)
+            if scientific is not None:
+                dataframe = read_table_npz(scientific)
+                group_id = tree.insert(
+                    trial_id, tk.END, text="Séries scientifiques 0-100 %", open=False
                 )
-        if not by_trial:
-            tree.insert("", tk.END, text="Aucun trial_events_contacts.csv")
+                families = (
+                    sorted(dataframe["family"].dropna().astype(str).unique())
+                    if "family" in dataframe.columns
+                    else [""]
+                )
+                excluded = {
+                    "phase_percent",
+                    "time_s",
+                    "family",
+                    "normalization_status",
+                }
+                for family in families:
+                    subset = (
+                        dataframe[dataframe["family"].astype(str) == family]
+                        if family
+                        else dataframe
+                    )
+                    family_id = tree.insert(
+                        group_id, tk.END, text=family or "données", open=False
+                    )
+                    metrics = [
+                        column
+                        for column in subset.columns
+                        if column not in excluded
+                        and not column.endswith(
+                            (
+                                "_finite_fraction",
+                                "_largest_gap_s",
+                                "_maximum_gap_s",
+                                "_normalization_status",
+                            )
+                        )
+                    ]
+                    for metric in graph_metric_columns(subset, metrics):
+                        self._insert_graph_node(
+                            tree,
+                            graph_kind,
+                            family_id,
+                            metric,
+                            {
+                                "trial": trial,
+                                "path": str(scientific),
+                                "x": "phase_percent",
+                                "family": family,
+                            },
+                            metric=metric,
+                        )
+            cycles = cycles_by_trial.get(trial)
+            if cycles is not None:
+                payload = json.loads(cycles.read_text(encoding="utf-8"))
+                cycle_rows = payload.get("cycles", [])
+                if cycle_rows:
+                    group_id = tree.insert(
+                        trial_id, tk.END, text="Cycles de contact", open=False
+                    )
+                    self._insert_graph_node(
+                        tree,
+                        graph_kind,
+                        group_id,
+                        "duration_s",
+                        {
+                            "trial": trial,
+                            "path": str(cycles),
+                            "x": "cycle_index",
+                        },
+                        metric="duration_s",
+                    )
+            for label, candidate, x_column in (
+                (
+                    "Synchronisation",
+                    synchronization_by_trial.get(trial),
+                    "time_s",
+                ),
+                ("Phase 0-100 %", phase_by_trial.get(trial), "phase_percent"),
+            ):
+                if candidate is None:
+                    continue
+                dataframe = read_table_npz(candidate)
+                group_id = tree.insert(trial_id, tk.END, text=label, open=True)
+                for metric in graph_metric_columns(dataframe, EVENT_METRICS):
+                    self._insert_graph_node(
+                        tree,
+                        graph_kind,
+                        group_id,
+                        metric,
+                        {
+                            "trial": trial,
+                            "path": str(candidate),
+                            "x": x_column,
+                        },
+                        metric=metric,
+                    )
+        if not all_trials:
+            tree.insert("", tk.END, text="Aucun résultat de découpage")
 
     def _insert_graph_node(
         self,
@@ -3103,6 +3250,8 @@ class CapturyBioBuddyGui(tk.Tk):
         panel = self.graph_panels.get("events")
         if not panel or event.inaxes is not panel.get("axes") or event.xdata is None:
             return
+        if not bool(panel.get("phase_drag_enabled", True)):
+            return
         if getattr(event, "button", 1) != 1:
             return
         self.graph_drag_selection = {
@@ -3146,26 +3295,42 @@ class CapturyBioBuddyGui(tk.Tk):
         axes = panel["axes"]
         canvas = panel["canvas"]
         path = Path(str(payload["filters"]["path"]))
+        x_column = str(payload["filters"].get("x", "time"))
+        panel["phase_drag_enabled"] = x_column != "phase_percent"
         metric = str(payload["metric"])
-        dataframe = self._read_csv_or_empty(path)
+        dataframe = (
+            read_table_npz(path)
+            if path.suffix.lower() == ".npz"
+            else (
+                pd.DataFrame(
+                    json.loads(path.read_text(encoding="utf-8")).get("cycles", [])
+                )
+                if path.suffix.lower() == ".json"
+                else self._read_csv_or_empty(path)
+            )
+        )
+        family = str(payload["filters"].get("family", ""))
+        if family and "family" in dataframe.columns:
+            dataframe = dataframe[dataframe["family"].astype(str) == family]
         axes.clear()
         if dataframe.empty:
             axes.set_title("Aucune donnée")
             canvas.draw_idle()
             return
-        if "time" not in dataframe.columns or metric not in dataframe.columns:
+        if x_column not in dataframe.columns or metric not in dataframe.columns:
             axes.set_title("Aucune donnée")
             canvas.draw_idle()
             return
         values = dataframe[metric]
         if values.dtype == bool:
             values = values.astype(int)
-        axes.plot(dataframe["time"], values)
+        axes.plot(dataframe[x_column], values)
         axes.set_title(f"{path.parent.name} - {metric}")
-        axes.set_xlabel("Temps (s)")
+        axes.set_xlabel("Phase (%)" if x_column == "phase_percent" else "Temps (s)")
         axes.set_ylabel(metric)
         axes.grid(alpha=0.3)
-        self._draw_manual_phase_span(axes)
+        if x_column != "phase_percent":
+            self._draw_manual_phase_span(axes)
         panel["figure"].tight_layout()
         canvas.draw_idle()
 
@@ -3402,6 +3567,13 @@ class CapturyBioBuddyGui(tk.Tk):
             "p6_reexpress_rotations_zxy",
             "p6_disable_static_model_alignment",
             "p6_disable_motive_marker_alignment",
+            "p6_temporal_sync_mode",
+            "p6_manual_lag_s",
+            "p6_max_lag_s",
+            "p6_phase_normalization_points",
+            "p6_cut_mode",
+            "p6_time_start",
+            "p6_time_end",
         ):
             self.vars[name].trace_add(
                 "write", lambda *_: self._on_p6_auto_analysis_option_changed()
@@ -3753,6 +3925,37 @@ class CapturyBioBuddyGui(tk.Tk):
                 "Dossier introuvable", f"Dossier cinématique: {data_root}"
             )
             return False
+        sync_mode = str(self.vars["p6_temporal_sync_mode"].get()).strip()
+        manual_lag = str(self.vars["p6_manual_lag_s"].get()).strip()
+        if sync_mode == "manual":
+            try:
+                lag_value = float(manual_lag)
+            except ValueError:
+                messagebox.showerror(
+                    "Lag temporel invalide",
+                    "Le mode manual requiert un lag Captury numérique en secondes.",
+                )
+                return False
+            if not np.isfinite(lag_value):
+                messagebox.showerror("Lag temporel invalide", manual_lag)
+                return False
+        try:
+            max_lag = float(str(self.vars["p6_max_lag_s"].get()).strip())
+            phase_points = int(
+                str(self.vars["p6_phase_normalization_points"].get()).strip()
+            )
+        except ValueError:
+            messagebox.showerror(
+                "Synchronisation invalide",
+                "Le lag maximal doit être numérique et les points de phase entiers.",
+            )
+            return False
+        if not np.isfinite(max_lag) or max_lag <= 0 or phase_points < 2:
+            messagebox.showerror(
+                "Synchronisation invalide",
+                "Le lag maximal doit être positif et la phase contenir au moins 2 points.",
+            )
+            return False
         return True
 
     def _run_selected_trial_auto_analysis(self) -> None:
@@ -3974,6 +4177,7 @@ class CapturyBioBuddyGui(tk.Tk):
             return
         values = self._var_values()
         values["p6_run_ik_batch"] = True
+        values["p6_trials"] = ""
         values["biobuddy_c3d_output"] = str(biomod_path)
         args = build_p6_args(values)
         self.vars["command_mode"].set(COMMAND_MODES["kinematic"])
@@ -4022,7 +4226,7 @@ class CapturyBioBuddyGui(tk.Tk):
     def _running_status_message(self, command_mode: str | None) -> str:
         messages = {
             "biobuddy_c3d_model": "Création du modèle BioBuddy en cours...",
-            "biobuddy_c3d_ik": "Reconstruction QLD statique en cours...",
+            "biobuddy_c3d_ik": "IK non linéaire TRF statique en cours...",
             "kinematic": "Analyse comparative en cours...",
             "comparison": "Comparaison en cours...",
             "pipeline": "Pipeline en cours...",
@@ -4054,10 +4258,19 @@ class CapturyBioBuddyGui(tk.Tk):
                         self._run_static_p6_analysis_after_biobuddy_ik()
                     self._run_pending_auto_analysis_if_needed()
                 else:
-                    self._append_log(str(item))
+                    output_text = str(item)
+                    self._update_status_from_process_output(output_text)
+                    self._append_log(output_text)
         except queue.Empty:
             pass
         self.after(100, self._drain_output_queue)
+
+    def _update_status_from_process_output(self, line: str) -> None:
+        """Promote concise BioBuddy IK progress from stdout to the status line."""
+
+        if not line.startswith("[BioBuddy IK] frame "):
+            return
+        self.status_var.set(line.removeprefix("[BioBuddy IK] ").strip())
 
     def _append_log(self, text: str) -> None:
         self.log_buffer += text
@@ -4146,7 +4359,7 @@ class CapturyBioBuddyGui(tk.Tk):
             (
                 f"Le modèle a été écrit ici:\n{output_path}\n\n"
                 f"Taille: {size} octets.\n\n"
-                "La reconstruction QLD de l'essai statique Motive va être lancée "
+                "L'IK non linéaire TRF de l'essai statique Motive va être lancée "
                 "automatiquement pour rendre ce modèle disponible dans les comparaisons."
             ),
         )
@@ -4173,7 +4386,7 @@ class CapturyBioBuddyGui(tk.Tk):
             self._biobuddy_c3d_ik_args(c3d_path),
             command_mode="biobuddy_c3d_ik",
             log_intro=(
-                "Étape suivante: reconstruction QLD de l'essai statique "
+                "Étape suivante: IK non linéaire TRF de l'essai statique "
                 f"avec {c3d_path.name}."
             ),
             clear_log=False,

@@ -9,7 +9,6 @@ import hashlib
 import json
 import os
 import re
-import subprocess
 import sys
 from dataclasses import dataclass, replace
 from pathlib import Path
@@ -86,12 +85,22 @@ from joint_kinematics import (
     write_joint_kinematics_audit,
 )
 from captury_c3d_angles import analyze_captury_angle_channels
+from temporal_synchronization import (
+    LAG_CONVENTION,
+    apply_time_offset,
+    composite_joint_centre_speed,
+    interpolate_finite_signal,
+    interpolate_finite_array,
+    normalize_selected_phase,
+    normalize_timeseries_groups,
+    resolve_temporal_synchronization,
+)
 
 DEFAULT_DATA_ROOT = Path("local_trials/2026-06-30_P6_flat")
 DEFAULT_OUTPUT_ROOT = Path("out_p6_motive_captury_comparison")
 ANGLE_LABEL_REGEX = r"(?i)(^.*angles?$|^.*_angle[s]?$|angle)"
 FOOT_MARKER_PATTERN = r"(LFCC|RFCC|LFM|RFM|LDP|RDP|Foot|Toe|Heel)"
-CACHE_VERSION = 8
+CACHE_VERSION = 10
 ROTATION_SEQUENCE_ZXY = "ZXY"
 DEFAULT_ALIGNMENT_CALIBRATION_CENTRES = (
     "Hips",
@@ -113,6 +122,10 @@ SCIENTIFIC_IMPLEMENTATION_FILES = {
     "mocap_alignment_code": Path(__file__).with_name("mocap_alignment.py"),
     "captury_c3d_angle_decoder": Path(__file__).with_name("captury_c3d_angles.py"),
     "captury_c3d_angle_registry": Path(__file__).with_name("captury_c3d_angles.json"),
+    "biobuddy_ik_code": Path(__file__).with_name("run_biobuddy_c3d_ik.py"),
+    "temporal_synchronization_code": Path(__file__).with_name(
+        "temporal_synchronization.py"
+    ),
 }
 
 
@@ -263,6 +276,12 @@ def trial_cache_fingerprint(
             "cut_mode": args.cut_mode,
             "time_start": args.time_start,
             "time_end": args.time_end,
+            "temporal_sync_mode": getattr(args, "temporal_sync_mode", "auto"),
+            "manual_lag_s": getattr(args, "manual_lag_s", None),
+            "max_lag_s": float(getattr(args, "max_lag_s", 0.5)),
+            "phase_normalization_points": int(
+                getattr(args, "phase_normalization_points", 101)
+            ),
             "no_figures": bool(args.no_figures),
         },
         "static_alignment": _static_alignment_cache_payload(static_alignment_transform),
@@ -301,6 +320,11 @@ def required_trial_outputs(
         trial_dir / "skin_marker_correspondence_metrics.csv",
         trial_dir / "skin_marker_correspondence_timeseries.npz",
         trial_dir / "trial_events_contacts.csv",
+        trial_dir / "temporal_synchronization.json",
+        trial_dir / "temporal_synchronization_timeseries.npz",
+        trial_dir / "temporal_phase_normalized.npz",
+        trial_dir / "phase_normalized_scientific_timeseries.npz",
+        trial_dir / "contact_cycles.json",
         trial_dir / "run_report.json",
     ]
     if include_rotation_audit:
@@ -318,6 +342,17 @@ def required_output_may_be_empty(path: Path) -> bool:
     """Return whether an empty file is a valid, complete scientific output."""
 
     return path.name == "skin_marker_correspondence_metrics.csv"
+
+
+def biobuddy_ik_outputs_complete(report: Mapping[str, Any]) -> bool:
+    """Return whether a cached report references both complete IK artifacts."""
+
+    outputs = report.get("biobuddy_ik_batch", {}).get("outputs", {})
+    required = (outputs.get("npz"), outputs.get("summary"))
+    return all(
+        value and Path(value).is_file() and Path(value).stat().st_size > 0
+        for value in required
+    )
 
 
 def cached_trial_report(
@@ -355,7 +390,7 @@ def cached_trial_report(
             output_path
         ):
             return None
-    if args.run_ik_batch and "motive_ik_batch" not in report:
+    if args.run_ik_batch and not biobuddy_ik_outputs_complete(report):
         return None
     return report
 
@@ -555,15 +590,12 @@ def comparison_input_files(
                     bundle, system, args.model_source
                 )
                 inputs[f"{prefix}/{system}/{source_kind}"] = source_path
-            motive_kind, _ = select_model_file(bundle, "motive", args.model_source)
-            if (
-                getattr(args, "run_ik_batch", False)
-                and motive_kind == "fbx"
-                and bundle.motive_bvh is not None
-            ):
-                inputs[f"{prefix}/motive/ik_bvh"] = bundle.motive_bvh
     if getattr(args, "biobuddy_biomod", None) is not None:
         inputs["biobuddy/biomod"] = args.biobuddy_biomod
+    if getattr(args, "run_ik_batch", False):
+        inputs["implementation/biobuddy_ik_code"] = SCIENTIFIC_IMPLEMENTATION_FILES[
+            "biobuddy_ik_code"
+        ]
     if getattr(args, "landmark_map", None) is not None:
         inputs["markers/landmark_map"] = args.landmark_map
     return inputs
@@ -655,6 +687,21 @@ def comparison_derived_artifacts(
             output_path = report.get("outputs", {}).get(output_name)
             if output_path:
                 artifacts[f"{trial}/kinematics/{output_name}"] = Path(output_path)
+        for output_name in (
+            "temporal_synchronization",
+            "temporal_synchronization_timeseries",
+            "temporal_phase_normalized",
+            "phase_normalized_scientific_timeseries",
+            "contact_cycles",
+        ):
+            output_path = report.get("outputs", {}).get(output_name)
+            if output_path:
+                artifacts[f"{trial}/time/{output_name}"] = Path(output_path)
+        biobuddy_ik_outputs = report.get("biobuddy_ik_batch", {}).get("outputs", {})
+        for output_name in ("npz", "summary"):
+            output_path = biobuddy_ik_outputs.get(output_name)
+            if output_path:
+                artifacts[f"{trial}/biobuddy/ik_{output_name}"] = Path(output_path)
     return artifacts
 
 
@@ -1218,7 +1265,9 @@ def segment_relative_q_metric_rows(
     motive_curves = segment_relative_rotation_curves(motive_rotations)
     component_names = ("x", "y", "z")
     for joint in sorted(set(captury_curves).intersection(motive_curves)):
-        cap_curve = interpolate_array(captury_curves[joint], captury_time, motive_time)
+        cap_curve = interpolate_finite_array(
+            captury_curves[joint], captury_time, motive_time
+        )
         mot_curve = motive_curves[joint]
         n_frames = min(cap_curve.shape[1], mot_curve.shape[1], motive_time.shape[0])
         if n_frames <= 0:
@@ -1432,14 +1481,8 @@ def segment_rotation_metric_rows(
     if reference_source not in rotations_by_source or not rotations_by_source.get(
         reference_source
     ):
-        fallback = "motive" if reference_source == "biobuddy" else ""
-        if fallback and rotations_by_source.get(fallback):
-            report["status"] = "fallback_missing_reference"
-            report["effective_reference"] = fallback
-            reference_source = fallback
-        else:
-            report["status"] = "missing_reference"
-            return [], [], report
+        report["status"] = "missing_reference"
+        return [], [], report
     else:
         report["effective_reference"] = reference_source
     reference_rotations = rotations_by_source[reference_source]
@@ -1450,7 +1493,13 @@ def segment_rotation_metric_rows(
         if source == reference_source or not source_rotations:
             continue
         source_time = times_by_source[source]
-        source_indices = nearest_time_indices(source_time, reference_time)
+        overlap_mask = (reference_time >= source_time[0]) & (
+            reference_time <= source_time[-1]
+        )
+        reference_indices = np.flatnonzero(overlap_mask)
+        source_indices = nearest_time_indices(
+            source_time, reference_time[reference_indices]
+        )
         common_segments = sorted(
             set(reference_rotations).intersection(source_rotations)
         )
@@ -1464,9 +1513,11 @@ def segment_rotation_metric_rows(
                 context=f"segment metric {source}/{segment}",
             )
             values: list[dict[str, Any]] = []
-            for frame, source_frame in enumerate(source_indices):
+            for reference_frame, source_frame in zip(
+                reference_indices, source_indices, strict=True
+            ):
                 vector_rad = rotation_deviation_vector(
-                    reference_series[:, :, frame],
+                    reference_series[:, :, reference_frame],
                     source_series[:, :, source_frame],
                 )
                 vector_deg = np.degrees(vector_rad)
@@ -1476,7 +1527,7 @@ def segment_rotation_metric_rows(
                     "reference": reference_source,
                     "source": source,
                     "segment": segment,
-                    "time": float(reference_time[frame]),
+                    "time": float(reference_time[reference_frame]),
                     "global_deg": global_deg,
                     "x_deg": float(vector_deg[0]),
                     "y_deg": float(vector_deg[1]),
@@ -1530,7 +1581,7 @@ def root_alignment_score_mm(
     if not centres_c3d_mm or c3d_markers_mm.size == 0:
         return float("inf")
     stacked = np.stack(list(centres_c3d_mm.values()), axis=1)
-    centres_on_c3d = interpolate_array(stacked, source_time, c3d_time)
+    centres_on_c3d = interpolate_finite_array(stacked, source_time, c3d_time)
     n_frames = centres_on_c3d.shape[2]
     frame_indices = np.linspace(0, n_frames - 1, min(max_frames, n_frames), dtype=int)
     frame_scores: list[float] = []
@@ -1807,7 +1858,7 @@ def interpolate_centres_to_time(
     centres_mm: dict[str, np.ndarray], source_time: np.ndarray, target_time: np.ndarray
 ) -> dict[str, np.ndarray]:
     return {
-        name: interpolate_array(values, source_time, target_time)
+        name: interpolate_finite_array(values, source_time, target_time)
         for name, values in centres_mm.items()
     }
 
@@ -2073,7 +2124,7 @@ def q_metric_rows(
     cap_q = {name: captury.q[i] for i, name in enumerate(captury.q_names)}
     mot_q = {name: motive.q[i] for i, name in enumerate(motive.q_names)}
     for q_name in sorted(set(cap_q).intersection(mot_q)):
-        cap_curve = interpolate_array(
+        cap_curve = interpolate_finite_array(
             cap_q[q_name][None, :], captury.time, motive.time
         )[0]
         mot_curve = mot_q[q_name]
@@ -2109,7 +2160,7 @@ def q_metric_rows_with_optional_biobuddy(
     bio_q = {name: biobuddy.q[i] for i, name in enumerate(biobuddy.q_names)}
     mot_q = {name: motive.q[i] for i, name in enumerate(motive.q_names)}
     for q_name in sorted(set(bio_q).intersection(mot_q)):
-        bio_curve = interpolate_array(
+        bio_curve = interpolate_finite_array(
             bio_q[q_name][None, :], biobuddy.time, motive.time
         )[0]
         mot_curve = mot_q[q_name]
@@ -2161,6 +2212,7 @@ def captury_c3d_angle_rows(
     c3d_angle_unit: str,
     cut_start_s: float | None,
     cut_end_s: float | None,
+    temporal_lag_s: float = 0.0,
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]], dict[str, Any]]:
     split = split_c3d_points(
         captury_c3d,
@@ -2172,8 +2224,9 @@ def captury_c3d_angle_rows(
     )
     if not split.angle_labels or split.angle_data.size == 0:
         return [], [], decode_report
-    mask = time_window_mask(split.time, cut_start_s, cut_end_s)
-    time = split.time[mask]
+    corrected_time = apply_time_offset(split.time, temporal_lag_s)
+    mask = time_window_mask(corrected_time, cut_start_s, cut_end_s)
+    time = corrected_time[mask]
     angle_deg = split.angle_data[:, :, mask] * float(
         decode_report["value_scale_to_deg"]
     )
@@ -2336,7 +2389,7 @@ def paired_model_marker_rows(
     reference_rows: list[np.ndarray] = []
     used_joints: list[str] = []
     for joint in sorted(set(model_centres_mm).intersection(marker_proxy_centres_mm)):
-        model_signal = interpolate_array(
+        model_signal = interpolate_finite_array(
             model_centres_mm[joint], model_time, marker_time
         ).T
         marker_signal = marker_proxy_centres_mm[joint].T
@@ -2361,7 +2414,7 @@ def stacked_finite_rows_from_centres(
 ) -> np.ndarray:
     rows: list[np.ndarray] = []
     for values in centres_mm.values():
-        interpolated = interpolate_array(values, time, reference_time).T
+        interpolated = interpolate_finite_array(values, time, reference_time).T
         interpolated = interpolated[np.all(np.isfinite(interpolated), axis=1)]
         if interpolated.size:
             rows.append(interpolated)
@@ -2464,6 +2517,27 @@ def analyze_motive_occlusions(
     return rows, fig_path
 
 
+def foot_contact_from_markers(
+    points_mm: np.ndarray, indices: list[int], dt: float
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, bool]:
+    """Detect kinematic contact, or report unavailable when no foot exists."""
+
+    foot = average_marker_group(points_mm, indices)
+    n_frames = points_mm.shape[2]
+    if foot is None:
+        nan = np.full(n_frames, np.nan)
+        return np.zeros(n_frames, dtype=bool), nan, nan, False
+    z = foot[2]
+    foot_speed = np.linalg.norm(np.gradient(foot, dt, axis=1), axis=0)
+    finite = np.isfinite(z) & np.isfinite(foot_speed)
+    if np.count_nonzero(finite) < 3:
+        return np.zeros(n_frames, dtype=bool), z, foot_speed, False
+    z_limit = float(np.nanpercentile(z, 35))
+    speed_limit = float(np.nanpercentile(foot_speed, 35))
+    contact = finite & (z <= z_limit) & (foot_speed <= speed_limit)
+    return contact, z, foot_speed, True
+
+
 def detect_trial_events_and_contacts(
     motive_c3d: Path,
     trial_dir: Path,
@@ -2505,19 +2579,12 @@ def detect_trial_events_and_contacts(
         and clean_marker_label(label).startswith("R")
     ]
 
-    def foot_contact(indices: list[int]) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-        foot = average_marker_group(points_mm, indices)
-        if foot is None:
-            nan = np.full(time.shape[0], np.nan)
-            return nan.astype(bool), nan, nan
-        z = foot[2]
-        foot_speed = np.linalg.norm(np.gradient(foot, dt, axis=1), axis=0)
-        z_limit = float(np.nanpercentile(z, 35))
-        speed_limit = float(np.nanpercentile(foot_speed, 35))
-        return (z <= z_limit) & (foot_speed <= speed_limit), z, foot_speed
-
-    left_contact, left_z, left_speed = foot_contact(left_indices)
-    right_contact, right_z, right_speed = foot_contact(right_indices)
+    left_contact, left_z, left_speed, left_available = foot_contact_from_markers(
+        points_mm, left_indices, dt
+    )
+    right_contact, right_z, right_speed, right_available = foot_contact_from_markers(
+        points_mm, right_indices, dt
+    )
     rows: list[dict[str, Any]] = []
     contact_mask = time_window_mask(time, time_start_s, time_end_s)
     for i, time_value in enumerate(time):
@@ -2542,6 +2609,8 @@ def detect_trial_events_and_contacts(
                 ),
                 "left_contact": bool(left_contact[i]),
                 "right_contact": bool(right_contact[i]),
+                "left_contact_available": left_available,
+                "right_contact_available": right_available,
             }
         )
     write_rows(trial_dir / "trial_events_contacts.csv", rows)
@@ -2562,11 +2631,56 @@ def detect_trial_events_and_contacts(
         ),
         "left_foot_markers": [labels[i] for i in left_indices],
         "right_foot_markers": [labels[i] for i in right_indices],
+        "left_contact_available": left_available,
+        "right_contact_available": right_available,
     }
     (trial_dir / "trial_events.json").write_text(
         json.dumps(report, indent=2), encoding="utf-8"
     )
     return report, rows
+
+
+def contact_cycle_report(rows: list[dict[str, Any]]) -> dict[str, Any]:
+    """Return diagnostic foot-contact cycles from Motive kinematic contacts."""
+
+    cycles: list[dict[str, Any]] = []
+    if not rows:
+        return {"status": "unavailable", "cycles": cycles}
+    times = np.asarray([float(row["time"]) for row in rows], dtype=float)
+    available_sides: list[str] = []
+    minimum_cycle_duration_s = 0.2
+    for side in ("left", "right"):
+        if not any(bool(row.get(f"{side}_contact_available", True)) for row in rows):
+            continue
+        available_sides.append(side)
+        contacts = np.asarray([bool(row[f"{side}_contact"]) for row in rows])
+        starts = np.flatnonzero(contacts & np.r_[True, ~contacts[:-1]])
+        for cycle_index, (first, second) in enumerate(zip(starts[:-1], starts[1:])):
+            duration_s = float(times[second] - times[first])
+            if duration_s < minimum_cycle_duration_s:
+                continue
+            cycles.append(
+                {
+                    "side": side,
+                    "cycle_index": cycle_index,
+                    "start_s": float(times[first]),
+                    "end_s": float(times[second]),
+                    "duration_s": duration_s,
+                    "definition": "successive_kinematic_contact_onsets",
+                }
+            )
+    return {
+        "status": (
+            "unavailable"
+            if not available_sides
+            else "diagnostic_only" if cycles else "no_complete_cycle"
+        ),
+        "method": "foot_marker_height_and_speed_contact_onsets",
+        "force_plate_validated": False,
+        "available_sides": available_sides,
+        "minimum_cycle_duration_s": minimum_cycle_duration_s,
+        "cycles": cycles,
+    }
 
 
 SEGMENT_LENGTH_PAIR_CANDIDATES = [
@@ -2783,8 +2897,10 @@ def run_biobuddy_ik_for_trial(
     unit_scale_to_m: float,
     max_frames: int,
     angle_label_regex: str,
+    cache_dir: Path,
+    force: bool = False,
 ) -> tuple[ModelRun | None, dict[str, Any]]:
-    """Run direct BioBuddy QLD IK for a trial when a BioBuddy model is available."""
+    """Run or reuse BioBuddy nonlinear TRF IK for one trial."""
 
     if biomod_path is None:
         return None, {"status": "missing", "reason": "no_biobuddy_biomod_argument"}
@@ -2805,6 +2921,8 @@ def run_biobuddy_ik_for_trial(
             biomod_unit_scale_to_m=unit_scale_to_m,
             angle_label_regex=angle_label_regex,
             max_frames=max_frames,
+            cache_dir=cache_dir,
+            force=force,
         )
         ik_npz = Path(report["outputs"]["npz"])
         run = model_run_from_biobuddy_ik_npz(
@@ -2843,6 +2961,7 @@ def propose_marker_correspondences_from_points(
     rotation: np.ndarray,
     translation: np.ndarray,
     *,
+    captury_lag_s: float = 0.0,
     max_median_error_mm: float = 250.0,
     max_pairs: int = 80,
 ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
@@ -2850,6 +2969,7 @@ def propose_marker_correspondences_from_points(
 
     motive_unique = unique_marker_labels(motive_labels)
     captury_unique = unique_marker_labels(captury_labels)
+    captury_time = apply_time_offset(captury_time, captury_lag_s)
     motive_indices = proposal_candidate_indices(motive_labels)
     captury_indices = proposal_candidate_indices(captury_labels)
     candidates: list[dict[str, Any]] = []
@@ -2861,7 +2981,7 @@ def propose_marker_correspondences_from_points(
         for captury_index in captury_indices:
             captury_signal = captury_points[:, captury_index, :]
             captury_on_motive = (
-                interpolate_array(captury_signal, captury_time, motive_time).T
+                interpolate_finite_array(captury_signal, captury_time, motive_time).T
                 @ rotation
                 + translation
             )
@@ -2918,6 +3038,7 @@ def propose_marker_correspondences(
     rotation: np.ndarray,
     translation: np.ndarray,
     angle_label_regex: str,
+    captury_lag_s: float = 0.0,
 ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
     motive_labels, motive_points, _motive_residuals, motive_time = read_c3d_points_mm(
         motive_c3d, angle_label_regex
@@ -2934,6 +3055,7 @@ def propose_marker_correspondences(
         captury_time,
         rotation,
         translation,
+        captury_lag_s=captury_lag_s,
     )
 
 
@@ -2944,6 +3066,7 @@ def marker_correspondence_rows(
     rotation: np.ndarray,
     translation: np.ndarray,
     landmark_map: list[dict[str, Any]],
+    captury_lag_s: float = 0.0,
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
     motive_labels, motive_points, _motive_residuals, motive_time = read_c3d_points_mm(
         motive_c3d
@@ -2951,6 +3074,7 @@ def marker_correspondence_rows(
     captury_labels, captury_points, _captury_residuals, captury_time = (
         read_c3d_points_mm(captury_c3d)
     )
+    captury_time = apply_time_offset(captury_time, captury_lag_s)
     motive_lookup = marker_indices_by_clean_label(motive_labels)
     captury_lookup = marker_indices_by_clean_label(captury_labels)
     rows: list[dict[str, Any]] = []
@@ -2970,7 +3094,8 @@ def marker_correspondence_rows(
         if motive_signal is None or captury_signal is None:
             continue
         captury_on_motive = (
-            interpolate_array(captury_signal, captury_time, motive_time).T @ rotation
+            interpolate_finite_array(captury_signal, captury_time, motive_time).T
+            @ rotation
             + translation
         )
         motive_rows = motive_signal.T
@@ -3018,6 +3143,115 @@ def marker_correspondence_rows(
     return rows, timeseries_rows
 
 
+def temporal_synchronization_artifacts(
+    motive_centres_mm: Mapping[str, np.ndarray],
+    motive_time: np.ndarray,
+    captury_centres_mm: Mapping[str, np.ndarray],
+    captury_original_time: np.ndarray,
+    synchronization: dict[str, Any],
+    *,
+    start_s: float | None,
+    end_s: float | None,
+    phase_points: int,
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]], dict[str, Any]]:
+    """Build compact synchronization and normalized-phase traces.
+
+    The traces use the same translation-invariant composite joint-centre speed
+    as the lag estimator. They are diagnostic signals, not anatomical angles.
+    """
+
+    reported_centres = synchronization.get("used_centres", [])
+    common = sorted(
+        set(reported_centres) or set(motive_centres_mm).intersection(captury_centres_mm)
+    )
+    motive_signal, motive_used = composite_joint_centre_speed(
+        {name: motive_centres_mm[name] for name in common}, motive_time
+    )
+    captury_signal, captury_used = composite_joint_centre_speed(
+        {name: captury_centres_mm[name] for name in common}, captury_original_time
+    )
+    used = sorted(set(motive_used).intersection(captury_used))
+    if used and (set(motive_used) != set(used) or set(captury_used) != set(used)):
+        motive_signal, _ = composite_joint_centre_speed(
+            {name: motive_centres_mm[name] for name in used}, motive_time
+        )
+        captury_signal, _ = composite_joint_centre_speed(
+            {name: captury_centres_mm[name] for name in used},
+            captury_original_time,
+        )
+    lag_s = float(synchronization.get("lag_s", 0.0))
+    captury_corrected_time = apply_time_offset(captury_original_time, lag_s)
+    captury_on_motive = interpolate_finite_signal(
+        captury_signal, captury_corrected_time, motive_time
+    )
+    valid = np.isfinite(motive_signal) & np.isfinite(captury_on_motive)
+    selected = valid.copy()
+    if start_s is not None:
+        selected &= motive_time >= float(start_s)
+    if end_s is not None:
+        selected &= motive_time <= float(end_s)
+    timeseries_rows = [
+        {
+            "time_s": float(time_value),
+            "motive_composite_speed": float(motive_signal[index]),
+            "captury_composite_speed": float(captury_on_motive[index]),
+            "difference": float(captury_on_motive[index] - motive_signal[index]),
+            "in_selected_window": bool(selected[index]),
+        }
+        for index, time_value in enumerate(motive_time)
+    ]
+    phase_rows, phase_report = normalize_selected_phase(
+        motive_time,
+        motive_signal,
+        captury_original_time,
+        captury_signal,
+        lag_s=lag_s,
+        start_s=start_s,
+        end_s=end_s,
+        n_points=phase_points,
+    )
+    if (
+        np.count_nonzero(selected) >= 3
+        and np.std(motive_signal[selected]) > 1e-9
+        and np.std(captury_on_motive[selected]) > 1e-9
+    ):
+        reference = motive_signal[selected]
+        moving = captury_on_motive[selected]
+        reference_z = (reference - np.mean(reference)) / np.std(reference)
+        moving_z = (moving - np.mean(moving)) / np.std(moving)
+        residual_rmse = float(np.sqrt(np.mean((moving_z - reference_z) ** 2)))
+        correlation = float(np.corrcoef(reference, moving)[0, 1])
+    else:
+        residual_rmse = None
+        correlation = None
+    evaluation = {
+        "signal": "dimensionless_composite_joint_centre_speed",
+        "used_centres": used,
+        "selected_samples": int(np.count_nonzero(selected)),
+        "selected_start_s": (
+            float(motive_time[selected][0]) if np.any(selected) else None
+        ),
+        "selected_end_s": (
+            float(motive_time[selected][-1]) if np.any(selected) else None
+        ),
+        "correlation": correlation,
+        "normalized_residual_rmse": residual_rmse,
+        "phase_normalization": phase_report,
+    }
+    return timeseries_rows, phase_rows, evaluation
+
+
+def finite_range(values: np.ndarray, axis: int) -> np.ndarray:
+    """Return max-min along ``axis`` while preserving all-missing slices as NaN."""
+
+    array = np.asarray(values, dtype=float)
+    finite = np.isfinite(array)
+    maximum = np.max(np.where(finite, array, -np.inf), axis=axis)
+    minimum = np.min(np.where(finite, array, np.inf), axis=axis)
+    result = maximum - minimum
+    return np.where(np.any(finite, axis=axis), result, np.nan)
+
+
 def vertical_amplitude_report(enriched_c3d: Path) -> dict[str, Any]:
     ezc3d = require_ezc3d()
     c3d = ezc3d.c3d(str(enriched_c3d))
@@ -3031,20 +3265,19 @@ def vertical_amplitude_report(enriched_c3d: Path) -> dict[str, Any]:
         if not (label.startswith("CAPJC_") or label.startswith("MOTJC_")):
             continue
         values = points_mm[:, index, :]
+        ranges = finite_range(values, axis=1)
         rows.append(
             {
                 "label": label,
-                "x_range_mm": float(np.nanmax(values[0]) - np.nanmin(values[0])),
-                "y_range_mm": float(np.nanmax(values[1]) - np.nanmin(values[1])),
-                "z_range_mm": float(np.nanmax(values[2]) - np.nanmin(values[2])),
+                "x_range_mm": float(ranges[0]),
+                "y_range_mm": float(ranges[1]),
+                "z_range_mm": float(ranges[2]),
             }
         )
     joint_indices = [labels.index(row["label"]) for row in rows]
     if joint_indices:
         joint_points = points_mm[:, joint_indices, :]
-        spatial_ranges = np.nanmax(joint_points, axis=1) - np.nanmin(
-            joint_points, axis=1
-        )
+        spatial_ranges = finite_range(joint_points, axis=1)
         median_spatial_range = np.nanmedian(spatial_ranges, axis=1)
         max_spatial_range = np.nanmax(spatial_ranges, axis=1)
     else:
@@ -3223,44 +3456,6 @@ def visualize_enriched_c3d(
         import time as time_module
 
         time_module.sleep(wait_seconds)
-
-
-def run_ik_batch(
-    bundle: TrialBundle, out_dir: Path, model_source: str, max_frames: int
-) -> dict[str, Any]:
-    source_kind, motive_model_path = select_model_file(bundle, "motive", model_source)
-    command = [
-        sys.executable,
-        str(Path(__file__).with_name("bvh_c3d_biobuddy_pyorerun_compare.py")),
-        "--bvh",
-        str(motive_model_path if source_kind == "bvh" else bundle.motive_bvh),
-        "--c3d",
-        str(bundle.motive_c3d),
-        "--out-dir",
-        str(out_dir / "motive_ik_pipeline"),
-        "--bvh-unit-scale-to-m",
-        "0.01",
-        "--inverse-kinematics",
-        "--inverse-kinematics-max-frames",
-        str(max_frames),
-    ]
-    if bundle.motive_fbx is not None:
-        command.extend(
-            ["--fbx", str(bundle.motive_fbx), "--fbx-unit-scale-to-m", "0.01"]
-        )
-    result = subprocess.run(
-        command,
-        cwd=Path(__file__).resolve().parent,
-        text=True,
-        capture_output=True,
-        check=False,
-    )
-    return {
-        "command": command,
-        "returncode": result.returncode,
-        "stdout_tail": result.stdout[-4000:],
-        "stderr_tail": result.stderr[-4000:],
-    }
 
 
 def compare_trial(
@@ -3463,6 +3658,34 @@ def compare_trial(
             "captury_and_motive_q_reexpressed_from_corrected_segment_matrices_as_ZXY"
         )
     alignment_report["motive_model_to_c3d_markers"] = model_marker_report
+    captury_original_time = captury.time.copy()
+    temporal_sync_mode = getattr(args, "temporal_sync_mode", "auto")
+    if temporal_sync_mode == "auto" and bundle.name == args.static_trial:
+        temporal_synchronization = {
+            "status": "static_reference_no_lag",
+            "method": "auto_skipped_for_static_reference",
+            "applied": False,
+            "lag_s": 0.0,
+            "lag_convention": LAG_CONVENTION,
+            "reference_clock": "motive",
+            "moving_clock": "captury",
+            "reason": "constant_lag_requires_a_dynamic_trial",
+        }
+    else:
+        temporal_synchronization = resolve_temporal_synchronization(
+            temporal_sync_mode,
+            mot_c3d_mm,
+            motive.time,
+            cap_aligned_mm,
+            captury_original_time,
+            manual_lag_s=getattr(args, "manual_lag_s", None),
+            max_lag_s=float(getattr(args, "max_lag_s", 0.5)),
+        )
+    temporal_lag_s = float(temporal_synchronization.get("lag_s", 0.0))
+    captury = replace(
+        captury,
+        time=apply_time_offset(captury_original_time, temporal_lag_s),
+    )
     enriched_c3d = append_centres_to_motive_c3d(
         bundle.motive_c3d,
         trial_dir / f"{safe_name(bundle.name)}_motive_with_capjc_motjc.c3d",
@@ -3478,6 +3701,23 @@ def compare_trial(
     cut_start_s, cut_end_s, effective_cut_mode = resolve_cut_window(
         args.cut_mode, args.time_start, args.time_end, detected_event_report
     )
+    temporal_rows, phase_rows, temporal_evaluation = temporal_synchronization_artifacts(
+        mot_c3d_mm,
+        motive.time,
+        cap_aligned_mm,
+        captury_original_time,
+        temporal_synchronization,
+        start_s=cut_start_s,
+        end_s=cut_end_s,
+        phase_points=int(getattr(args, "phase_normalization_points", 101)),
+    )
+    temporal_synchronization["comparison_window"] = {
+        "cut_mode": args.cut_mode,
+        "effective_cut_mode": effective_cut_mode,
+        "start_s": cut_start_s,
+        "end_s": cut_end_s,
+    }
+    temporal_synchronization["evaluation"] = temporal_evaluation
     captury_metrics = trim_model_run(captury, cut_start_s, cut_end_s)
     motive_metrics = trim_model_run(motive, cut_start_s, cut_end_s)
     biobuddy_run: ModelRun | None = None
@@ -3493,6 +3733,8 @@ def compare_trial(
             args.biobuddy_unit_scale_to_m,
             args.ik_max_frames,
             args.angle_label_regex,
+            args.out_dir / "biobuddy_ik_cache",
+            force=args.no_cache,
         )
         if biobuddy_run is not None:
             biobuddy_run = trim_model_run(biobuddy_run, cut_start_s, cut_end_s)
@@ -3585,6 +3827,7 @@ def compare_trial(
         args.c3d_angle_unit,
         cut_start_s,
         cut_end_s,
+        temporal_lag_s,
     )
     q_rows.extend(c3d_angle_rows)
     q_ts_rows.extend(c3d_angle_ts_rows)
@@ -3665,7 +3908,7 @@ def compare_trial(
         bundle.name,
         generate_figure=not args.no_figures,
     )
-    event_report, _contact_rows = detect_trial_events_and_contacts(
+    event_report, contact_rows = detect_trial_events_and_contacts(
         bundle.motive_c3d,
         trial_dir,
         bundle.name,
@@ -3683,6 +3926,7 @@ def compare_trial(
         marker_rotation,
         marker_translation,
         args.angle_label_regex,
+        temporal_lag_s,
     )
     marker_proposal_path = trial_dir / "skin_marker_correspondence_proposal.json"
     marker_proposal_path.write_text(
@@ -3701,7 +3945,63 @@ def compare_trial(
         marker_rotation,
         marker_translation,
         landmark_map,
+        temporal_lag_s,
     )
+    phase_points = int(getattr(args, "phase_normalization_points", 101))
+    normalized_scientific_rows: list[dict[str, Any]] = []
+    for family, rows, groups, values in (
+        (
+            "joint_centres",
+            centre_ts_rows,
+            ("joint",),
+            (
+                "distance_mm",
+                "biobuddy_distance_mm",
+                "captury_x_mm",
+                "captury_y_mm",
+                "captury_z_mm",
+                "motive_x_mm",
+                "motive_y_mm",
+                "motive_z_mm",
+            ),
+        ),
+        (
+            "kinematics_q",
+            q_ts_rows,
+            ("q_name",),
+            ("motive", "captury", "biobuddy", "captury_c3d", "difference"),
+        ),
+        (
+            "segment_rotations",
+            segment_ts_rows,
+            ("reference", "source", "segment"),
+            ("global_deg", "x_deg", "y_deg", "z_deg"),
+        ),
+        (
+            "skin_markers",
+            marker_ts_rows,
+            ("landmark",),
+            ("error_x_mm", "error_y_mm", "error_z_mm", "distance_mm"),
+        ),
+    ):
+        existing_values = tuple(
+            value for value in values if any(value in row for row in rows)
+        )
+        if not existing_values:
+            continue
+        normalized = normalize_timeseries_groups(
+            rows,
+            time_key="time",
+            group_keys=groups,
+            value_keys=existing_values,
+            start_s=cut_start_s,
+            end_s=cut_end_s,
+            n_points=phase_points,
+        )
+        for row in normalized:
+            row["family"] = family
+        normalized_scientific_rows.extend(normalized)
+    cycles = contact_cycle_report(contact_rows)
     write_rows(trial_dir / "joint_centre_metrics.csv", centre_rows)
     write_table_npz(trial_dir / "joint_centre_timeseries.npz", centre_ts_rows)
     write_rows(
@@ -3731,6 +4031,20 @@ def compare_trial(
     write_table_npz(
         trial_dir / "skin_marker_correspondence_timeseries.npz", marker_ts_rows
     )
+    temporal_sync_path = trial_dir / "temporal_synchronization.json"
+    temporal_sync_path.write_text(
+        json.dumps(temporal_synchronization, indent=2), encoding="utf-8"
+    )
+    write_table_npz(
+        trial_dir / "temporal_synchronization_timeseries.npz", temporal_rows
+    )
+    write_table_npz(trial_dir / "temporal_phase_normalized.npz", phase_rows)
+    write_table_npz(
+        trial_dir / "phase_normalized_scientific_timeseries.npz",
+        normalized_scientific_rows,
+    )
+    contact_cycles_path = trial_dir / "contact_cycles.json"
+    contact_cycles_path.write_text(json.dumps(cycles, indent=2), encoding="utf-8")
     plot_metric_barh(
         pd.DataFrame(dimension_rows),
         category="dimension",
@@ -3790,6 +4104,7 @@ def compare_trial(
             "captury_frames": int(captury_metrics.time.shape[0]),
             "motive_frames": int(motive_metrics.time.shape[0]),
         },
+        "temporal_synchronization": temporal_synchronization,
         "alignment": alignment_report,
         "spatial_calibration": spatial_calibration.to_dict(),
         "outputs": {
@@ -3820,6 +4135,17 @@ def compare_trial(
             ),
             "motive_marker_occlusions": str(trial_dir / "motive_marker_occlusions.csv"),
             "trial_events_contacts": str(trial_dir / "trial_events_contacts.csv"),
+            "temporal_synchronization": str(temporal_sync_path),
+            "temporal_synchronization_timeseries": str(
+                trial_dir / "temporal_synchronization_timeseries.npz"
+            ),
+            "temporal_phase_normalized": str(
+                trial_dir / "temporal_phase_normalized.npz"
+            ),
+            "phase_normalized_scientific_timeseries": str(
+                trial_dir / "phase_normalized_scientific_timeseries.npz"
+            ),
+            "contact_cycles": str(contact_cycles_path),
             "model_dimensions": str(trial_dir / "model_dimensions.csv"),
             "skin_marker_correspondence_metrics": str(
                 trial_dir / "skin_marker_correspondence_metrics.csv"
@@ -3839,6 +4165,7 @@ def compare_trial(
             },
         },
         "trial_events": event_report,
+        "contact_cycles": cycles,
         "segment_rotations": segment_report,
         "joint_kinematics_d4_d6": {
             source: {
@@ -3878,9 +4205,6 @@ def compare_trial(
     }
     if args.run_ik_batch:
         report["biobuddy_ik_batch"] = biobuddy_ik_report
-        report["motive_ik_batch"] = run_ik_batch(
-            bundle, trial_dir, args.model_source, args.ik_max_frames
-        )
     if args.visualize and (
         args.visualize_trial is None or args.visualize_trial == bundle.name
     ):
@@ -3931,6 +4255,36 @@ def parse_args() -> argparse.Namespace:
             "Trial cutting mode: manual uses --time-start/--time-end when provided, "
             "movement uses detected movement bounds, full ignores both."
         ),
+    )
+    parser.add_argument(
+        "--temporal-sync-mode",
+        choices=["auto", "manual", "none"],
+        default="auto",
+        help=(
+            "Captury-to-Motive clock synchronization. Auto estimates one constant "
+            "lag from common joint-centre speeds; manual requires --manual-lag-s."
+        ),
+    )
+    parser.add_argument(
+        "--manual-lag-s",
+        type=float,
+        default=None,
+        help=(
+            "Manual Captury lag in seconds. Positive values place Captury samples "
+            "later on the Motive clock."
+        ),
+    )
+    parser.add_argument(
+        "--max-lag-s",
+        type=float,
+        default=0.5,
+        help="Maximum absolute lag searched in automatic mode (default: 0.5 s).",
+    )
+    parser.add_argument(
+        "--phase-normalization-points",
+        type=int,
+        default=101,
+        help="Number of samples used to normalize the selected phase to 0-100%%.",
     )
     parser.add_argument("--model-source", choices=["auto", "bvh", "fbx"], default="bvh")
     parser.add_argument(
@@ -4082,7 +4436,16 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Disable the Motive model -> Motive C3D marker-proxy yaw/translation alignment.",
     )
-    parser.add_argument("--run-ik-batch", action="store_true")
+    parser.add_argument(
+        "--run-biobuddy-ik-batch",
+        "--run-ik-batch",
+        dest="run_ik_batch",
+        action="store_true",
+        help=(
+            "Run cached nonlinear TRF IK only for the BioBuddy model. The old "
+            "--run-ik-batch spelling remains as a compatibility alias."
+        ),
+    )
     parser.add_argument("--ik-max-frames", type=int, default=0)
     parser.add_argument("--visualize", action="store_true")
     parser.add_argument("--visualize-trial", default=None)

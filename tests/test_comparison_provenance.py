@@ -91,9 +91,30 @@ class ComparisonProvenanceTests(unittest.TestCase):
                 "mocap_alignment_code",
                 "captury_c3d_angle_decoder",
                 "captury_c3d_angle_registry",
+                "biobuddy_ik_code",
+                "temporal_synchronization_code",
             },
         )
         self.assertNotEqual(first["digest"], second["digest"])
+
+    def test_biobuddy_ik_outputs_must_exist_before_trial_cache_is_reused(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            npz = root / "ik.npz"
+            summary = root / "ik.json"
+            npz.write_bytes(b"npz")
+            summary.write_text("{}", encoding="utf-8")
+            report = {
+                "biobuddy_ik_batch": {
+                    "outputs": {"npz": str(npz), "summary": str(summary)}
+                }
+            }
+
+            self.assertTrue(comparison.biobuddy_ik_outputs_complete(report))
+            npz.unlink()
+            self.assertFalse(comparison.biobuddy_ik_outputs_complete(report))
+
+        self.assertFalse(comparison.biobuddy_ik_outputs_complete({}))
 
     def test_rotation_audit_npz_roundtrip_including_empty_comparison(self) -> None:
         comparison_data = {
@@ -123,7 +144,7 @@ class ComparisonProvenanceTests(unittest.TestCase):
         np.testing.assert_allclose(dataframe["geodesic_deg"], np.rad2deg([0.1, 0.2]))
         self.assertTrue(empty.empty)
 
-    def test_fbx_ik_batch_also_tracks_motive_bvh(self) -> None:
+    def test_biobuddy_ik_batch_does_not_add_historical_motive_bvh_ik(self) -> None:
         bundle = comparison.TrialBundle(
             "Static",
             Path("captury.c3d"),
@@ -143,7 +164,11 @@ class ComparisonProvenanceTests(unittest.TestCase):
 
         inputs = comparison.comparison_input_files([bundle], args)
 
-        self.assertEqual(inputs["Static/motive/ik_bvh"], Path("motive.bvh"))
+        self.assertNotIn("Static/motive/ik_bvh", inputs)
+        self.assertEqual(
+            inputs["implementation/biobuddy_ik_code"],
+            comparison.SCIENTIFIC_IMPLEMENTATION_FILES["biobuddy_ik_code"],
+        )
 
     def test_rotation_audit_tracks_bvh_and_fbx_for_both_systems(self) -> None:
         bundle = comparison.TrialBundle(
@@ -188,6 +213,12 @@ class ComparisonProvenanceTests(unittest.TestCase):
                     "captury_c3d_angle_metrics": "/tmp/captury_angles.csv",
                     "captury_c3d_angle_timeseries": "/tmp/captury_angles.npz",
                 },
+                "biobuddy_ik_batch": {
+                    "outputs": {
+                        "npz": "/tmp/biobuddy_ik.npz",
+                        "summary": "/tmp/biobuddy_ik.json",
+                    }
+                },
                 "skin_marker_correspondence": {"map_source": "automatic_proposal"},
                 "bvh_fbx_rotation_audit": {
                     "captury": {
@@ -230,6 +261,8 @@ class ComparisonProvenanceTests(unittest.TestCase):
                 "Static/kinematics/captury_c3d_angle_timeseries": Path(
                     "/tmp/captury_angles.npz"
                 ),
+                "Static/biobuddy/ik_npz": Path("/tmp/biobuddy_ik.npz"),
+                "Static/biobuddy/ik_summary": Path("/tmp/biobuddy_ik.json"),
             },
         )
 

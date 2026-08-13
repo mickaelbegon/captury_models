@@ -27,7 +27,7 @@ qualite du recalage et de l'incertitude de reconstruction.
 - separation des marqueurs et des canaux angulaires Captury dans le C3D;
 - gestion des unites, de l'axe vertical et des translations de racine;
 - construction du modele BioBuddy Motive 57 avec statique, SCoRE et SARA;
-- reconstruction QLD biorbd et lancement batch de la cinematique inverse;
+- IK non lineaire TRF BioBuddy et lancement batch de la cinematique inverse;
 - calcul des centres articulaires, dimensions et rotations segmentaires;
 - comparaison de series temporelles et metriques MAE, RMSE, biais, CCC et
   correlation;
@@ -181,8 +181,8 @@ identifiables dans le rapport genere.
 | G6 | ISB D1-D3 | accepte pour diagnostic BioBuddy | cibles Wu versionnees, roundtrip bioMod et evaluation statique; Captury/Motive proprietaires restent inconnus |
 | G7 | ISB D4 rotations | accepte pour diagnostic BioBuddy hanche/genou; final ISB refuse | matrices parent-enfant corrigees, axes JCS, signes, singularites, roundtrip et provenance; G6 et corrections des autres sources/articulations restent incomplets |
 | G8 | ISB D5 translations | non applicable actuellement | translation articulaire distale exprimee dans le repere proximal ISB si elle est analysee |
-| G9 | BioBuddy dynamique | refuse | IK de chaque essai, residus et absence de fallback silencieux |
-| G10 | Synchronisation | a construire | lag, evenements communs, erreur residuelle et cycles documentes |
+| G9 | BioBuddy dynamique | partiel: statique reconstruit, dynamique refuse | IK de chaque essai, residus et absence de fallback silencieux |
+| G10 | Synchronisation | accepte pour lag constant diagnostique; derive et contacts force-plate non valides | lag, evenements communs, erreur residuelle et cycles documentes |
 | G11 | Metriques | partiel | SO(3), waveform, ROM, timing et agregation essai puis participant |
 | G12 | Rapport reproductible | a construire | tableau D1-D6 avec preuve associee a chaque statut |
 
@@ -437,7 +437,7 @@ d'un protocole controle permettant d'identifier sequence, signes et axes.
 
 ### Phase 6 - BioBuddy comme troisieme modele dynamique
 
-Executer la QLD statique puis l'IK batch sur tous les essais Motive. Enregistrer
+Executer l'IK non lineaire TRF statique puis le batch sur tous les essais Motive. Enregistrer
 les residus marqueurs, les marqueurs utilises, les echecs, les centres SCoRE,
 les axes SARA et leurs incertitudes.
 
@@ -446,6 +446,44 @@ marqueurs manquants, reconstruction synthetique et lecture des `q`/matrices.
 
 **Gate:** aucun fallback silencieux BioBuddy vers Motive. Une source absente
 est affichee comme absente et la raison apparait dans le rapport.
+
+**Etat au 2026-08-12:** implementation fonctionnelle et gate technique atteint;
+validation scientifique dynamique encore refusee.
+Le batch BioBuddy utilise directement les 47 marqueurs techniques du BioMod,
+sans l'ancien pipeline IK BVH/FBX. Le diagnostic a montre que l'erreur historique
+d'environ 58,7 mm provenait principalement d'un melange entre indices de tous
+les marqueurs et indices des marqueurs techniques apres insertion de marqueurs
+anatomiques. Le smoke P6 Static corrige donne 0,350 mm d'erreur moyenne sur 10
+frames. Les resultats sont caches par contenu BioMod/C3D, solveur et parametres;
+le Static post-creation est reutilise. Temps, `nfev`, residus et ETA sont traces.
+BioBuddy alimente dimensions, centres et rotations segmentaires. La comparaison
+directe des `q` reste refusee sans mapping anatomique explicite des noms de DoF.
+
+Sur le Static complet, les 773 frames sont reconstruites en environ 1,03 s avec
+0,192 mm de residu moyen in-sample sur les marqueurs optimises, 2 572
+evaluations de fonction et 47/47 marqueurs techniques. Cette valeur est une
+qualite d'ajustement, pas une erreur de validation independante. `Marche_001`
+converge numeriquement sur 957/957 frames en environ
+8,83 s et 21 138 evaluations, mais conserve 34,95 mm d'erreur moyenne
+(RMSE 44,89 mm; p95 94,71 mm). La convergence TRF ne valide donc pas la
+cinematique dynamique.
+
+Le controle mecanique a ajuste independamment les clusters rigides du Static au
+premier frame de marche. Pour les segments ayant au moins trois marqueurs, la
+RMSE est comprise entre 0,23 et 6,15 mm; une erreur globale d'unite ou une
+deformation massive des clusters n'explique donc pas le residu de chaine. Les
+residus BioBuddy moyens les plus eleves concernent `LUpperArm` (91,93 mm),
+`RHand` (87,32 mm), `LHand` (85,09 mm) et `RUpperArm` (84,92 mm), contre
+10,08-12,51 mm pour les pieds. Les prochains travaux scientifiques doivent
+examiner les centres SCoRE/SARA, les longueurs et liaisons intersegmentaires et
+la pauvrete des clusters de bras (un seul marqueur technique par bras) avant
+toute acceleration ou interpretation des angles dynamiques.
+
+La revue independante accepte le gate technique apres ajout du hash du code IK
+dans la cle, du SHA-256 et du controle de schema du NPZ avant reutilisation,
+ainsi que de tests explicites des conversions C3D mm -> BioMod m -> residus mm.
+G9 reste partiel: le statique est reconstruit, mais la cinematique dynamique
+reste refusee tant que les residus de chaine ne sont pas expliques.
 
 ### Phase 7 - Synchronisation et selection des phases
 
@@ -457,6 +495,42 @@ contacts, pics ou signaux communs, puis normaliser les cycles ou phases a
 echantillons manquants, fenetres manuelles et detection des contacts.
 
 **Gate:** lag, methode, erreur residuelle et fenetre analysee sont sauvegardes.
+
+**Etat au 2026-08-13:** phase terminee; gate technique accepte pour un lag
+constant diagnostique et une phase selectionnee. La derive d'horloge et la
+validation des contacts par plateforme de force restent hors de ce gate.
+Motive est l'horloge de reference et la convention est
+`captury_corrected_time = captury_original_time + lag_s`. L'estimateur utilise
+la correlation d'une vitesse composite sans translation construite sur les
+centres articulaires communs apres recalage spatial. Il estime uniquement un
+offset constant et refuse le Static, un signal insuffisant, une correlation
+inferieure a 0,5, un gain de correlation inferieur a 0,01 ou un optimum a la
+limite de recherche. La proeminence du meilleur pic est egalement comparee au
+second pic separe afin de refuser un mouvement periodique ambigu; la resolution
+de recherche constitue l'incertitude temporelle minimale rapportee. Le meme temps Captury
+corrige est utilise pour centres, q, rotations segmentaires, angles C3D et
+marqueurs cutanes. Aucune valeur n'est extrapolee hors du recouvrement temporel;
+les echantillons correspondants restent manquants dans les sorties et le viewer.
+Le JSON sauvegarde methode, lag applique et estime, correlations, proeminence,
+resolution, RMSE normalisee et fenetres. Les NPZ sauvegardent le signal
+inspectable, la phase composite et les series scientifiques normalisees a
+0-100 % pour chaque famille disponible parmi centres, q, rotations
+segmentaires et marqueurs apparies. Une famille indisponible reste absente.
+Chaque signal publie couverture finie, plus grand gap, gap maximal accepte et
+statut; une longue occlusion interne rend la normalisation indisponible au lieu
+d'etre traversee par interpolation.
+`contact_cycles.json` recense les cycles derives des contacts cinematiques et
+les qualifie explicitement de diagnostiques sans validation force-plate. Un
+groupe de marqueurs de pied absent rend le cote indisponible et les cycles de
+moins de 0,2 s sont rejetes.
+
+Sur P6 `Marche_001`, le meilleur lag est `-8,353 ms`, mais le gain de
+correlation n'est que `1,13e-5` (`0,997284` vers `0,997295`): l'algorithme le
+refuse comme gain negligeable et applique `0 s`. Le smoke headless produit 101
+points pour la phase composite et 16 059 lignes normalisees scientifiques.
+Apres rejet des micro-cycles inferieurs a 0,2 s, 8 cycles diagnostiques restent.
+Ces chiffres valident la plomberie et le refus
+conservateur; ils ne valident pas anatomiquement les contacts ou les cycles.
 
 ### Phase 8 - Metriques et incertitudes
 

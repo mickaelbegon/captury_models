@@ -106,7 +106,7 @@ The GUI tabs are organized for the Captury/Motive analysis:
 - `Données`: choose the flattened `Captury/` + `Motive/` data root, output folder, static trial, model source and model-to-C3D axis conversion. The detected files are inventoried in a table, and the global trial menu in the top-right corner applies to every tab. The local P6 debug preset remains available from the CLI with `--p6-debug`.
 - `BioBuddy`: create a `bioMod` directly from a folder of calibration C3D files with BioBuddy's `create_model_from_c3d_folder`, including the Motive 57 preset.
 - `Occlusions`: analyze missing Motive marker trajectories in a sortable table with clean marker names.
-- `Découpage`: estimate movement start/end and ground contacts from foot-marker kinematics, and open the selected trial in the lightweight 3D C3D viewer.
+- `Découpage`: estimate movement start/end and ground contacts from foot-marker kinematics, synchronize the Captury clock to Motive, normalize the selected phase to 0-100 %, and open the selected trial in the lightweight 3D C3D viewer.
 - `Dimensions`: compare model dimensions with an embedded graph and hierarchical metric/component selectors.
 - `Segments`: compare segment orientation matrices against a selectable reference model (`BioBuddy` by default, with documented fallback to Motive when no BioBuddy q time series is available).
 - `Centres`: compare model joint-centre positions after alignment, including time curves for a selected joint.
@@ -170,6 +170,8 @@ interpreting results: FBX/BVH-to-C3D registration, Captury/Motive/BioBuddy model
 coherence, vertical-axis orientation, unit scaling and joint-angle extraction.
 
 In the `Découpage` tab, drag horizontally on a contact/movement graph to define the manual phase of interest. The selected time span is shaded on the graph and copied into `Début manuel (s)` / `Fin manuelle (s)`.
+
+The same tab exposes `auto`, `manual`, and `none` temporal synchronization. Motive is always the reference clock. The sign convention is explicit: `captury_corrected_time = captury_original_time + lag_s`. Automatic mode estimates one constant lag from a robust composite of translation-invariant common joint-centre speeds; it is skipped for the Static trial and refused when motion is insufficient, correlation is below 0.5, the correlation gain is below 0.01, the optimum reaches the search boundary, or separated periodic peaks are ambiguous. The estimated lag remains in the report when it is refused. It does not estimate clock drift or deform time, and it leaves samples outside temporal overlap missing rather than repeating endpoint postures.
 
 The C3D viewer is a lightweight PySide/QPainter widget. It uses orthographic projection, drag rotation, wheel zoom, double-click reset, a right-click view menu (`XY`, `YZ`, `XZ`, `Face`, `Dos`, `Côté`), a frame slider, playback, marker-table selection highlighting, a whole-body fit toggle and an RGB triad. Launch it directly with:
 
@@ -476,6 +478,43 @@ python compare_p6_motive_captury.py \
 
 Use `--cut-mode full` to explicitly ignore manual and detected bounds.
 
+Synchronize a dynamic trial automatically and normalize its selected window to
+101 points:
+
+```bash
+python compare_p6_motive_captury.py \
+  --data-root local_trials/2026-06-30_P6_flat \
+  --trial Marche_001 \
+  --temporal-sync-mode auto \
+  --max-lag-s 0.5 \
+  --phase-normalization-points 101 \
+  --cut-mode movement \
+  --no-mesh --no-figures \
+  --out-dir out_p6_motive_captury_comparison
+```
+
+For an externally measured offset, use `--temporal-sync-mode manual
+--manual-lag-s VALUE`. A positive value places Captury samples later on the
+Motive timeline. The corrected time vector is used consistently for Captury
+model centres, q, segment rotations, C3D angle channels and skin markers;
+spatial samples are not modified. `temporal_synchronization.json` records the
+method, lag, correlations, peak prominence, lag resolution, normalized residual
+RMSE and analyzed window. Automatic synchronization is not applied when the
+signal is static, correlation is weak, improvement is negligible, the best
+peak lies on the search boundary, or multiple periodic peaks are ambiguous.
+`temporal_synchronization_timeseries.npz` stores the inspectable alignment
+signal, and `temporal_phase_normalized.npz` stores the selected phase on
+0-100 %. `phase_normalized_scientific_timeseries.npz` extends the same phase
+window to each available family among joint centres, q, segment rotations and
+paired skin markers; unavailable families remain absent instead of being
+silently synthesized. Every normalized signal records its finite coverage,
+largest interpolated gap, accepted maximum gap and status; long internal gaps
+are refused and written as missing values.
+`contact_cycles.json` lists foot-contact cycles detected from kinematics; they
+remain diagnostic and are explicitly marked as not force-plate validated.
+Missing foot-marker groups are marked unavailable, never converted to contact,
+and cycles shorter than 0.2 s are rejected.
+
 The script builds BioBuddy/biorbd models for both systems from BVH by default. Use `--model-source fbx` to force FBX. `--model-source auto` now builds and compares both exports when both are available: automatic selection is rejected unless every mapped segment stays below `--bvh-fbx-max-p95-geodesic-deg` (default `5` degrees at p95). This numerical gate prevents silent source substitution; it is not an ISB tolerance or proof of anatomical equivalence. Captury BVH/FBX is treated as millimetres; Motive BVH/FBX is treated as centimetres unless overridden with `--captury-unit-scale-to-m` or `--motive-unit-scale-to-m`.
 
 Audit BVH and FBX while keeping an explicit BVH result:
@@ -493,7 +532,7 @@ python compare_p6_motive_captury.py \
 
 Each system writes `bvh_fbx_rotation_audit.json` plus a compressed `bvh_fbx_rotation_audit.npz` under the trial's `captury/` or `motive/` directory. The JSON records canonical segment coverage, SO(3) quality corrections, per-segment median/p95/max/RMS geodesic deviations and the automatic-selection verdict. On the current P6 Static files, both systems fail the conservative 5-degree gate, so BVH or FBX must be selected explicitly.
 
-BVH and FBX timestamps are compared as elapsed time from each export's first sample; FBX rotations are interpolated by SLERP onto overlapping BVH elapsed times. The audit does not estimate temporal lag or compensate for missing leading frames, so a dynamic-trial failure can include synchronization error and must remain diagnostic until the G10 synchronization gate is implemented.
+The within-system BVH/FBX rotation audit still compares elapsed timestamps without a separate lag estimate because both files are expected to originate from the same export. Cross-system Captury/Motive comparisons use the explicit synchronization policy above before interpolation. No path currently compensates clock drift.
 
 The model coordinates are converted from Y-up to the Motive C3D Z-up convention before writing C3D outputs:
 
@@ -527,6 +566,11 @@ Main outputs:
 - `out_p6_motive_captury_comparison/<trial>/<system>/<source>/<system>_<source>_root_translation_policy.json`
 - `out_p6_motive_captury_comparison/<trial>/motive_marker_occlusions.csv`
 - `out_p6_motive_captury_comparison/<trial>/trial_events_contacts.csv`
+- `out_p6_motive_captury_comparison/<trial>/temporal_synchronization.json`
+- `out_p6_motive_captury_comparison/<trial>/temporal_synchronization_timeseries.npz`
+- `out_p6_motive_captury_comparison/<trial>/temporal_phase_normalized.npz`
+- `out_p6_motive_captury_comparison/<trial>/phase_normalized_scientific_timeseries.npz`
+- `out_p6_motive_captury_comparison/<trial>/contact_cycles.json`
 - `out_p6_motive_captury_comparison/<trial>/model_dimensions.csv`
 - `out_p6_motive_captury_comparison/<trial>/skin_marker_correspondence_metrics.csv`
 - `out_p6_motive_captury_comparison/all_joint_centre_metrics.csv`
@@ -575,13 +619,13 @@ PYORERUN_HEADLESS=1 python compare_p6_motive_captury.py \
 
 For an interactive Rerun view, remove `PYORERUN_HEADLESS=1` and `--headless`. The current visualization displays the enriched C3D joint-centre channels. FBX meshes are generated when `--model-source fbx` and mesh extraction is enabled, but Motive FBX files may not contain usable geometry; this is reported under each trial's `run_report.json`.
 
-Run Motive inverse kinematics in batch through the existing BioBuddy/biorbd pipeline:
+Run BioBuddy inverse kinematics in batch with bounded nonlinear TRF:
 
 ```bash
 python compare_p6_motive_captury.py \
   --data-root local_trials/2026-06-30_P6_flat \
   --trial LKnee \
-  --run-ik-batch \
+  --run-biobuddy-ik-batch \
   --ik-max-frames 50 \
   --out-dir out_p6_motive_captury_ik_check
 ```
@@ -598,4 +642,8 @@ The script then recomputes each local marker position in the global frame while 
 
 ## Inverse Kinematics
 
-With `--inverse-kinematics`, the script uses only the C3D marker channels, never the C3D angle channels. The solver can be `least_squares`, which calls `biorbd.InverseKinematics`, or `kalman`, which calls `biorbd.KalmanReconsMarkers`. The outputs contain reconstructed `q`, `qdot`, and `qddot`; no inverse dynamics or generalized forces are computed in this step.
+The BioBuddy batch now uses only the generated BioBuddy bioMod and the Motive C3D markers. It no longer launches the historical BVH/FBX inverse-kinematics pipeline. The bounded solver is reported as `scipy.optimize.least_squares:trf`; `--run-ik-batch` remains a compatibility alias for `--run-biobuddy-ik-batch`. Results are cached by SHA-256 of the BioMod and C3D plus the solver, marker mapping, unit scale, frame limit and tolerance. The static result calculated after model creation is therefore reused by a later batch with identical parameters.
+
+Each cached summary reports elapsed time, `nfev`, successful frames and marker residuals globally, per marker and per parent segment. The NPZ stores `q`, `qdot`, `qddot`, residuals, `nfev` and timing arrays. The cache key includes the IK implementation hash, and the NPZ digest and minimal schema are checked before reuse. On P6 Static, the corrected technical-marker indexing uses 47/47 markers and reduces the 10-frame diagnostic from the historical approximately 58.7 mm to 0.350 mm mean marker residual; the complete 773-frame static trial reaches a 0.192 mm in-sample residual in about 1.0 s. This is goodness of fit on the markers optimized by IK, not independent validation error. The former value came primarily from mixing indices of all BioMod markers with indices of technical markers after interleaved anatomical markers; it was not evidence that TRF tolerances should be relaxed.
+
+P6 `Marche_001` remains a scientific warning rather than a solver-performance target: the complete trial converges in about 8.8 s but retains 34.95 mm mean marker error. At its first frame, independent rigid fits of marker clusters from the static model are only 0.23-6.15 mm RMSE, while the linked BioBuddy chain produces its largest residuals on upper arms and hands. This points toward inter-segment geometry, functional joint centres/axes or model constraints, rather than a global unit error. No acceptance threshold is silently applied: converged frames remain `diagnostic_only` until this dynamic inconsistency is resolved. BioBuddy DoF names are not assumed homologous to Motive/Captury export names; cross-model kinematics are compared through segment rotation matrices and audited joint conventions until an explicit anatomical DoF map exists.

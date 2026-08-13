@@ -70,6 +70,21 @@ def summarize_run_report(report: Mapping[str, Any]) -> str:
     )
     if corrections:
         lines.append(f"Corrections segments: {', '.join(map(str, corrections))}")
+    synchronization = report.get("temporal_synchronization", {})
+    if isinstance(synchronization, Mapping) and synchronization:
+        status = synchronization.get("status", "?")
+        lag_s = synchronization.get("lag_s", 0.0)
+        estimated_lag_s = synchronization.get("estimated_lag_s")
+        line = f"Synchronisation: {status}, lag appliqué {float(lag_s):+.6f} s"
+        if isinstance(estimated_lag_s, (float, int)) and estimated_lag_s != lag_s:
+            line += f", estimé {float(estimated_lag_s):+.6f} s"
+        correlation = synchronization.get("correlation_after")
+        prominence = synchronization.get("peak_prominence")
+        if isinstance(correlation, (float, int)):
+            line += f", r={float(correlation):.3f}"
+        if isinstance(prominence, (float, int)):
+            line += f", proéminence={float(prominence):.3f}"
+        lines.append(line)
     return (
         "\n".join(lines) if lines else "Rapport disponible, aucun choix critique listé."
     )

@@ -80,6 +80,10 @@ class P6DebugGuiTests(unittest.TestCase):
             "selected_trial",
             "p6_static_trial",
             "p6_cut_mode",
+            "p6_temporal_sync_mode",
+            "p6_manual_lag_s",
+            "p6_max_lag_s",
+            "p6_phase_normalization_points",
             "p6_time_start",
             "p6_time_end",
             "p6_joint_filter",
@@ -142,6 +146,37 @@ class P6DebugGuiTests(unittest.TestCase):
         gui.joint_chain_cache = {}
         gui.status_var = FakeVar()
         return gui
+
+    def test_temporal_gui_validation_accepts_finite_manual_settings(self) -> None:
+        gui = self.make_gui_stub()
+        with tempfile.TemporaryDirectory() as tmp:
+            gui.vars["p6_data_root"].set(tmp)
+            gui.vars["p6_temporal_sync_mode"].set("manual")
+            gui.vars["p6_manual_lag_s"].set("0.125")
+            gui.vars["p6_max_lag_s"].set("0.5")
+            gui.vars["p6_phase_normalization_points"].set("101")
+
+            self.assertTrue(CapturyBioBuddyGui._validate_p6_analysis(gui))
+
+    def test_temporal_gui_validation_rejects_invalid_settings(self) -> None:
+        gui = self.make_gui_stub()
+        with tempfile.TemporaryDirectory() as tmp, patch(
+            "captury_biobuddy_gui.messagebox.showerror"
+        ) as showerror:
+            gui.vars["p6_data_root"].set(tmp)
+            gui.vars["p6_temporal_sync_mode"].set("manual")
+            gui.vars["p6_manual_lag_s"].set("")
+            gui.vars["p6_max_lag_s"].set("0.5")
+            gui.vars["p6_phase_normalization_points"].set("101")
+
+            self.assertFalse(CapturyBioBuddyGui._validate_p6_analysis(gui))
+            self.assertTrue(showerror.called)
+
+            showerror.reset_mock()
+            gui.vars["p6_manual_lag_s"].set("0.0")
+            gui.vars["p6_max_lag_s"].set("-1")
+            self.assertFalse(CapturyBioBuddyGui._validate_p6_analysis(gui))
+            self.assertTrue(showerror.called)
 
     def test_running_state_disables_all_analysis_buttons(self) -> None:
         gui = self.make_gui_stub()
@@ -329,7 +364,7 @@ class P6DebugGuiTests(unittest.TestCase):
         self.assertEqual(level, "info")
         self.assertEqual(title, "Modèle BioBuddy créé")
         self.assertIn("motive_57.bioMod", message)
-        self.assertIn("reconstruction QLD", message)
+        self.assertIn("IK non linéaire TRF", message)
 
     def test_successful_biobuddy_model_creation_starts_static_ik_without_popup(
         self,
@@ -504,9 +539,23 @@ class P6DebugGuiTests(unittest.TestCase):
             CapturyBioBuddyGui._running_status_message(gui, "biobuddy_c3d_model"),
         )
         self.assertIn(
-            "Reconstruction QLD statique",
+            "IK non linéaire TRF statique",
             CapturyBioBuddyGui._running_status_message(gui, "biobuddy_c3d_ik"),
         )
+
+    def test_biobuddy_ik_progress_line_updates_gui_status(self) -> None:
+        gui = self.make_gui_stub()
+        line = (
+            "[BioBuddy IK] frame 20/100 | temps 2.5 s | nfev 4 | "
+            "erreur 0.42 mm | reste ~10.0 s\n"
+        )
+
+        CapturyBioBuddyGui._update_status_from_process_output(gui, line)
+
+        self.assertIn("20/100", str(gui.status_var.get()))
+        self.assertIn("nfev 4", str(gui.status_var.get()))
+        self.assertIn("0.42 mm", str(gui.status_var.get()))
+        self.assertIn("10.0 s", str(gui.status_var.get()))
 
     def test_manual_phase_bounds_are_sorted_and_set_manual_cut_mode(self) -> None:
         gui = self.make_gui_stub()

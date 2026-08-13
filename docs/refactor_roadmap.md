@@ -219,7 +219,7 @@ Purpose:
 
 - Make generated BioBuddy models a stable third source for dimensions, centres,
   segment rotations and kinematics.
-- Separate model creation, static QLD reconstruction and batch IK orchestration.
+- Separate model creation, static nonlinear TRF IK and batch IK orchestration.
 - Avoid the small IK script importing helpers from the historical mega-script.
 
 Tests first:
@@ -247,7 +247,7 @@ Tests first:
 
 - Add golden mini-report tests with heavy helpers mocked.
 - Add cache hit/miss tests preserving report keys and output paths.
-- Add `--run-ik-batch` orchestration tests without running real IK.
+- Add `--run-biobuddy-ik-batch` orchestration tests without running real IK.
 
 ## Phase 9 - Historical BVH/FBX Source Runs
 
