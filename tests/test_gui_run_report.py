@@ -43,6 +43,26 @@ class GuiRunReportTests(unittest.TestCase):
                 "correlation_after": 0.98,
                 "peak_prominence": 0.12,
             },
+            "metric_quality": {
+                "waveforms": 12,
+                "eligible_waveforms": 9,
+                "status_counts": {
+                    "ok": 9,
+                    "low_reference_amplitude": 3,
+                },
+            },
+            "metric_sensitivity": {
+                "root_translation": {
+                    "captury": {
+                        "status": "computed",
+                        "score_difference_mm": 4.2,
+                    },
+                },
+                "temporal_lag": {
+                    "status": "computed",
+                    "normalized_rmse_improvement": 0.03,
+                },
+            },
         }
 
         summary = summarize_run_report(report)
@@ -56,6 +76,10 @@ class GuiRunReportTests(unittest.TestCase):
         self.assertIn("captury_thigh_y_axis_from_hip_to_knee_cor", summary)
         self.assertIn("Synchronisation: ok", summary)
         self.assertIn("+0.125000 s", summary)
+        self.assertIn("Forme cinématique: 9/12", summary)
+        self.assertIn("faible amplitude référence: 3", summary)
+        self.assertIn("Sensibilité offset translation racine Captury: 4.20 mm", summary)
+        self.assertIn("gain RMSE normalisée +0.0300", summary)
 
     def test_summarize_run_report_handles_empty_report(self) -> None:
         self.assertEqual(summarize_run_report({}), "Aucun rapport sélectionné.")

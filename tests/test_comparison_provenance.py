@@ -87,12 +87,14 @@ class ComparisonProvenanceTests(unittest.TestCase):
                 "joint_kinematics_registry",
                 "joint_kinematics_code",
                 "isb_segment_audit_code",
+                "isb_compliance_report_code",
                 "spatial_calibration_code",
                 "mocap_alignment_code",
                 "captury_c3d_angle_decoder",
                 "captury_c3d_angle_registry",
                 "biobuddy_ik_code",
                 "temporal_synchronization_code",
+                "comparison_metrics_code",
             },
         )
         self.assertNotEqual(first["digest"], second["digest"])

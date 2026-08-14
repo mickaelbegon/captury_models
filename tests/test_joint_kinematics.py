@@ -237,6 +237,8 @@ class JointKinematicsTests(unittest.TestCase):
         self.assertEqual(hip["euler_status"], "unavailable")
         self.assertEqual(hip["proximal"], "pelvis")
         self.assertEqual(hip["distal"], "right_thigh")
+        self.assertIsNone(hip["proximal_segment_id"])
+        self.assertIsNone(hip["distal_segment_id"])
         self.assertEqual(hip["laterality"], "right")
         self.assertEqual(hip["component_signs"], [1, 1, 1])
         self.assertEqual(hip["laterality_preprocessing"], "none")

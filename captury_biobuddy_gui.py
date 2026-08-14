@@ -77,6 +77,18 @@ from gui_marker_correspondence import (
     tree_values_to_payload,
 )
 from gui_run_report import summarize_run_report
+from gui_state import (
+    default_gui_session_state_path,
+    load_gui_session_state,
+    save_gui_session_state,
+)
+from gui_isb_report import (
+    SOURCE_IDS_BY_LABEL,
+    SOURCE_LABELS,
+    filter_isb_rows,
+    isb_filter_values,
+    isb_table_values,
+)
 from gui_trial_viewer import (
     COR_LAYER_LABELS,
     DATA_SOURCE_COLORS,
@@ -322,12 +334,15 @@ class CapturyBioBuddyGui(tk.Tk):
 
         self.vars: dict[str, tk.Variable] = {}
         self._create_variables()
+        self.gui_session_state_path = default_gui_session_state_path()
+        self._restore_gui_session_state()
         self._configure_style()
         self._build_layout()
         self._bind_command_preview()
         self._update_biobuddy_biomod_status()
         self._update_command_preview()
         self._update_embedded_trial_viewer()
+        self.protocol("WM_DELETE_WINDOW", self._on_close)
         self.after(100, self._drain_output_queue)
 
     def _register_analysis_button(self, button: ttk.Button) -> ttk.Button:
@@ -1055,6 +1070,7 @@ class CapturyBioBuddyGui(tk.Tk):
     def _build_critical_methods_tab(self, notebook: ttk.Notebook) -> None:
         tab = self._tab(notebook, "Critique")
         tab.rowconfigure(1, weight=1)
+        tab.rowconfigure(2, weight=1)
 
         report_panel = ttk.LabelFrame(tab, text="Dernier rapport d'analyse")
         report_panel.grid(row=0, column=0, sticky="ew")
@@ -1073,15 +1089,126 @@ class CapturyBioBuddyGui(tk.Tk):
             command=self._update_run_report_summary,
         ).grid(row=0, column=1, sticky="ne", padx=(0, 10), pady=8)
 
+        isb_panel = ttk.LabelFrame(tab, text="Conformité ISB - déviations D1 à D6")
+        isb_panel.grid(row=1, column=0, sticky="nsew", pady=(12, 0))
+        isb_panel.rowconfigure(1, weight=1)
+        isb_panel.columnconfigure(0, weight=1)
+
+        filters = ttk.Frame(isb_panel)
+        filters.grid(row=0, column=0, sticky="ew", padx=8, pady=8)
+        filters.columnconfigure(1, weight=1)
+        filters.columnconfigure(3, weight=1)
+        filters.columnconfigure(5, weight=1)
+        filters.columnconfigure(7, weight=1)
+        self.isb_source_filter_var = tk.StringVar(value="Tous")
+        self.isb_deviation_filter_var = tk.StringVar(value="Tous")
+        self.isb_status_filter_var = tk.StringVar(value="Tous")
+        self.isb_entity_filter_var = tk.StringVar(value="Tous")
+        ttk.Label(filters, text="Source").grid(row=0, column=0, sticky="w")
+        self.isb_source_filter_combo = ttk.Combobox(
+            filters,
+            textvariable=self.isb_source_filter_var,
+            values=("Tous", *SOURCE_LABELS.values()),
+            state="readonly",
+            width=24,
+        )
+        self.isb_source_filter_combo.grid(row=0, column=1, sticky="ew", padx=(6, 12))
+        ttk.Label(filters, text="Déviation").grid(row=0, column=2, sticky="w")
+        self.isb_deviation_filter_combo = ttk.Combobox(
+            filters,
+            textvariable=self.isb_deviation_filter_var,
+            values=("Tous", "D1", "D2", "D3", "D4", "D5", "D6"),
+            state="readonly",
+            width=10,
+        )
+        self.isb_deviation_filter_combo.grid(row=0, column=3, sticky="ew", padx=(6, 12))
+        ttk.Label(filters, text="Statut").grid(row=0, column=4, sticky="w")
+        self.isb_status_filter_combo = ttk.Combobox(
+            filters,
+            textvariable=self.isb_status_filter_var,
+            values=("Tous",),
+            state="readonly",
+            width=18,
+        )
+        self.isb_status_filter_combo.grid(row=0, column=5, sticky="ew", padx=(6, 12))
+        ttk.Label(filters, text="Cible").grid(row=0, column=6, sticky="w")
+        self.isb_entity_filter_combo = ttk.Combobox(
+            filters,
+            textvariable=self.isb_entity_filter_var,
+            values=("Tous",),
+            state="readonly",
+            width=18,
+        )
+        self.isb_entity_filter_combo.grid(row=0, column=7, sticky="ew", padx=(6, 0))
+        for combo in (
+            self.isb_source_filter_combo,
+            self.isb_deviation_filter_combo,
+            self.isb_status_filter_combo,
+            self.isb_entity_filter_combo,
+        ):
+            combo.bind("<<ComboboxSelected>>", self._refresh_isb_report_table)
+
+        table_frame = ttk.Frame(isb_panel)
+        table_frame.grid(row=1, column=0, sticky="nsew", padx=8, pady=(0, 4))
+        table_frame.rowconfigure(0, weight=1)
+        table_frame.columnconfigure(0, weight=1)
+        columns = (
+            "source",
+            "format",
+            "trial",
+            "entity",
+            "deviation",
+            "status",
+            "confidence",
+            "blocking",
+        )
+        self.isb_report_tree = ttk.Treeview(
+            table_frame, columns=columns, show="headings", height=9
+        )
+        headings = (
+            "Source",
+            "Format",
+            "Essai",
+            "Segment / articulation",
+            "D",
+            "Statut",
+            "Confiance",
+            "Blocage",
+        )
+        widths = (150, 70, 90, 155, 40, 105, 120, 210)
+        for column, heading, width in zip(columns, headings, widths, strict=True):
+            self.isb_report_tree.heading(column, text=heading)
+            self.isb_report_tree.column(column, width=width, minwidth=40, stretch=True)
+        y_scroll = ttk.Scrollbar(
+            table_frame, orient=tk.VERTICAL, command=self.isb_report_tree.yview
+        )
+        x_scroll = ttk.Scrollbar(
+            table_frame, orient=tk.HORIZONTAL, command=self.isb_report_tree.xview
+        )
+        self.isb_report_tree.configure(
+            yscrollcommand=y_scroll.set, xscrollcommand=x_scroll.set
+        )
+        self.isb_report_tree.grid(row=0, column=0, sticky="nsew")
+        y_scroll.grid(row=0, column=1, sticky="ns")
+        x_scroll.grid(row=1, column=0, sticky="ew")
+        self.isb_report_status_var = tk.StringVar(
+            value="Rapport D1-D6 non encore généré."
+        )
+        ttk.Label(
+            isb_panel,
+            textvariable=self.isb_report_status_var,
+            style="Status.TLabel",
+        ).grid(row=2, column=0, sticky="ew", padx=8, pady=(0, 8))
+
         panel = ttk.LabelFrame(tab, text="Algorithmes sensibles et contrôles")
-        panel.grid(row=1, column=0, sticky="nsew", pady=(12, 0))
+        panel.grid(row=2, column=0, sticky="nsew", pady=(12, 0))
         panel.rowconfigure(0, weight=1)
         panel.columnconfigure(0, weight=1)
 
         text = tk.Text(
             panel,
             wrap=tk.WORD,
-            height=20,
+            height=10,
             font=("TkDefaultFont", 10),
             relief=tk.FLAT,
             background="#ffffff",
@@ -1789,6 +1916,7 @@ class CapturyBioBuddyGui(tk.Tk):
         self._update_embedded_joint_chain()
         self._auto_enable_biobuddy_cor_layer_after_refresh()
         self._update_run_report_summary()
+        self._refresh_isb_report_table()
 
     def _invalidate_output_caches(self) -> None:
         self.joint_chain_cache.clear()
@@ -2015,6 +2143,57 @@ class CapturyBioBuddyGui(tk.Tk):
             self.run_report_summary_var.set(f"Rapport illisible: {exc}")
             return
         self.run_report_summary_var.set(summarize_run_report(report))
+
+    def _isb_report_path(self) -> Path:
+        return self._graph_output_root() / "isb_d1_d6_report.json"
+
+    def _load_isb_report_rows(self) -> list[dict[str, object]]:
+        path = self._isb_report_path()
+        if not path.exists():
+            return []
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        rows = payload.get("rows", []) if isinstance(payload, dict) else []
+        return [dict(row) for row in rows if isinstance(row, dict)]
+
+    def _refresh_isb_report_table(self, _event: object | None = None) -> None:
+        if not hasattr(self, "isb_report_tree"):
+            return
+        try:
+            rows = self._load_isb_report_rows()
+        except (OSError, json.JSONDecodeError) as exc:
+            self.isb_report_status_var.set(f"Rapport D1-D6 illisible: {exc}")
+            return
+        source_label = self.isb_source_filter_var.get()
+        source_id = SOURCE_IDS_BY_LABEL.get(source_label, source_label)
+        selected_trial = str(self.vars["selected_trial"].get()).strip()
+        filtered = filter_isb_rows(
+            rows,
+            source_id=source_id,
+            deviation_id=self.isb_deviation_filter_var.get(),
+            entity_id=self.isb_entity_filter_var.get(),
+            status_class=self.isb_status_filter_var.get(),
+            selected_trial=selected_trial,
+        )
+        status_values = isb_filter_values(rows, "status_class")
+        entity_values = isb_filter_values(rows, "entity_id")
+        self.isb_status_filter_combo.configure(values=status_values)
+        self.isb_entity_filter_combo.configure(values=entity_values)
+        if self.isb_status_filter_var.get() not in status_values:
+            self.isb_status_filter_var.set("Tous")
+        if self.isb_entity_filter_var.get() not in entity_values:
+            self.isb_entity_filter_var.set("Tous")
+        self.isb_report_tree.delete(*self.isb_report_tree.get_children())
+        for row in filtered:
+            self.isb_report_tree.insert("", tk.END, values=isb_table_values(row))
+        if rows:
+            blocking = sum(bool(row.get("blocking")) for row in filtered)
+            self.isb_report_status_var.set(
+                f"{len(filtered)} ligne(s), {blocking} comparaison(s) bloquée(s)."
+            )
+        else:
+            self.isb_report_status_var.set(
+                "Rapport D1-D6 non encore généré; lancer l'analyse."
+            )
 
     def _captury_marker_display_transform(self) -> tuple[np.ndarray, np.ndarray] | None:
         report_path = self._selected_trial_report_path()
@@ -3040,8 +3219,9 @@ class CapturyBioBuddyGui(tk.Tk):
             filters = dict(payloads[0]["filters"])
             q_name = str(filters.get("q_name", ""))
             trial = str(filters.get("trial", ""))
+            source = str(filters.get("source", ""))
             if q_name and trial:
-                self._draw_kinematics_timeseries(axes, trial, q_name)
+                self._draw_kinematics_timeseries(axes, trial, q_name, source)
                 panel["figure"].tight_layout()
                 canvas.draw_idle()
                 return
@@ -3050,7 +3230,7 @@ class CapturyBioBuddyGui(tk.Tk):
         canvas.draw_idle()
 
     def _draw_kinematics_timeseries(
-        self, axes: object, trial: str, q_name: str
+        self, axes: object, trial: str, q_name: str, source: str = ""
     ) -> None:
         path = self._kinematics_timeseries_path(trial)
         dataframe = self._read_timeseries_table(
@@ -3063,6 +3243,8 @@ class CapturyBioBuddyGui(tk.Tk):
             axes.set_title("Aucune cinématique temporelle")
             return
         values = dataframe[dataframe["q_name"].astype(str) == q_name].copy()
+        if source and "source" in values.columns:
+            values = values[values["source"].astype(str) == source]
         if values.empty:
             axes.set_title(f"Aucune donnée temporelle: {q_name}")
             return
@@ -3075,7 +3257,7 @@ class CapturyBioBuddyGui(tk.Tk):
             y = self._values_for_display(y, column, q_name=q_name)
             color = (
                 data_source_color(column)
-                if column in {"captury", "motive", "captury_c3d"}
+                if column in {"captury", "motive", "biobuddy", "captury_c3d"}
                 else "#64748b"
             )
             axes.plot(values["time"], y, label=column, color=color)
@@ -3084,7 +3266,8 @@ class CapturyBioBuddyGui(tk.Tk):
             and values["captury_c3d"].astype(float).notna().any()
         )
         unit = "deg" if self._is_rotation_q_name(q_name) or has_c3d_angles else "native"
-        axes.set_title(f"{trial} - {q_name}")
+        source_suffix = f" - {source}" if source else ""
+        axes.set_title(f"{trial} - {q_name}{source_suffix}")
         axes.set_xlabel("Temps (s)")
         axes.set_ylabel(unit)
         axes.legend()
@@ -3119,7 +3302,14 @@ class CapturyBioBuddyGui(tk.Tk):
                 series.append(
                     {
                         "metric": metric,
-                        "label": filters["q_name"],
+                        "label": " / ".join(
+                            value
+                            for value in (
+                                filters.get("source", ""),
+                                filters["q_name"],
+                            )
+                            if value
+                        ),
                         "values": values.to_numpy(),
                     }
                 )
@@ -3597,6 +3787,28 @@ class CapturyBioBuddyGui(tk.Tk):
     def _var_values(self) -> dict[str, object]:
         return {name: variable.get() for name, variable in self.vars.items()}
 
+    def _restore_gui_session_state(self) -> None:
+        """Restore paths and trial selection without restoring viewer visibility."""
+
+        for name, value in load_gui_session_state(self.gui_session_state_path).items():
+            variable = self.vars.get(name)
+            if variable is not None:
+                variable.set(value)
+
+    def _save_gui_session_state(self) -> None:
+        """Persist the minimal context needed to rediscover cached results."""
+
+        save_gui_session_state(self.gui_session_state_path, self._var_values())
+
+    def _on_close(self) -> None:
+        """Save the reopen context and close the Tk application."""
+
+        try:
+            self._save_gui_session_state()
+        except OSError as exc:
+            self._append_log(f"\nÉtat GUI non sauvegardé: {exc}\n")
+        self.destroy()
+
     def _split_extra_labels(self) -> list[str]:
         return split_extra_labels(self._var_values())
 
@@ -3661,6 +3873,7 @@ class CapturyBioBuddyGui(tk.Tk):
         self._populate_occlusion_table()
         self._update_embedded_trial_viewer()
         self._update_run_report_summary()
+        self._refresh_isb_report_table()
         self._run_selected_trial_auto_analysis()
 
     def _update_inventory_table(self) -> None:

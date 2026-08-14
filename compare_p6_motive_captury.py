@@ -54,7 +54,12 @@ from mocap_labels import (
     marker_display_labels,
     marker_indices_by_display_label,
 )
-from model_comparison_metrics import joint_center_error_xyz, waveform_metrics
+from model_comparison_metrics import (
+    aggregate_trial_metrics_by_participant,
+    bland_altman,
+    joint_center_error_xyz,
+    waveform_metrics,
+)
 from run_biobuddy_c3d_ik import run_direct_biobuddy_ik
 from spatial_calibration import (
     RowRigidTransform,
@@ -71,6 +76,12 @@ from isb_segment_audit import (
     load_biobuddy_audit_sidecars,
     write_isb_d1_d3_audit,
 )
+from isb_compliance_report import (
+    build_isb_d1_d6_report,
+    build_reproducibility_manifest,
+    write_isb_d1_d6_report,
+    write_reproducibility_manifest,
+)
 from kinematic_rotations import (
     assess_rotation_source_equivalence,
     canonicalize_rotation_series,
@@ -78,6 +89,7 @@ from kinematic_rotations import (
     change_lab_basis,
     compare_segment_rotation_mappings,
     rotation_vector as canonical_rotation_vector,
+    slerp_rotation_series,
 )
 from joint_kinematics import (
     audit_joint_kinematics_source,
@@ -100,7 +112,7 @@ DEFAULT_DATA_ROOT = Path("local_trials/2026-06-30_P6_flat")
 DEFAULT_OUTPUT_ROOT = Path("out_p6_motive_captury_comparison")
 ANGLE_LABEL_REGEX = r"(?i)(^.*angles?$|^.*_angle[s]?$|angle)"
 FOOT_MARKER_PATTERN = r"(LFCC|RFCC|LFM|RFM|LDP|RDP|Foot|Toe|Heel)"
-CACHE_VERSION = 10
+CACHE_VERSION = 12
 ROTATION_SEQUENCE_ZXY = "ZXY"
 DEFAULT_ALIGNMENT_CALIBRATION_CENTRES = (
     "Hips",
@@ -118,6 +130,7 @@ SCIENTIFIC_IMPLEMENTATION_FILES = {
     "joint_kinematics_registry": Path(__file__).with_name("isb_joint_kinematics.json"),
     "joint_kinematics_code": Path(__file__).with_name("joint_kinematics.py"),
     "isb_segment_audit_code": Path(__file__).with_name("isb_segment_audit.py"),
+    "isb_compliance_report_code": Path(__file__).with_name("isb_compliance_report.py"),
     "spatial_calibration_code": Path(__file__).with_name("spatial_calibration.py"),
     "mocap_alignment_code": Path(__file__).with_name("mocap_alignment.py"),
     "captury_c3d_angle_decoder": Path(__file__).with_name("captury_c3d_angles.py"),
@@ -126,6 +139,7 @@ SCIENTIFIC_IMPLEMENTATION_FILES = {
     "temporal_synchronization_code": Path(__file__).with_name(
         "temporal_synchronization.py"
     ),
+    "comparison_metrics_code": Path(__file__).with_name("model_comparison_metrics.py"),
 }
 
 
@@ -159,6 +173,7 @@ class TrialBundle:
     motive_c3d: Path
     motive_bvh: Path | None
     motive_fbx: Path | None
+    participant: str | None = None
 
 
 @dataclass
@@ -325,6 +340,8 @@ def required_trial_outputs(
         trial_dir / "temporal_phase_normalized.npz",
         trial_dir / "phase_normalized_scientific_timeseries.npz",
         trial_dir / "contact_cycles.json",
+        trial_dir / "metric_quality.json",
+        trial_dir / "metric_sensitivity.json",
         trial_dir / "run_report.json",
     ]
     if include_rotation_audit:
@@ -459,6 +476,157 @@ def safe_name(value: str) -> str:
     return re.sub(r"[^0-9A-Za-z_.-]+", "_", value).strip("_") or "trial"
 
 
+def infer_participant_identifier(*paths: Path) -> str | None:
+    """Infer a participant token only from explicit P-prefixed file/path tokens."""
+
+    patterns = (
+        re.compile(r"(?i)(?:^|[_\-/])(P\d+)(?:[_\-/.]|$)"),
+        re.compile(r"(?i)(?:^|_)(P\d+)$"),
+    )
+    candidates: list[str] = []
+    for path in paths:
+        text = str(path)
+        for pattern in patterns:
+            match = pattern.search(text)
+            if match:
+                candidates.append(match.group(1).upper())
+                break
+    unique = sorted(set(candidates))
+    return unique[0] if len(unique) == 1 else None
+
+
+def normalize_summary_source(rows: list[dict[str, Any]], default: str) -> None:
+    """Replace absent/NaN source labels before CSV and population grouping."""
+
+    for row in rows:
+        value = row.get("source")
+        if value is None or (
+            isinstance(value, (float, np.floating)) and not np.isfinite(value)
+        ):
+            row["source"] = default
+        elif not str(value).strip() or str(value).strip().lower() == "nan":
+            row["source"] = default
+
+
+def metric_quality_report(rows: list[dict[str, Any]]) -> dict[str, Any]:
+    """Summarize waveform eligibility without converting frames into subjects."""
+
+    waveform_rows = [row for row in rows if "waveform_status" in row]
+    status_counts: dict[str, int] = {}
+    eligible = 0
+    for row in waveform_rows:
+        status = str(row["waveform_status"])
+        status_counts[status] = status_counts.get(status, 0) + 1
+        eligible += int(bool(row.get("shape_metrics_eligible", False)))
+    return {
+        "schema_version": 1,
+        "status": "ok" if waveform_rows else "no_waveform_metrics",
+        "statistical_unit": "trial_waveform",
+        "waveforms": len(waveform_rows),
+        "eligible_waveforms": eligible,
+        "ineligible_waveforms": len(waveform_rows) - eligible,
+        "descriptive_rows_excluded": len(rows) - len(waveform_rows),
+        "status_counts": status_counts,
+        "guarded_metrics": [
+            "nrmse_range",
+            "pearson_r_waveform",
+            "lin_ccc_waveform",
+        ],
+        "limits_of_agreement_scope": (
+            "descriptive_within_trial_frames_not_population_ci"
+        ),
+    }
+
+
+def metric_sensitivity_report(
+    *,
+    root_policies: dict[str, dict[str, Any]],
+    temporal: dict[str, Any],
+    evaluation_centre_rows: list[dict[str, Any]],
+    calibration_centre_rows: list[dict[str, Any]],
+    rotation_audits: dict[str, dict[str, Any]],
+) -> dict[str, Any]:
+    """Report already-computed counterfactuals without inventing new variants."""
+
+    root_report: dict[str, Any] = {}
+    for system in ("captury", "motive"):
+        policy = root_policies.get(system, {})
+        subtract = policy.get("score_mm_subtract_static_offset")
+        keep = policy.get("score_mm_keep_file_translation")
+        if isinstance(subtract, (float, int)) and isinstance(keep, (float, int)):
+            root_report[system] = {
+                "status": "computed",
+                "selected_mode": policy.get("selected_mode"),
+                "score_mm_subtract_static_offset": float(subtract),
+                "score_mm_keep_file_translation": float(keep),
+                "score_difference_mm": float(abs(float(keep) - float(subtract))),
+            }
+        else:
+            root_report[system] = {"status": "not_computed"}
+    before = temporal.get("normalized_rmse_before")
+    after = temporal.get("normalized_rmse_after")
+    temporal_report = {"status": "not_computed"}
+    if isinstance(before, (float, int)) and isinstance(after, (float, int)):
+        temporal_report = {
+            "status": "computed",
+            "estimated_lag_s": temporal.get("estimated_lag_s"),
+            "applied_lag_s": temporal.get("lag_s"),
+            "normalized_rmse_before": float(before),
+            "normalized_rmse_after": float(after),
+            "normalized_rmse_improvement": float(before) - float(after),
+        }
+
+    def median_metric(rows: list[dict[str, Any]], metric: str) -> float | None:
+        values = np.asarray(
+            [float(row.get(metric, np.nan)) for row in rows], dtype=float
+        )
+        values = values[np.isfinite(values)]
+        return float(np.median(values)) if values.size else None
+
+    evaluation = median_metric(evaluation_centre_rows, "median_error_mm")
+    calibration = median_metric(calibration_centre_rows, "median_error_mm")
+    centre_report: dict[str, Any] = {"status": "not_computed"}
+    if evaluation is not None and calibration is not None:
+        centre_report = {
+            "status": "computed",
+            "calibration_centres_median_error_mm": calibration,
+            "held_out_centres_median_error_mm": evaluation,
+            "held_out_minus_calibration_mm": evaluation - calibration,
+            "interpretation": "calibration_and_evaluation_sets_are_disjoint",
+        }
+    source_report: dict[str, Any] = {"status": "not_computed"}
+    computed_sources: dict[str, Any] = {}
+    for system, audit in rotation_audits.items():
+        summary = audit.get("summary", audit)
+        segments = summary.get("segments", {}) if isinstance(summary, dict) else {}
+        values = [
+            float(item["p95_geodesic_deg"])
+            for item in segments.values()
+            if isinstance(item, dict)
+            and isinstance(item.get("p95_geodesic_deg"), (float, int))
+        ]
+        if values:
+            computed_sources[system] = {
+                "segments": len(values),
+                "median_p95_geodesic_deg": float(np.median(values)),
+                "max_p95_geodesic_deg": float(np.max(values)),
+            }
+    if computed_sources:
+        source_report = {"status": "computed", "systems": computed_sources}
+    return {
+        "schema_version": 1,
+        "status": "diagnostic_counterfactuals",
+        "root_translation": root_report,
+        "temporal_lag": temporal_report,
+        "centre_definition": centre_report,
+        "bvh_fbx_source": source_report,
+        "axis_sequence_and_anatomical_frame": {
+            "status": "not_computed",
+            "reason": "requires_anatomically_valid_counterfactual_models",
+        },
+    }
+
+
 def discover_trials(data_root: Path) -> list[TrialBundle]:
     if (data_root / "Captury").is_dir() and (data_root / "Motive").is_dir():
         return discover_flat_trials(data_root)
@@ -484,6 +652,7 @@ def discover_trials(data_root: Path) -> list[TrialBundle]:
                 motive_c3d=motive_c3ds[0],
                 motive_bvh=motive_bvhs[0] if motive_bvhs else None,
                 motive_fbx=motive_fbxs[0] if motive_fbxs else None,
+                participant=infer_participant_identifier(captury_c3d, motive_c3ds[0]),
             )
         )
     return trials
@@ -535,6 +704,9 @@ def discover_flat_trials(data_root: Path) -> list[TrialBundle]:
                 motive_c3d=motive[trial]["c3d"],
                 motive_bvh=motive[trial].get("bvh"),
                 motive_fbx=motive[trial].get("fbx"),
+                participant=infer_participant_identifier(
+                    captury[trial]["c3d"], motive[trial]["c3d"]
+                ),
             )
         )
     return trials
@@ -683,6 +855,8 @@ def comparison_derived_artifacts(
             "captury_c3d_angle_decode",
             "captury_c3d_angle_metrics",
             "captury_c3d_angle_timeseries",
+            "metric_quality",
+            "metric_sensitivity",
         ):
             output_path = report.get("outputs", {}).get(output_name)
             if output_path:
@@ -1261,13 +1435,36 @@ def segment_relative_q_metric_rows(
 
     summary_rows: list[dict[str, Any]] = []
     timeseries_rows: list[dict[str, Any]] = []
-    captury_curves = segment_relative_rotation_curves(captury_rotations)
     motive_curves = segment_relative_rotation_curves(motive_rotations)
     component_names = ("x", "y", "z")
+    captury_curves: dict[str, np.ndarray] = {}
+    for joint, proximal, distal in SEGMENT_RELATIVE_ROTATION_PAIRS:
+        if (
+            proximal not in captury_rotations
+            or distal not in captury_rotations
+            or joint not in motive_curves
+        ):
+            continue
+        overlap = (motive_time >= captury_time[0]) & (motive_time <= captury_time[-1])
+        target_time = motive_time[overlap]
+        values = np.full((3, motive_time.size), np.nan, dtype=float)
+        if target_time.size:
+            proximal_on_motive = slerp_rotation_series(
+                captury_rotations[proximal], captury_time, target_time
+            )
+            distal_on_motive = slerp_rotation_series(
+                captury_rotations[distal], captury_time, target_time
+            )
+            for target_index in range(target_time.size):
+                values[:, np.flatnonzero(overlap)[target_index]] = (
+                    rotation_deviation_vector(
+                        proximal_on_motive[:, :, target_index],
+                        distal_on_motive[:, :, target_index],
+                    )
+                )
+        captury_curves[joint] = values
     for joint in sorted(set(captury_curves).intersection(motive_curves)):
-        cap_curve = interpolate_finite_array(
-            captury_curves[joint], captury_time, motive_time
-        )
+        cap_curve = captury_curves[joint]
         mot_curve = motive_curves[joint]
         n_frames = min(cap_curve.shape[1], mot_curve.shape[1], motive_time.shape[0])
         if n_frames <= 0:
@@ -1284,7 +1481,12 @@ def segment_relative_q_metric_rows(
                     "q_name": q_name,
                     "unit": "rad",
                     "source": "segment_relative_rotation",
-                    **waveform_metrics(reference, test, "rad"),
+                    **waveform_metrics(
+                        reference,
+                        test,
+                        "rad",
+                        time=motive_time[:n_frames],
+                    ),
                 }
             )
             for frame, time_value in enumerate(motive_time[:n_frames]):
@@ -1293,6 +1495,7 @@ def segment_relative_q_metric_rows(
                         "trial": trial,
                         "time": float(time_value),
                         "q_name": q_name,
+                        "source": "segment_relative_rotation",
                         "motive": float(reference[frame]),
                         "captury": float(test[frame]),
                         "difference": float(test[frame] - reference[frame]),
@@ -1319,6 +1522,8 @@ def _source_joint_articulations(
         result[articulation_id] = {
             "proximal": segment_names[proximal],
             "distal": segment_names[distal],
+            "proximal_segment_id": proximal,
+            "distal_segment_id": distal,
         }
     return result
 
@@ -1497,9 +1702,7 @@ def segment_rotation_metric_rows(
             reference_time <= source_time[-1]
         )
         reference_indices = np.flatnonzero(overlap_mask)
-        source_indices = nearest_time_indices(
-            source_time, reference_time[reference_indices]
-        )
+        overlap_time = reference_time[reference_indices]
         common_segments = sorted(
             set(reference_rotations).intersection(source_rotations)
         )
@@ -1512,13 +1715,14 @@ def segment_rotation_metric_rows(
                 source_rotations[segment],
                 context=f"segment metric {source}/{segment}",
             )
+            source_on_reference = slerp_rotation_series(
+                source_series, source_time, overlap_time
+            )
             values: list[dict[str, Any]] = []
-            for reference_frame, source_frame in zip(
-                reference_indices, source_indices, strict=True
-            ):
+            for overlap_frame, reference_frame in enumerate(reference_indices):
                 vector_rad = rotation_deviation_vector(
                     reference_series[:, :, reference_frame],
-                    source_series[:, :, source_frame],
+                    source_on_reference[:, :, overlap_frame],
                 )
                 vector_deg = np.degrees(vector_rad)
                 global_deg = float(np.linalg.norm(vector_deg))
@@ -1529,6 +1733,7 @@ def segment_rotation_metric_rows(
                     "segment": segment,
                     "time": float(reference_time[reference_frame]),
                     "global_deg": global_deg,
+                    "geodesic_deg": global_deg,
                     "x_deg": float(vector_deg[0]),
                     "y_deg": float(vector_deg[1]),
                     "z_deg": float(vector_deg[2]),
@@ -1541,9 +1746,20 @@ def segment_rotation_metric_rows(
             if not values:
                 continue
             global_values = np.asarray([row["global_deg"] for row in values])
+            signed_x = np.asarray([row["x_deg"] for row in values])
+            signed_y = np.asarray([row["y_deg"] for row in values])
+            signed_z = np.asarray([row["z_deg"] for row in values])
             abs_x = np.asarray([row["abs_x_deg"] for row in values])
             abs_y = np.asarray([row["abs_y_deg"] for row in values])
             abs_z = np.asarray([row["abs_z_deg"] for row in values])
+            component_agreement = {
+                axis: bland_altman(np.zeros(component.shape), component)
+                for axis, component in (
+                    ("x", signed_x),
+                    ("y", signed_y),
+                    ("z", signed_z),
+                )
+            }
             summary_rows.append(
                 {
                     "trial": trial,
@@ -1553,12 +1769,33 @@ def segment_rotation_metric_rows(
                     "median_global_deg": float(np.nanmedian(global_values)),
                     "p95_global_deg": float(np.nanpercentile(global_values, 95)),
                     "max_global_deg": float(np.nanmax(global_values)),
+                    "median_geodesic_deg": float(np.nanmedian(global_values)),
+                    "p95_geodesic_deg": float(np.nanpercentile(global_values, 95)),
+                    "max_geodesic_deg": float(np.nanmax(global_values)),
+                    "rmse_global_deg": float(np.sqrt(np.nanmean(global_values**2))),
+                    "rmse_geodesic_deg": float(np.sqrt(np.nanmean(global_values**2))),
                     "median_abs_x_deg": float(np.nanmedian(abs_x)),
                     "median_abs_y_deg": float(np.nanmedian(abs_y)),
                     "median_abs_z_deg": float(np.nanmedian(abs_z)),
                     "p95_abs_x_deg": float(np.nanpercentile(abs_x, 95)),
                     "p95_abs_y_deg": float(np.nanpercentile(abs_y, 95)),
                     "p95_abs_z_deg": float(np.nanpercentile(abs_z, 95)),
+                    **{
+                        f"bias_{axis}_deg": agreement["bias"]
+                        for axis, agreement in component_agreement.items()
+                    },
+                    **{
+                        f"loa_lower_{axis}_deg": agreement["loa_lower"]
+                        for axis, agreement in component_agreement.items()
+                    },
+                    **{
+                        f"loa_upper_{axis}_deg": agreement["loa_upper"]
+                        for axis, agreement in component_agreement.items()
+                    },
+                    "paired_frames": len(values),
+                    "limits_of_agreement_scope": (
+                        "descriptive_within_trial_frames_not_population_ci"
+                    ),
                     "reference_max_projection_frobenius": reference_quality[
                         "max_projection_frobenius"
                     ],
@@ -2134,7 +2371,8 @@ def q_metric_rows(
                 "trial": trial,
                 "q_name": q_name,
                 "unit": unit,
-                **waveform_metrics(mot_curve, cap_curve, unit),
+                "source": "captury",
+                **waveform_metrics(mot_curve, cap_curve, unit, time=motive.time),
             }
         )
         for i, time_value in enumerate(motive.time):
@@ -2143,6 +2381,7 @@ def q_metric_rows(
                     "trial": trial,
                     "time": float(time_value),
                     "q_name": q_name,
+                    "source": "captury",
                     "motive": mot_curve[i],
                     "captury": cap_curve[i],
                     "difference": cap_curve[i] - mot_curve[i],
@@ -2171,7 +2410,7 @@ def q_metric_rows_with_optional_biobuddy(
                 "q_name": q_name,
                 "unit": unit,
                 "source": "biobuddy_ik",
-                **waveform_metrics(mot_curve, bio_curve, unit),
+                **waveform_metrics(mot_curve, bio_curve, unit, time=motive.time),
             }
         )
         for i, time_value in enumerate(motive.time):
@@ -2180,6 +2419,7 @@ def q_metric_rows_with_optional_biobuddy(
                     "trial": trial,
                     "time": float(time_value),
                     "q_name": q_name,
+                    "source": "biobuddy_ik",
                     "motive": mot_curve[i],
                     "captury": np.nan,
                     "biobuddy": bio_curve[i],
@@ -2275,6 +2515,7 @@ def captury_c3d_angle_rows(
                         "trial": trial,
                         "time": float(time_value),
                         "q_name": q_name,
+                        "source": "captury_c3d",
                         "captury_c3d": float(values[frame_index]),
                         "articulation": decoded_channel.get("articulation"),
                         "source_component": axis_name,
@@ -3340,6 +3581,18 @@ def metric_columns(df: pd.DataFrame, exclude: set[str]) -> list[str]:
     return columns
 
 
+METRIC_FIGURE_METADATA_COLUMNS = {
+    "paired_samples",
+    "paired_frames",
+    "paired_coverage",
+    "minimum_paired_samples",
+    "minimum_paired_coverage",
+    "minimum_amplitude_rad",
+    "minimum_amplitude_native",
+    "shape_metrics_eligible",
+}
+
+
 def plot_metric_barh(
     df: pd.DataFrame,
     category: str,
@@ -3392,7 +3645,10 @@ def generate_metric_figures(
     figures_dir = out_dir / "figures"
     if centre_rows:
         centre_df = pd.DataFrame(centre_rows)
-        for metric in metric_columns(centre_df, {"trial", "joint", "n_frames"}):
+        for metric in metric_columns(
+            centre_df,
+            {"trial", "joint", "n_frames", *METRIC_FIGURE_METADATA_COLUMNS},
+        ):
             path = plot_metric_barh(
                 centre_df,
                 category="joint",
@@ -3405,7 +3661,17 @@ def generate_metric_figures(
                 figure_paths["joint_centres"].append(str(path))
     if q_rows:
         q_df = pd.DataFrame(q_rows)
-        for metric in metric_columns(q_df, {"trial", "q_name", "unit"}):
+        for metric in metric_columns(
+            q_df,
+            {
+                "trial",
+                "q_name",
+                "unit",
+                "source",
+                "participant",
+                *METRIC_FIGURE_METADATA_COLUMNS,
+            },
+        ):
             path = plot_metric_barh(
                 q_df,
                 category="q_name",
@@ -4002,6 +4268,32 @@ def compare_trial(
             row["family"] = family
         normalized_scientific_rows.extend(normalized)
     cycles = contact_cycle_report(contact_rows)
+    summary_tables = (
+        centre_rows,
+        calibration_centre_rows,
+        q_rows,
+        c3d_angle_rows,
+        segment_rows,
+        dimension_rows,
+        marker_rows,
+    )
+    for rows in summary_tables:
+        for row in rows:
+            row.setdefault("participant", bundle.participant or "")
+    quality = metric_quality_report(q_rows)
+    sensitivity = metric_sensitivity_report(
+        root_policies={
+            "captury": captury.root_offset_policy,
+            "motive": motive.root_offset_policy,
+        },
+        temporal=temporal_synchronization,
+        evaluation_centre_rows=centre_rows,
+        calibration_centre_rows=calibration_centre_rows,
+        rotation_audits={
+            "captury": captury_source_audit,
+            "motive": motive_source_audit,
+        },
+    )
     write_rows(trial_dir / "joint_centre_metrics.csv", centre_rows)
     write_table_npz(trial_dir / "joint_centre_timeseries.npz", centre_ts_rows)
     write_rows(
@@ -4045,6 +4337,12 @@ def compare_trial(
     )
     contact_cycles_path = trial_dir / "contact_cycles.json"
     contact_cycles_path.write_text(json.dumps(cycles, indent=2), encoding="utf-8")
+    metric_quality_path = trial_dir / "metric_quality.json"
+    metric_quality_path.write_text(json.dumps(quality, indent=2), encoding="utf-8")
+    metric_sensitivity_path = trial_dir / "metric_sensitivity.json"
+    metric_sensitivity_path.write_text(
+        json.dumps(sensitivity, indent=2), encoding="utf-8"
+    )
     plot_metric_barh(
         pd.DataFrame(dimension_rows),
         category="dimension",
@@ -4064,6 +4362,7 @@ def compare_trial(
     vertical_report = vertical_amplitude_report(enriched_c3d)
     report: dict[str, Any] = {
         "trial": bundle.name,
+        "participant": bundle.participant,
         "files": {
             "captury_c3d": str(bundle.captury_c3d),
             "captury_bvh": str(bundle.captury_bvh) if bundle.captury_bvh else None,
@@ -4110,6 +4409,7 @@ def compare_trial(
         "outputs": {
             "enriched_c3d": str(enriched_c3d),
             "joint_centre_metrics": str(trial_dir / "joint_centre_metrics.csv"),
+            "joint_centre_timeseries": str(trial_dir / "joint_centre_timeseries.npz"),
             "alignment_calibration_centre_metrics": str(
                 trial_dir / "alignment_calibration_centre_metrics.csv"
             ),
@@ -4118,6 +4418,7 @@ def compare_trial(
             ),
             "spatial_calibration": str(spatial_calibration_path),
             "kinematics_q_metrics": str(trial_dir / "kinematics_q_metrics.csv"),
+            "kinematics_q_timeseries": str(trial_dir / "kinematics_q_timeseries.npz"),
             "captury_c3d_angle_metrics": str(
                 trial_dir / "captury_c3d_angle_metrics.csv"
             ),
@@ -4146,6 +4447,8 @@ def compare_trial(
                 trial_dir / "phase_normalized_scientific_timeseries.npz"
             ),
             "contact_cycles": str(contact_cycles_path),
+            "metric_quality": str(metric_quality_path),
+            "metric_sensitivity": str(metric_sensitivity_path),
             "model_dimensions": str(trial_dir / "model_dimensions.csv"),
             "skin_marker_correspondence_metrics": str(
                 trial_dir / "skin_marker_correspondence_metrics.csv"
@@ -4166,6 +4469,8 @@ def compare_trial(
         },
         "trial_events": event_report,
         "contact_cycles": cycles,
+        "metric_quality": quality,
+        "metric_sensitivity": sensitivity,
         "segment_rotations": segment_report,
         "joint_kinematics_d4_d6": {
             source: {
@@ -4536,8 +4841,9 @@ def main() -> None:
         return
 
     biobuddy_audit_evidence = load_biobuddy_audit_sidecars(args.biobuddy_biomod)
+    convention_registry = load_kinematic_conventions()
     isb_audit = build_isb_d1_d3_audit(
-        load_kinematic_conventions(),
+        convention_registry,
         biomod_verification=biobuddy_audit_evidence["biomod_verification"],
         static_evaluation=biobuddy_audit_evidence["static_evaluation"],
     )
@@ -4607,6 +4913,8 @@ def main() -> None:
             all_marker_rows.extend(pd.read_csv(marker_csv).to_dict("records"))
         if segment_csv.exists() and segment_csv.stat().st_size:
             all_segment_rows.extend(pd.read_csv(segment_csv).to_dict("records"))
+    normalize_summary_source(all_q_rows, "captury")
+    normalize_summary_source(all_centre_rows, "captury")
     write_rows(args.out_dir / "all_joint_centre_metrics.csv", all_centre_rows)
     write_rows(args.out_dir / "all_kinematics_q_metrics.csv", all_q_rows)
     write_rows(args.out_dir / "all_motive_marker_occlusions.csv", all_occlusion_rows)
@@ -4614,6 +4922,107 @@ def main() -> None:
     write_rows(args.out_dir / "all_segment_rotation_metrics.csv", all_segment_rows)
     write_rows(
         args.out_dir / "all_skin_marker_correspondence_metrics.csv", all_marker_rows
+    )
+    population_q_rows, population_q_report = aggregate_trial_metrics_by_participant(
+        all_q_rows,
+        metric_keys=(
+            "bias_rad",
+            "mae_rad",
+            "rmse_rad",
+            "bias_native",
+            "mae_native",
+            "rmse_native",
+            "nrmse_range",
+            "linear_gain",
+            "linear_offset_rad",
+            "reference_rom_rad",
+            "test_rom_rad",
+            "rom_difference_rad",
+            "max_time_difference_s",
+            "min_time_difference_s",
+        ),
+        group_keys=("trial", "source", "q_name"),
+    )
+    population_centre_rows, population_centre_report = (
+        aggregate_trial_metrics_by_participant(
+            all_centre_rows,
+            metric_keys=(
+                "median_error_mm",
+                "p95_error_mm",
+                "mae_euclidean",
+                "rmse_euclidean",
+            ),
+            group_keys=("trial", "source", "joint"),
+        )
+    )
+    population_segment_rows, population_segment_report = (
+        aggregate_trial_metrics_by_participant(
+            all_segment_rows,
+            metric_keys=(
+                "median_global_deg",
+                "p95_global_deg",
+                "rmse_global_deg",
+                "median_abs_x_deg",
+                "median_abs_y_deg",
+                "median_abs_z_deg",
+            ),
+            group_keys=("trial", "reference", "source", "segment"),
+        )
+    )
+    population_q_path = args.out_dir / "population_kinematics_summary.csv"
+    population_centre_path = args.out_dir / "population_joint_centre_summary.csv"
+    population_segment_path = args.out_dir / "population_segment_summary.csv"
+    population_report_path = args.out_dir / "population_aggregation.json"
+    write_rows(population_q_path, population_q_rows)
+    write_rows(population_centre_path, population_centre_rows)
+    write_rows(population_segment_path, population_segment_rows)
+    population_report = {
+        "schema_version": 1,
+        "statistical_unit": "participant",
+        "frames_used_as_population_observations": False,
+        "excluded_from_population_aggregation": {
+            "limits_of_agreement": (
+                "frame-level descriptive bounds are not population LoA"
+            ),
+            "pearson_r_waveform": "requires Fisher-z aggregation",
+            "lin_ccc_waveform": "requires a dedicated repeated-measures model",
+        },
+        "kinematics": population_q_report,
+        "joint_centres": population_centre_report,
+        "segments": population_segment_report,
+        "outputs": {
+            "kinematics": str(population_q_path),
+            "joint_centres": str(population_centre_path),
+            "segments": str(population_segment_path),
+        },
+    }
+    population_report_path.write_text(
+        json.dumps(population_report, indent=2), encoding="utf-8"
+    )
+    scientific_artifacts.update(
+        {
+            "scientific/population_kinematics": population_q_path,
+            "scientific/population_joint_centres": population_centre_path,
+            "scientific/population_segments": population_segment_path,
+            "scientific/population_aggregation": population_report_path,
+        }
+    )
+    isb_d1_d6_report = build_isb_d1_d6_report(
+        isb_audit, provenance_reports, convention_registry
+    )
+    isb_d1_d6_paths = write_isb_d1_d6_report(args.out_dir, isb_d1_d6_report)
+    reproducibility_manifest = build_reproducibility_manifest(
+        args.out_dir, provenance_reports
+    )
+    reproducibility_manifest_path = write_reproducibility_manifest(
+        args.out_dir, reproducibility_manifest
+    )
+    scientific_artifacts.update(
+        {
+            "scientific/isb_d1_d6_json": isb_d1_d6_paths["json"],
+            "scientific/isb_d1_d6_table": isb_d1_d6_paths["table"],
+            "scientific/reproducibility_manifest": reproducibility_manifest_path,
+        }
     )
     figures = (
         {
@@ -4684,7 +5093,13 @@ def main() -> None:
                     "summary": str(isb_audit_paths["json"]),
                     "table": str(isb_audit_paths["table"]),
                 },
+                "isb_d1_d6_report": {
+                    "summary": str(isb_d1_d6_paths["json"]),
+                    "table": str(isb_d1_d6_paths["table"]),
+                },
+                "reproducibility_manifest": str(reproducibility_manifest_path),
                 "figures": figures,
+                "population_aggregation": population_report,
                 "reports": reports,
             },
             indent=2,
@@ -4704,6 +5119,8 @@ def main() -> None:
         print(f"Figures: {args.out_dir / 'figures'}")
     print(f"Report: {args.out_dir / 'run_report.json'}")
     print(f"ISB D1-D3 audit: {isb_audit_paths['json']}")
+    print(f"ISB D1-D6 report: {isb_d1_d6_paths['json']}")
+    print(f"Reproducibility manifest: {reproducibility_manifest_path}")
     print(f"Provenance: {provenance_path}")
 
 

@@ -85,6 +85,56 @@ def summarize_run_report(report: Mapping[str, Any]) -> str:
         if isinstance(prominence, (float, int)):
             line += f", proéminence={float(prominence):.3f}"
         lines.append(line)
+    metric_quality = report.get("metric_quality", {})
+    if isinstance(metric_quality, Mapping) and metric_quality:
+        total = metric_quality.get("waveforms")
+        eligible = metric_quality.get("eligible_waveforms")
+        if isinstance(total, int) and isinstance(eligible, int):
+            lines.append(f"Forme cinématique: {eligible}/{total} courbes éligibles")
+        status_counts = metric_quality.get("status_counts", {})
+        if isinstance(status_counts, Mapping):
+            low_reference = status_counts.get("low_reference_amplitude", 0)
+            low_test = status_counts.get("low_test_amplitude", 0)
+            insufficient_pairs = status_counts.get("insufficient_pairs", 0)
+            insufficient_coverage = status_counts.get("insufficient_coverage", 0)
+            unknown_native = status_counts.get("unknown_native_scale", 0)
+            details: list[str] = []
+            if isinstance(low_reference, int) and low_reference:
+                details.append(f"faible amplitude référence: {low_reference}")
+            if isinstance(low_test, int) and low_test:
+                details.append(f"faible amplitude test: {low_test}")
+            if isinstance(insufficient_pairs, int) and insufficient_pairs:
+                details.append(f"paires insuffisantes: {insufficient_pairs}")
+            if isinstance(insufficient_coverage, int) and insufficient_coverage:
+                details.append(f"couverture insuffisante: {insufficient_coverage}")
+            if isinstance(unknown_native, int) and unknown_native:
+                details.append(f"seuil natif inconnu: {unknown_native}")
+            if details:
+                lines.append("Garde-fous: " + ", ".join(details))
+    sensitivity = report.get("metric_sensitivity", {})
+    if isinstance(sensitivity, Mapping) and sensitivity:
+        root = sensitivity.get("root_translation", {})
+        if isinstance(root, Mapping):
+            for system in ("captury", "motive"):
+                system_root = root.get(system, {})
+                if not isinstance(system_root, Mapping):
+                    continue
+                score = system_root.get("score_difference_mm")
+                if system_root.get("status") == "computed" and isinstance(
+                    score, (float, int)
+                ):
+                    lines.append(
+                        "Sensibilité offset translation racine "
+                        f"{system.capitalize()}: {float(score):.2f} mm"
+                    )
+        temporal = sensitivity.get("temporal_lag", {})
+        if isinstance(temporal, Mapping) and temporal.get("status") == "computed":
+            improvement = temporal.get("normalized_rmse_improvement")
+            if isinstance(improvement, (float, int)):
+                lines.append(
+                    "Sensibilité synchronisation: gain RMSE normalisée "
+                    f"{float(improvement):+.4f}"
+                )
     return (
         "\n".join(lines) if lines else "Rapport disponible, aucun choix critique listé."
     )
