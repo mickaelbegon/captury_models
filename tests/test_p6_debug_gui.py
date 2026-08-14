@@ -307,6 +307,27 @@ class P6DebugGuiTests(unittest.TestCase):
         self.assertEqual(biobuddy_button.state, "normal")
         self.assertFalse(gui.viewer_cor_layer_vars["biobuddy"].get())
 
+    def test_restored_biobuddy_layer_is_available_but_not_checked(self) -> None:
+        gui = self.make_gui_stub()
+        gui.viewer_cor_layer_vars = {
+            "captury": FakeVar(True),
+            "motive": FakeVar(True),
+            "biobuddy": FakeVar(False),
+        }
+        biobuddy_button = FakeButton()
+        gui.viewer_cor_layer_checks = {"biobuddy": biobuddy_button}
+        gui.embedded_viewer = SimpleNamespace(
+            chain_data=JointCentreChainData(
+                layers={"biobuddy": {"Hips": np.zeros((1, 3))}},
+                edges=[],
+            )
+        )
+
+        CapturyBioBuddyGui._update_cor_layer_check_states(gui)
+
+        self.assertEqual(biobuddy_button.state, "normal")
+        self.assertFalse(gui.viewer_cor_layer_vars["biobuddy"].get())
+
     def test_visible_cor_update_applies_rotate_body_segments_to_viewer(self) -> None:
         gui = self.make_gui_stub()
         gui.viewer_cor_layer_vars = {

@@ -106,6 +106,7 @@ The small `Commande` button in the bottom-left corner opens a compact command po
 The GUI tabs are organized for the Captury/Motive analysis:
 
 - `Données`: choose the flattened `Captury/` + `Motive/` data root, output folder, static trial, model source and model-to-C3D axis conversion. The detected files are inventoried in a table, and the global trial menu in the top-right corner applies to every tab. The local P6 debug preset remains available from the CLI with `--p6-debug`.
+- On exit, the GUI remembers the data root, output folder, BioBuddy model and selected trial in `~/.config/captury_models/gui_session.json`. On reopening, cached `joint_centre_timeseries.npz` results make the BioBuddy CoR checkbox available again when that layer exists; the checkbox remains unchecked until the user selects it.
 - `BioBuddy`: create a `bioMod` directly from a folder of calibration C3D files with BioBuddy's `create_model_from_c3d_folder`, including the Motive 57 preset.
 - `Occlusions`: analyze missing Motive marker trajectories in a sortable table with clean marker names.
 - `Découpage`: estimate movement start/end and ground contacts from foot-marker kinematics, synchronize the Captury clock to Motive, normalize the selected phase to 0-100 %, and open the selected trial in the lightweight 3D C3D viewer.

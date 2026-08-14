@@ -77,6 +77,11 @@ from gui_marker_correspondence import (
     tree_values_to_payload,
 )
 from gui_run_report import summarize_run_report
+from gui_state import (
+    default_gui_session_state_path,
+    load_gui_session_state,
+    save_gui_session_state,
+)
 from gui_isb_report import (
     SOURCE_IDS_BY_LABEL,
     SOURCE_LABELS,
@@ -329,12 +334,15 @@ class CapturyBioBuddyGui(tk.Tk):
 
         self.vars: dict[str, tk.Variable] = {}
         self._create_variables()
+        self.gui_session_state_path = default_gui_session_state_path()
+        self._restore_gui_session_state()
         self._configure_style()
         self._build_layout()
         self._bind_command_preview()
         self._update_biobuddy_biomod_status()
         self._update_command_preview()
         self._update_embedded_trial_viewer()
+        self.protocol("WM_DELETE_WINDOW", self._on_close)
         self.after(100, self._drain_output_queue)
 
     def _register_analysis_button(self, button: ttk.Button) -> ttk.Button:
@@ -3778,6 +3786,28 @@ class CapturyBioBuddyGui(tk.Tk):
 
     def _var_values(self) -> dict[str, object]:
         return {name: variable.get() for name, variable in self.vars.items()}
+
+    def _restore_gui_session_state(self) -> None:
+        """Restore paths and trial selection without restoring viewer visibility."""
+
+        for name, value in load_gui_session_state(self.gui_session_state_path).items():
+            variable = self.vars.get(name)
+            if variable is not None:
+                variable.set(value)
+
+    def _save_gui_session_state(self) -> None:
+        """Persist the minimal context needed to rediscover cached results."""
+
+        save_gui_session_state(self.gui_session_state_path, self._var_values())
+
+    def _on_close(self) -> None:
+        """Save the reopen context and close the Tk application."""
+
+        try:
+            self._save_gui_session_state()
+        except OSError as exc:
+            self._append_log(f"\nÉtat GUI non sauvegardé: {exc}\n")
+        self.destroy()
 
     def _split_extra_labels(self) -> list[str]:
         return split_extra_labels(self._var_values())
