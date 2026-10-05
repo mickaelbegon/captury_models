@@ -43,7 +43,7 @@ Commencer par le test ciblé correspondant au module modifié, par exemple :
 ```bash
 python -m unittest tests.test_mocap_units -v
 python -m unittest tests.test_joint_kinematics -v
-python -m unittest tests.test_gui_commands -v
+python -m unittest tests.test_gui_refactor_contracts -v
 ```
 
 Vérifier que le nom de module existe dans `tests/` avant d'utiliser l'exemple; plusieurs fichiers peuvent être testés en les énumérant. Pour une modification Python, lancer au minimum le ou les tests pertinents et `python -m py_compile chemin/vers/module.py`; étendre aux tests d'intégration ou à toute la suite selon le risque. Une GUI nécessite un smoke test réel si le changement touche son lancement ou son interaction. Ne pas lancer une analyse complète sur des données utilisateur sans nécessité. Rapporter séparément contrôles réussis, non lancés ou bloqués.
