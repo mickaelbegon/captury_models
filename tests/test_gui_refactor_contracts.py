@@ -26,7 +26,7 @@ from gui_graphs import (
     joint_centre_error_timeseries,
     joint_centre_error_timeseries_between,
 )
-from gui_commands import ROOT_OFFSET_MODE_LABELS
+from gui_commands import ROOT_OFFSET_MODE_LABELS, build_p6_args
 from gui_trial_viewer import JointCentreChainData, TkC3DTrialCanvas, local_chain_axes
 
 
@@ -62,6 +62,8 @@ def make_gui_stub() -> CapturyBioBuddyGui:
         "p6_auto_analyze",
         "p6_model_source",
         "p6_model_to_c3d_axis",
+        "p6_captury_model_to_c3d_axis",
+        "p6_motive_model_to_c3d_axis",
         "root_offset_mode",
         "c3d_angle_unit",
         "p6_reexpress_rotations_zxy",
@@ -100,6 +102,8 @@ def make_gui_stub() -> CapturyBioBuddyGui:
     gui.vars["p6_auto_analyze"].set(True)
     gui.vars["p6_model_source"].set("fbx")
     gui.vars["p6_model_to_c3d_axis"].set("auto")
+    gui.vars["p6_captury_model_to_c3d_axis"].set("auto")
+    gui.vars["p6_motive_model_to_c3d_axis"].set("auto")
     gui.vars["root_offset_mode"].set("auto")
     gui.vars["c3d_angle_unit"].set("deg")
     gui.vars["p6_reexpress_rotations_zxy"].set(False)
@@ -123,6 +127,46 @@ def make_gui_stub() -> CapturyBioBuddyGui:
 
 
 class GuiRefactorContracts(unittest.TestCase):
+    def test_p6_command_builder_emits_opt_in_captury_frame_corrections(self) -> None:
+        args = build_p6_args(
+            {
+                "p6_data_root": "data",
+                "p6_out_dir": "out",
+                "p6_static_trial": "Static",
+                "p6_model_source": "bvh",
+                "p6_model_to_c3d_axis": "auto",
+                "root_offset_mode": "auto",
+                "p6_captury_rename_axes": True,
+                "p6_captury_q_landmarks_json": "captury_q_landmarks.json",
+            }
+        )
+
+        self.assertIn("--captury-rename-axes", args)
+        self.assertIn("--captury-q-landmarks-json", args)
+        self.assertIn("captury_q_landmarks.json", args)
+        self.assertNotIn("--captury-calibrate-segment-frames", args)
+
+    def test_p6_command_builder_can_override_axes_per_system(self) -> None:
+        args = build_p6_args(
+            {
+                "p6_data_root": "data",
+                "p6_out_dir": "out",
+                "p6_static_trial": "Static",
+                "p6_model_source": "bvh",
+                "p6_model_to_c3d_axis": "auto",
+                "p6_captury_model_to_c3d_axis": "identity",
+                "p6_motive_model_to_c3d_axis": "y_up_to_z_up",
+                "root_offset_mode": "auto",
+            }
+        )
+
+        self.assertEqual(
+            args[args.index("--captury-model-to-c3d-axis") + 1], "identity"
+        )
+        self.assertEqual(
+            args[args.index("--motive-model-to-c3d-axis") + 1], "y_up_to_z_up"
+        )
+
     def test_p6_command_builder_contract(self) -> None:
         gui = make_gui_stub()
 

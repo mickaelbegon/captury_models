@@ -230,6 +230,16 @@ def append_p6_common_args(args: list[str], values: Mapping[str, object]) -> None
     append_value(args, values, "--model-source", "p6_model_source")
     append_root_offset_mode(args, values)
     append_value(args, values, "--model-to-c3d-axis", "p6_model_to_c3d_axis")
+    for system in ("captury", "motive"):
+        value = str(values.get(f"p6_{system}_model_to_c3d_axis", "auto")).strip()
+        if value and value != "auto":
+            args.extend([f"--{system}-model-to-c3d-axis", value])
+    append_value(
+        args,
+        values,
+        "--captury-q-landmarks-json",
+        "p6_captury_q_landmarks_json",
+    )
     append_value(args, values, "--biobuddy-biomod", "biobuddy_c3d_output")
     append_value(args, values, "--c3d-angle-unit", "c3d_angle_unit")
     append_value(args, values, "--landmark-map", "compare_landmark_map")
@@ -239,6 +249,18 @@ def append_p6_common_args(args: list[str], values: Mapping[str, object]) -> None
         values,
         "--captury-reorient-thigh-y-from-cor",
         "p6_captury_reorient_thigh_y_from_cor",
+    )
+    append_flag(
+        args,
+        values,
+        "--captury-rename-axes",
+        "p6_captury_rename_axes",
+    )
+    append_flag(
+        args,
+        values,
+        "--captury-calibrate-segment-frames",
+        "p6_captury_calibrate_segment_frames",
     )
     append_flag(
         args,

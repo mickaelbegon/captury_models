@@ -165,6 +165,9 @@ def transformed_marker_data(
         rate=data.rate,
         unit=data.unit,
         time=None if data.time is None else np.asarray(data.time, dtype=float).copy(),
+        display_labels=(
+            None if data.display_labels is None else list(data.display_labels)
+        ),
     )
 
 
@@ -247,11 +250,15 @@ def captury_marker_transform_from_c3d_layers(
     return kabsch_rows(np.vstack(reference_rows), np.vstack(moving_rows))
 
 
-def vertical_axis_label(kind: str) -> str:
+def vertical_axis_label(kind: str, system: str | None = None) -> str:
+    """Return the displayed native vertical-axis convention for one file."""
+
     normalized_kind = str(kind).strip().lower()
     if normalized_kind in {"bvh", "fbx"}:
         return "+Y modèle"
     if normalized_kind == "c3d":
+        if str(system or "").strip().lower() == "captury":
+            return "+Y labo"
         return "+Z labo"
     return "auto"
 
@@ -759,7 +766,13 @@ class TkC3DTrialCanvas(tk.Canvas):
         screen, depth = project_points(
             points, self.camera, center, scale, width, height
         )
-        display_labels = marker_display_labels(data.labels)
+        display_labels = (
+            list(data.display_labels)
+            if data.display_labels is not None
+            and len(data.display_labels) == len(data.labels)
+            else marker_display_labels(data.labels)
+        )
+        raw_display_labels = marker_display_labels(data.labels)
         for index in np.argsort(depth):
             point = points[:, index]
             if not np.all(np.isfinite(point)):
@@ -769,8 +782,10 @@ class TkC3DTrialCanvas(tk.Canvas):
             selected = (
                 label == self.selected_label
                 or display_label == self.selected_label
+                or raw_display_labels[index] == self.selected_label
                 or label in self.selected_markers.get(source, set())
                 or display_label in self.selected_markers.get(source, set())
+                or raw_display_labels[index] in self.selected_markers.get(source, set())
             )
             x = float(screen[0, index])
             y = float(screen[1, index])

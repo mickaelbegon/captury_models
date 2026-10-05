@@ -105,7 +105,7 @@ The small `Commande` button in the bottom-left corner opens a compact command po
 
 The GUI tabs are organized for the Captury/Motive analysis:
 
-- `Données`: choose the flattened `Captury/` + `Motive/` data root, output folder, static trial, model source and model-to-C3D axis conversion. The detected files are inventoried in a table, and the global trial menu in the top-right corner applies to every tab. The local P6 debug preset remains available from the CLI with `--p6-debug`.
+- `Données`: choose the flattened `Captury/` + `Motive/` data root, output folder, static trial, model source and model-to-C3D axis conversion. It also exposes the two opt-in Captury segment-frame corrections and the editable `captury_q_landmarks.json` alias map. The detected files are inventoried in a table, and the global trial menu in the top-right corner applies to every tab. The local P6 debug preset remains available from the CLI with `--p6-debug`.
 - On exit, the GUI remembers the data root, output folder, BioBuddy model and selected trial in `~/.config/captury_models/gui_session.json`. On reopening, cached `joint_centre_timeseries.npz` results make the BioBuddy CoR checkbox available again when that layer exists; the checkbox remains unchecked until the user selects it.
 - `BioBuddy`: create a `bioMod` directly from a folder of calibration C3D files with BioBuddy's `create_model_from_c3d_folder`, including the Motive 57 preset.
 - `Occlusions`: analyze missing Motive marker trajectories in a sortable table with clean marker names.
@@ -121,7 +121,7 @@ The GUI tabs are organized for the Captury/Motive analysis:
 
 The metric tabs contain embedded Matplotlib graphs instead of PNG previews. Each graph panel has a hierarchical selector (`trial -> metric -> component`) so a metric can be plotted globally or narrowed to a specific marker, segment, joint, landmark or q component. In the `Segments` tab, selecting a segment displays global and X/Y/Z rotation-deviation curves over time from `segment_rotation_timeseries.npz`; selecting a broader metric displays absolute-deviation boxplots by segment/source. Segment deviations are computed from `R_ref.T @ R_source` with the rotation-vector log map, then displayed in degrees. In the `Centres` tab, selecting a metric displays one time-distribution boxplot per joint centre from `joint_centre_timeseries.npz`; selecting a single joint displays its error curves over time, with Euclidean distance and absolute X/Y/Z components. In the `Cinématiques` tab, selecting one DoF displays its Motive, Captury and difference waveforms over time; selecting one Captury C3D angle channel displays the exported Captury C3D angle waveform. Selecting a metric such as `bias_rad`, `mae_rad`, `rmse_rad` or `c3d_mean_deg` displays one boxplot per DoF/channel. Rotation metrics and rotation waveforms are converted to degrees for display, while the output files keep the raw radian values when they come from model q.
 
-The model-centre workflow automatically handles the current P6 conventions by default: Captury BVH/FBX is treated as millimetres, Motive BVH/FBX as centimetres, and `--model-to-c3d-axis auto` currently resolves to the Y-up model -> Motive C3D Z-up conversion. Before writing `CAPJC_*` and `MOTJC_*` channels into enriched C3D copies, the Motive model chain is also yaw/translation-aligned to the Motive C3D marker cloud from 57-marker anatomical proxies, with a horizontal PCA fallback when too few proxies are available. The bottom-left `Log` button opens the live process log when needed.
+The model-centre workflow automatically handles the current P6 conventions by default: Captury BVH/FBX is treated as millimetres and its C3D remains in its native `+Y`-up laboratory frame; Motive BVH/FBX is treated as centimetres and its C3D is `+Z` up. With `--model-to-c3d-axis auto`, Captury model centres are therefore compared first with Captury C3D in `+Y`, while Motive model centres are compared with Motive C3D in `+Z`. Captury C3D is converted to the common `+Z` comparison frame only for Captury/Motive alignment and cross-system metrics. Before writing `CAPJC_*` and `MOTJC_*` channels into enriched C3D copies, the Motive model chain is also yaw/translation-aligned to the Motive C3D marker cloud from 57-marker anatomical proxies, with a horizontal PCA fallback when too few proxies are available. The bottom-left `Log` button opens the live process log when needed.
 
 Each full `compare_p6_motive_captury.py` comparison batch now writes `provenance_manifest.json` before scientific processing. It records the exact selected C3D/BVH/FBX/bioMod inputs, SHA-256 hashes, command, Python executable, dependency versions, matrix convention and unresolved convention blockers. It also records the generated `isb_d1_d3_audit.json` and `isb_d1_d3_audit.npz` artifacts. The specialized `--occlusions-only` path intentionally skips BioBuddy import and D1-D3 audit generation. A `comparison_readiness.status` of `diagnostic_only` means that the figures remain useful for diagnosis but must not be interpreted as final biomechanical agreement. The manifest does not yet recover every C3D sampling rate or proprietary exporter convention; these remain explicit G0/G2 tasks in the scientific roadmap.
 
@@ -147,7 +147,7 @@ and curve recipes. Table-like NPZ files and hierarchical D4-D6 angle series can
 therefore be reloaded without GUI code. The manifest reproduces stored curves;
 it does not turn unknown conventions into anatomically harmonized data.
 
-The detected-file tables show the vertical-axis convention used by the GUI: BVH/FBX model files are treated as `+Y modèle`, while C3D files are displayed and written in `+Z labo`.
+The detected-file tables show the vertical-axis convention used by the GUI: BVH/FBX model files are treated as `+Y modèle`; Captury C3D is displayed as `+Y labo`, whereas Motive C3D is displayed and written as `+Z labo`. The embedded viewer converts the Captury marker layer to the common frame before its Captury-to-Motive rigid overlay, while preserving the raw source file on disk.
 
 The selected trial's Motive and Captury C3D files are loaded as separate marker layers in the right-hand 3D viewer panel whenever both are available. C3D marker coordinates are converted automatically to millimetres from the C3D `POINT:UNITS` field before display, matching the CoR chains written in `joint_centre_timeseries.npz`. Captury C3D angle channels stored in the POINT section, such as `RHip`, `LKne` or labels matching `angle`, are excluded from marker layers and marker comparisons. They are extracted separately as kinematic channels. Marker colors use lighter source-code nuances, while CoR chains use the stronger Captury orange, Motive cyan and BioBuddy green colors. Marker layers and CoR chains have independent checkboxes, so Captury/Motive markers and Captury/Motive/BioBuddy kinematic chains can be toggled separately. Selecting a trial starts a lightweight cached analysis for that movement by default, using no meshes, no figures, no Rerun and no batch IK; this refreshes the metric tables and graphs without launching the heaviest options.
 
@@ -288,7 +288,7 @@ Useful generated files include:
 
 ## Root Translation Policy
 
-Captury exports may store a static root offset in the skeleton while also storing root position channels in laboratory coordinates. The generic policy remains `--root-offset-mode auto`: it builds both interpretations of the root translation q, with and without subtracting the static root offset, then keeps the better overlay. In the Captury/Motive comparison, Captury explicitly defaults to `--captury-root-offset-mode keep`, while Motive inherits the generic `auto` policy. The single-trial BVH/FBX pipeline scores in native model units. The Captury/Motive P6 pipeline first converts model centres to the C3D frame with `--model-to-c3d-axis`, scores automatic interpretations in millimetres against the matching C3D marker cloud, and writes the chosen policy in each trial report.
+Captury exports may store a static root offset in the skeleton while also storing root position channels in laboratory coordinates. The generic policy remains `--root-offset-mode auto`: it builds both interpretations of the root translation q, with and without subtracting the static root offset, then keeps the better overlay. In the Captury/Motive comparison, Captury explicitly defaults to `--captury-root-offset-mode keep`, while Motive inherits the generic `auto` policy. The single-trial BVH/FBX pipeline scores in native model units. The Captury/Motive P6 pipeline first converts each model into its *own* C3D basis with `--model-to-c3d-axis`, scores automatic interpretations in millimetres against that system's matching C3D marker cloud, and writes the chosen policy in each trial report.
 
 The selected policy is written to:
 
@@ -554,17 +554,74 @@ Each system writes `bvh_fbx_rotation_audit.json` plus a compressed `bvh_fbx_rota
 
 The within-system BVH/FBX rotation audit still compares elapsed timestamps without a separate lag estimate because both files are expected to originate from the same export. Cross-system Captury/Motive comparisons use the explicit synchronization policy above before interpolation. No path currently compensates clock drift.
 
-The model coordinates are converted from Y-up to the Motive C3D Z-up convention before writing C3D outputs:
+## Captury Coordinate Frames and Optional Q_* Corrections
 
-```bash
---model-to-c3d-axis auto
---root-offset-mode auto
+The current FBX/BVH model convention is `+Y` vertical. `--model-to-c3d-axis
+auto` keeps a Captury model in its own Captury C3D `+Y` frame, and maps a
+Motive model from `+Y` to its Motive C3D `+Z` frame:
+
+```text
+Captury model (+Y) -> Captury C3D (+Y): identity
+Motive  model (+Y) -> Motive  C3D (+Z): x'=x, y'=-z, z'=y
+Captury C3D (+Y) -> common comparison frame (+Z): x'=x, y'=-z, z'=y
 ```
 
-In concrete terms, the current FBX/BVH model convention is `+Y` vertical. The
-automatic conversion writes model coordinates into the Motive C3D laboratory
-frame as `x_c3d = x_model`, `y_c3d = -z_model`, `z_c3d = y_model`. BioBuddy
-exports the generated biorbd segments with `translations xyz` and
+The final Captury-to-Motive alignment uses only the last, comparison-stage
+conversion. It is deliberately not injected into Captury root-offset scoring
+or Captury-only segment-frame calibration. This distinction is recorded in
+`run_report.json -> axis_conversion` and `spatial_calibration.json` so an
+apparent offset can be traced to the correct stage.
+
+For a manual source-specific diagnostic, use
+`--captury-model-to-c3d-axis` and `--motive-model-to-c3d-axis` separately.
+The legacy shared `--model-to-c3d-axis` must remain `auto` for a two-system
+comparison: applying one manual basis to both systems would incorrectly rotate
+either Captury or Motive relative to its own C3D. The GUI exposes the same two
+source-specific menus in `Données` and `Modèles`.
+
+The GUI `Données` tab exposes two mutually exclusive, **unchecked by default**
+Captury options. They are also available from the CLI:
+
+```bash
+# Diagnostic baseline: a single local-axis rename for every Captury segment.
+python compare_p6_motive_captury.py ... --captury-rename-axes
+
+# Participant/source-specific static calibration from Captury data only.
+python compare_p6_motive_captury.py ... \
+  --captury-calibrate-segment-frames \
+  --captury-q-landmarks-json captury_q_landmarks.json
+```
+
+`--captury-rename-axes` right-multiplies every Captury local frame by the
+single matrix `R_y(+90 deg)`, which merely renames the local axes. It uses no
+marker or joint-centre data. It is kept as an explicit diagnostic baseline:
+when it does not resolve segment-specific discrepancies, that result shows
+why a global relabelling is not an anatomical calibration and must not be
+interpreted as ISB conformity.
+
+`--captury-calibrate-segment-frames` is the opt-in alternative. From the
+selected participant's **Captury static trial only**, it derives the pelvis
+target frame from the accepted `Q_Wa#1..#5` aliases and the left/right thigh
+target frames from the Captury hip-to-knee model-centre direction plus the
+accepted `Q_LK#1/#2` or `Q_RK#1/#2` transverse marker pair. Per-frame
+matrices are fitted as `C = R_source.T @ R_target`, robustly averaged on
+SO(3), and then applied as `R_target = R_source @ C` on that participant's
+dynamic trials. No Motive marker, Motive centre, Motive transform, or
+functional centre is used in this calibration. The matrices are frozen in
+`spatial_calibration.json`, reused only for the same `bvh` or `fbx` source
+kind, and recomputed for each new participant/static trial. Segments without
+a reviewed Captury landmark construction remain explicitly uncalibrated.
+
+`captury_q_landmarks.json` is the editable evidence map. In the GUI, it
+renames raw duplicates for review, for example `CAP_RASIS (Q_Wa#1)` and
+`CAP_LK_medial (Q_LK#1)`, while correspondence files retain the stable raw
+occurrence keys (`Q_Wa#1`, `Q_LK#1`, ...). Review this map before enabling
+the calibration on a new Captury export because duplicate occurrence order is
+an export property, not a universal anatomical guarantee. These frames are
+anatomical surrogates for comparison; they do not, on their own, certify ISB
+D1-D3 compliance.
+
+BioBuddy exports the generated biorbd segments with `translations xyz` and
 `rotations zyx` in the `bioMod`. The saved `q` arrays still expose readable
 coordinate names such as `Hips_transX`, then `Hips_rotX`, `Hips_rotY`,
 `Hips_rotZ`; always use the `q_names`/generated `bioMod` order rather than

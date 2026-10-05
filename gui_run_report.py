@@ -38,7 +38,21 @@ def summarize_run_report(report: Mapping[str, Any]) -> str:
         lines.append(f"Essai: {trial}")
     axis = report.get("axis_conversion")
     if axis:
-        lines.append(f"Axe modèle -> C3D: {axis}")
+        if isinstance(axis, Mapping):
+            descriptions: list[str] = []
+            for system in ("captury", "motive"):
+                details = axis.get(system)
+                if not isinstance(details, Mapping):
+                    continue
+                own = str(details.get("own_c3d_vertical_axis", "?"))
+                common = str(details.get("common_comparison_vertical_axis", "+Z"))
+                descriptions.append(f"{system.title()} C3D {own} -> commun {common}")
+            if descriptions:
+                lines.append("Axes: " + "; ".join(descriptions))
+            else:
+                lines.append(f"Axes: {axis}")
+        else:
+            lines.append(f"Axe modèle -> C3D: {axis}")
     for model_key, label in (("captury", "Captury"), ("motive", "Motive")):
         model_line = _model_line(report, model_key, label)
         if model_line:

@@ -91,8 +91,13 @@ class P6DebugGuiTests(unittest.TestCase):
             "p6_auto_analyze",
             "p6_model_source",
             "p6_model_to_c3d_axis",
+            "p6_captury_model_to_c3d_axis",
+            "p6_motive_model_to_c3d_axis",
+            "p6_captury_q_landmarks_json",
             "p6_segment_reference",
             "p6_captury_reorient_thigh_y_from_cor",
+            "p6_captury_rename_axes",
+            "p6_captury_calibrate_segment_frames",
             "p6_rotate_body_segments_180_x",
             "p6_reexpress_rotations_zxy",
             "p6_disable_static_model_alignment",
@@ -123,6 +128,10 @@ class P6DebugGuiTests(unittest.TestCase):
         gui.vars["p6_segment_reference"].set("biobuddy")
         gui.vars["p6_joint_centre_reference"].set("biobuddy")
         gui.vars["p6_captury_reorient_thigh_y_from_cor"].set(False)
+        gui.vars["p6_captury_model_to_c3d_axis"].set("auto")
+        gui.vars["p6_motive_model_to_c3d_axis"].set("auto")
+        gui.vars["p6_captury_rename_axes"].set(False)
+        gui.vars["p6_captury_calibrate_segment_frames"].set(False)
         gui.vars["p6_rotate_body_segments_180_x"].set(False)
         gui.vars["p6_reexpress_rotations_zxy"].set(False)
         gui.vars["p6_disable_static_model_alignment"].set(False)
@@ -157,6 +166,16 @@ class P6DebugGuiTests(unittest.TestCase):
             gui.vars["p6_phase_normalization_points"].set("101")
 
             self.assertTrue(CapturyBioBuddyGui._validate_p6_analysis(gui))
+
+    def test_captury_frame_modes_are_mutually_exclusive(self) -> None:
+        gui = self.make_gui_stub()
+        gui.vars["p6_captury_rename_axes"].set(True)
+        gui.vars["p6_captury_calibrate_segment_frames"].set(True)
+
+        CapturyBioBuddyGui._enforce_captury_frame_mode(gui, "calibrate")
+
+        self.assertTrue(gui.vars["p6_captury_calibrate_segment_frames"].get())
+        self.assertFalse(gui.vars["p6_captury_rename_axes"].get())
 
     def test_temporal_gui_validation_rejects_invalid_settings(self) -> None:
         gui = self.make_gui_stub()
@@ -1077,6 +1096,8 @@ class P6DebugGuiTests(unittest.TestCase):
         self.assertEqual(vertical_axis_label("bvh"), "+Y modèle")
         self.assertEqual(vertical_axis_label("fbx"), "+Y modèle")
         self.assertEqual(vertical_axis_label("c3d"), "+Z labo")
+        self.assertEqual(vertical_axis_label("c3d", "Captury"), "+Y labo")
+        self.assertEqual(vertical_axis_label("c3d", "Motive"), "+Z labo")
 
     def test_viewer_anatomical_axis_uses_motive_left_right_markers(self) -> None:
         viewer = object.__new__(TkC3DTrialCanvas)

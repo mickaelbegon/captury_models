@@ -18,6 +18,7 @@ file.
 from __future__ import annotations
 
 import argparse
+from dataclasses import replace
 import importlib.util
 import json
 import os
@@ -35,6 +36,10 @@ from typing import Iterable
 import numpy as np
 
 from c3d_trial_viewer import load_c3d_marker_data
+from captury_frame_calibration import (
+    captury_display_labels,
+    load_captury_q_landmark_config,
+)
 from gui_commands import (
     C3D_VIEWER_SCRIPT,
     COMMAND_MODES,
@@ -118,6 +123,7 @@ from motive57_c3d_mapping import (
     motive57_mapping_payload,
     save_motive57_mapping,
 )
+from mocap_coordinate_frames import resolve_system_coordinate_frames
 
 try:
     import pandas as pd
@@ -425,8 +431,13 @@ class CapturyBioBuddyGui(tk.Tk):
             "p6_no_cache": False,
             "p6_model_source": "bvh",
             "p6_model_to_c3d_axis": "auto",
+            "p6_captury_model_to_c3d_axis": "auto",
+            "p6_motive_model_to_c3d_axis": "auto",
+            "p6_captury_q_landmarks_json": "captury_q_landmarks.json",
             "p6_segment_reference": "biobuddy",
             "p6_captury_reorient_thigh_y_from_cor": False,
+            "p6_captury_rename_axes": False,
+            "p6_captury_calibrate_segment_frames": False,
             "p6_rotate_body_segments_180_x": False,
             "p6_reexpress_rotations_zxy": False,
             "p6_disable_static_model_alignment": False,
@@ -589,32 +600,58 @@ class CapturyBioBuddyGui(tk.Tk):
         self._combo_row(
             data,
             6,
-            "Axes modèle -> C3D",
-            "p6_model_to_c3d_axis",
+            "Captury modèle -> C3D",
+            "p6_captury_model_to_c3d_axis",
             ("auto", "y_up_to_z_up", "identity"),
         )
         self._combo_row(
             data,
             7,
+            "Motive modèle -> C3D",
+            "p6_motive_model_to_c3d_axis",
+            ("auto", "y_up_to_z_up", "identity"),
+        )
+        self._combo_row(
+            data,
+            8,
             "Offset trans. racine",
             "root_offset_mode",
             ROOT_OFFSET_MODE_CHOICES,
         )
         self._check(
             data,
-            8,
+            9,
             "R(x,180°)R(y,180°)",
             "p6_rotate_body_segments_180_x",
         )
         self._check(
             data,
-            9,
+            10,
+            "Captury : renommer axes R(y,90°) (diagnostic)",
+            "p6_captury_rename_axes",
+        )
+        self._check(
+            data,
+            11,
+            "Captury : calibration repères Q_* + CoR (statique)",
+            "p6_captury_calibrate_segment_frames",
+        )
+        self._path_row(
+            data,
+            12,
+            "Config Q_* Captury",
+            "p6_captury_q_landmarks_json",
+            [("JSON", "*.json"), ("Tous les fichiers", "*")],
+        )
+        self._check(
+            data,
+            13,
             "Désactiver recalage statique Captury -> Motive",
             "p6_disable_static_model_alignment",
         )
         self._check(
             data,
-            10,
+            14,
             "Désactiver recalage Motive -> marqueurs C3D",
             "p6_disable_motive_marker_alignment",
         )
@@ -1323,53 +1360,61 @@ class CapturyBioBuddyGui(tk.Tk):
         self._combo_row(
             chain_compare,
             1,
-            "Axes modèle -> C3D",
-            "p6_model_to_c3d_axis",
+            "Captury modèle -> C3D",
+            "p6_captury_model_to_c3d_axis",
             ("auto", "y_up_to_z_up", "identity"),
         )
         self._combo_row(
             chain_compare,
             2,
+            "Motive modèle -> C3D",
+            "p6_motive_model_to_c3d_axis",
+            ("auto", "y_up_to_z_up", "identity"),
+        )
+        self._combo_row(
+            chain_compare,
+            3,
             "Offset trans. racine",
             "root_offset_mode",
             ROOT_OFFSET_MODE_CHOICES,
         )
         self._check(
             chain_compare,
-            3,
+            4,
             "Désactiver recalage statique Captury -> Motive",
             "p6_disable_static_model_alignment",
         )
         self._check(
             chain_compare,
-            4,
+            5,
             "Désactiver recalage Motive -> marqueurs C3D",
             "p6_disable_motive_marker_alignment",
         )
         self._check(
             chain_compare,
-            5,
+            6,
             "Captury: axe Y cuisse = hanche -> genou",
             "p6_captury_reorient_thigh_y_from_cor",
         )
         self._check(
             chain_compare,
-            6,
+            7,
             "R(x,180°)R(y,180°)",
             "p6_rotate_body_segments_180_x",
         )
-        self._check(chain_compare, 7, "Ne pas extraire les meshes FBX", "p6_no_mesh")
-        self._entry_row(chain_compare, 8, "Max points mesh", "p6_max_mesh_points")
+        self._check(chain_compare, 8, "Ne pas extraire les meshes FBX", "p6_no_mesh")
+        self._entry_row(chain_compare, 9, "Max points mesh", "p6_max_mesh_points")
         ttk.Label(
             chain_compare,
             text=(
                 "Utilise BVH/FBX pour construire les modèles BioBuddy/biorbd des deux systèmes. "
-                "Le mode y_up_to_z_up place la hauteur modèle sur Z avant écriture dans le C3D cible. "
+                "En auto, Captury reste +Y -> +Y dans son C3D et Motive passe +Y -> +Z; "
+                "les menus séparés sont réservés aux diagnostics source par source. "
                 "Root offset auto compare keep/subtract avec le C3D et retient la meilleure superposition."
             ),
             style="Status.TLabel",
             wraplength=760,
-        ).grid(row=9, column=0, columnspan=3, sticky="w", padx=10, pady=(4, 10))
+        ).grid(row=10, column=0, columnspan=3, sticky="w", padx=10, pady=(4, 10))
 
         explorer = ttk.LabelFrame(tab, text="Explorateur BioBuddy")
         explorer.grid(row=3, column=0, sticky="ew", pady=(12, 0))
@@ -1936,16 +1981,30 @@ class CapturyBioBuddyGui(tk.Tk):
                 continue
             try:
                 data = self._load_cached_c3d_marker_data(path)
+                if source == "captury":
+                    data = self._captury_marker_display_data(data)
             except Exception as exc:
                 self._append_log(f"\nListe marqueurs impossible pour {path}: {exc}\n")
                 continue
-            skin_marker_labels = [
-                label
-                for label in data.labels
+            raw_display_labels = marker_display_labels(data.labels)
+            visual_display_labels = (
+                data.display_labels
+                if data.display_labels is not None
+                and len(data.display_labels) == len(data.labels)
+                else raw_display_labels
+            )
+            pairs = sorted(
+                (visual_label, raw_label)
+                for label, visual_label, raw_label in zip(
+                    data.labels,
+                    visual_display_labels,
+                    raw_display_labels,
+                    strict=True,
+                )
                 if not is_joint_centre_marker_label(str(label))
-            ]
-            display_labels = sorted(marker_display_labels(skin_marker_labels))
-            raw_by_display = {label: label for label in display_labels}
+            )
+            display_labels = [display for display, _raw in pairs]
+            raw_by_display = {display: raw for display, raw in pairs}
             self.marker_list_label_lookup[source] = raw_by_display
             for display_label in display_labels:
                 listbox.insert(tk.END, display_label)
@@ -2225,6 +2284,22 @@ class CapturyBioBuddyGui(tk.Tk):
             self.joint_chain_cache[key] = load_joint_centre_chain_data(path)
         return self.joint_chain_cache[key]
 
+    def _captury_marker_display_data(self, data: C3DMarkerData) -> C3DMarkerData:
+        """Attach editable Q_* aliases without altering raw C3D identifiers."""
+
+        configured_path = str(self.vars["p6_captury_q_landmarks_json"].get()).strip()
+        try:
+            config = (
+                load_captury_q_landmark_config(self._resolve(configured_path))
+                if configured_path
+                else load_captury_q_landmark_config()
+            )
+            display_labels = captury_display_labels(data.labels, config)
+        except (OSError, ValueError, json.JSONDecodeError) as exc:
+            self._append_log(f"\nAlias Q_* Captury indisponibles: {exc}\n")
+            display_labels = marker_display_labels(data.labels)
+        return replace(data, display_labels=display_labels)
+
     def _selected_trial_joint_chain_path(self) -> Path | None:
         selected = str(self.vars["selected_trial"].get()).strip()
         if not selected or selected == ALL_TRIALS_LABEL:
@@ -2262,10 +2337,19 @@ class CapturyBioBuddyGui(tk.Tk):
         for source, c3d_path in c3d_paths.items():
             try:
                 data = self._load_cached_c3d_marker_data(c3d_path)
+                if source.lower() == "captury":
+                    data = self._captury_marker_display_data(data)
                 layers[source.lower()] = data
             except Exception as exc:
                 failed.append(source)
                 self._append_log(f"\nVisu 3D C3D impossible pour {c3d_path}: {exc}\n")
+        if "captury" in layers:
+            captury_coordinates = resolve_system_coordinate_frames("captury", "auto")
+            layers["captury"] = transformed_marker_data(
+                layers["captury"],
+                captury_coordinates.own_c3d_to_common.T,
+                np.zeros(3),
+            )
         captury_transform = None
         if "captury" in layers and "motive" in layers:
             captury_transform = captury_marker_transform_from_c3d_layers(
@@ -3750,9 +3834,14 @@ class CapturyBioBuddyGui(tk.Tk):
         for name in (
             "p6_model_source",
             "p6_model_to_c3d_axis",
+            "p6_captury_model_to_c3d_axis",
+            "p6_motive_model_to_c3d_axis",
+            "p6_captury_q_landmarks_json",
             "root_offset_mode",
             "p6_segment_reference",
             "p6_captury_reorient_thigh_y_from_cor",
+            "p6_captury_rename_axes",
+            "p6_captury_calibrate_segment_frames",
             "p6_rotate_body_segments_180_x",
             "p6_reexpress_rotations_zxy",
             "p6_disable_static_model_alignment",
@@ -3770,6 +3859,12 @@ class CapturyBioBuddyGui(tk.Tk):
             )
         self.vars["p6_rotate_body_segments_180_x"].trace_add(
             "write", lambda *_: self._update_visible_cor_layers()
+        )
+        self.vars["p6_captury_rename_axes"].trace_add(
+            "write", lambda *_: self._enforce_captury_frame_mode("rename")
+        )
+        self.vars["p6_captury_calibrate_segment_frames"].trace_add(
+            "write", lambda *_: self._enforce_captury_frame_mode("calibrate")
         )
         self.vars["p6_joint_centre_reference"].trace_add(
             "write", lambda *_: self._draw_selected_graph("centres")
@@ -3901,7 +3996,11 @@ class CapturyBioBuddyGui(tk.Tk):
                     tree.insert(
                         "",
                         tk.END,
-                        values=(kind.upper(), vertical_axis_label(kind), display_path),
+                        values=(
+                            kind.upper(),
+                            vertical_axis_label(kind, system),
+                            display_path,
+                        ),
                     )
 
     def _command_mode(self) -> str:
@@ -4193,6 +4292,18 @@ class CapturyBioBuddyGui(tk.Tk):
     def _on_p6_auto_analysis_option_changed(self) -> None:
         self._schedule_p6_auto_analysis("option modifiée")
 
+    def _enforce_captury_frame_mode(self, selected_mode: str) -> None:
+        """Keep the pedagogical and landmark-based Captury modes exclusive."""
+
+        if selected_mode == "rename":
+            selected = bool(self.vars["p6_captury_rename_axes"].get())
+            other_name = "p6_captury_calibrate_segment_frames"
+        else:
+            selected = bool(self.vars["p6_captury_calibrate_segment_frames"].get())
+            other_name = "p6_captury_rename_axes"
+        if selected and bool(self.vars[other_name].get()):
+            self.vars[other_name].set(False)
+
     def _schedule_p6_auto_analysis(self, reason: str) -> None:
         if self.process is not None:
             self.pending_auto_analysis = True
@@ -4231,6 +4342,8 @@ class CapturyBioBuddyGui(tk.Tk):
         self.vars["p6_auto_analyze"].set(True)
         self.vars["p6_model_source"].set("bvh")
         self.vars["p6_model_to_c3d_axis"].set("auto")
+        self.vars["p6_captury_model_to_c3d_axis"].set("auto")
+        self.vars["p6_motive_model_to_c3d_axis"].set("auto")
         self.vars["root_offset_mode"].set(ROOT_OFFSET_MODE_LABELS["auto"])
         self.vars["p6_segment_reference"].set("biobuddy")
         self.vars["p6_no_mesh"].set(True)

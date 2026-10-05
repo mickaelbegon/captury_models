@@ -49,6 +49,7 @@ try:
         split_static_calibration_trial,
         spatial_calibration_from_report,
         static_transform_from_report,
+        requested_model_to_own_c3d_axis,
         requested_root_offset_mode,
         time_window_mask,
         trial_cache_fingerprint,
@@ -96,6 +97,7 @@ except ImportError as exc:  # pragma: no cover - depends on optional scientific 
     split_static_calibration_trial = None
     spatial_calibration_from_report = None
     static_transform_from_report = None
+    requested_model_to_own_c3d_axis = None
     requested_root_offset_mode = None
     time_window_mask = None
     trial_cache_fingerprint = None
@@ -326,6 +328,25 @@ class FlatTrialDiscoveryTests(unittest.TestCase):
 
         self.assertEqual(requested_root_offset_mode(args, "captury", None), "keep")
         self.assertEqual(requested_root_offset_mode(args, "motive", None), "auto")
+
+    def test_manual_model_axis_mode_must_name_the_system(self) -> None:
+        assert requested_model_to_own_c3d_axis is not None
+
+        legacy = argparse.Namespace(model_to_c3d_axis="identity")
+        with self.assertRaises(ValueError):
+            requested_model_to_own_c3d_axis(legacy, "captury")
+
+        explicit = argparse.Namespace(
+            model_to_c3d_axis="auto",
+            captury_model_to_c3d_axis="identity",
+            motive_model_to_c3d_axis="y_up_to_z_up",
+        )
+        self.assertEqual(
+            requested_model_to_own_c3d_axis(explicit, "captury"), "identity"
+        )
+        self.assertEqual(
+            requested_model_to_own_c3d_axis(explicit, "motive"), "y_up_to_z_up"
+        )
 
     def test_comparison_inputs_include_only_selected_model_files(self) -> None:
         assert TrialBundle is not None

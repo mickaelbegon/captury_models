@@ -127,9 +127,31 @@ class SpatialCalibrationTests(unittest.TestCase):
                 "root_translation_policy_in_native_q",
                 "forward_kinematics_in_native_model_frame",
                 "source_native_to_c3d_mm",
+                "optional_captury_local_segment_frame_calibration",
                 "captury_to_motive_static",
                 "motive_to_c3d_static",
             ],
+        )
+
+    def test_roundtrip_preserves_optional_captury_frame_calibration(self) -> None:
+        calibration = SpatialCalibration(
+            static_trial="Static",
+            calibration_centres=("Hips",),
+            evaluation_centres=(),
+            captury_to_motive=RowRigidTransform.identity(),
+            motive_to_c3d=RowRigidTransform.identity(),
+            status="ok",
+            captury_segment_frame_calibration={
+                "source_kind": "bvh",
+                "segments": {"Hips": {"matrix": np.eye(3).tolist()}},
+            },
+        )
+
+        restored = SpatialCalibration.from_dict(calibration.to_dict())
+
+        assert restored.captury_segment_frame_calibration is not None
+        self.assertEqual(
+            restored.captury_segment_frame_calibration["source_kind"], "bvh"
         )
 
     def test_transform_composition_matches_sequential_non_commuting_stages(

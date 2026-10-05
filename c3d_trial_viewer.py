@@ -36,6 +36,7 @@ class C3DMarkerData:
     rate: float
     unit: str = "mm"
     time: np.ndarray | None = None
+    display_labels: list[str] | None = None
 
     @property
     def n_frames(self) -> int:

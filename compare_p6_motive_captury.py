@@ -97,6 +97,17 @@ from joint_kinematics import (
     write_joint_kinematics_audit,
 )
 from captury_c3d_angles import analyze_captury_angle_channels
+from captury_frame_calibration import (
+    apply_segment_frame_corrections,
+    apply_simple_captury_axis_rename,
+    fit_captury_segment_frame_corrections,
+    is_static_frame_calibration_trial,
+    load_captury_q_landmark_config,
+)
+from mocap_coordinate_frames import (
+    resolve_system_coordinate_frames,
+    transform_point_trajectories,
+)
 from temporal_synchronization import (
     LAG_CONVENTION,
     apply_time_offset,
@@ -112,7 +123,7 @@ DEFAULT_DATA_ROOT = Path("local_trials/2026-06-30_P6_flat")
 DEFAULT_OUTPUT_ROOT = Path("out_p6_motive_captury_comparison")
 ANGLE_LABEL_REGEX = r"(?i)(^.*angles?$|^.*_angle[s]?$|angle)"
 FOOT_MARKER_PATTERN = r"(LFCC|RFCC|LFM|RFM|LDP|RDP|Foot|Toe|Heel)"
-CACHE_VERSION = 12
+CACHE_VERSION = 13
 ROTATION_SEQUENCE_ZXY = "ZXY"
 DEFAULT_ALIGNMENT_CALIBRATION_CENTRES = (
     "Hips",
@@ -135,6 +146,13 @@ SCIENTIFIC_IMPLEMENTATION_FILES = {
     "mocap_alignment_code": Path(__file__).with_name("mocap_alignment.py"),
     "captury_c3d_angle_decoder": Path(__file__).with_name("captury_c3d_angles.py"),
     "captury_c3d_angle_registry": Path(__file__).with_name("captury_c3d_angles.json"),
+    "captury_frame_calibration_code": Path(__file__).with_name(
+        "captury_frame_calibration.py"
+    ),
+    "captury_q_landmarks": Path(__file__).with_name("captury_q_landmarks.json"),
+    "mocap_coordinate_frames_code": Path(__file__).with_name(
+        "mocap_coordinate_frames.py"
+    ),
     "biobuddy_ik_code": Path(__file__).with_name("run_biobuddy_c3d_ik.py"),
     "temporal_synchronization_code": Path(__file__).with_name(
         "temporal_synchronization.py"
@@ -255,6 +273,17 @@ def trial_cache_fingerprint(
                 getattr(args, "bvh_fbx_max_p95_geodesic_deg", 5.0)
             ),
             "model_to_c3d_axis": args.model_to_c3d_axis,
+            "captury_model_to_c3d_axis": getattr(
+                args, "captury_model_to_c3d_axis", None
+            ),
+            "motive_model_to_c3d_axis": getattr(args, "motive_model_to_c3d_axis", None),
+            "captury_q_landmarks_json": (
+                file_fingerprint(args.captury_q_landmarks_json)
+                if getattr(args, "captury_q_landmarks_json", None)
+                else file_fingerprint(
+                    Path(__file__).with_name("captury_q_landmarks.json")
+                )
+            ),
             "captury_unit_scale_to_m": args.captury_unit_scale_to_m,
             "motive_unit_scale_to_m": args.motive_unit_scale_to_m,
             "biobuddy_unit_scale_to_m": args.biobuddy_unit_scale_to_m,
@@ -269,6 +298,10 @@ def trial_cache_fingerprint(
             "segment_reference": args.segment_reference,
             "captury_reorient_thigh_y_from_cor": bool(
                 args.captury_reorient_thigh_y_from_cor
+            ),
+            "captury_rename_axes": bool(getattr(args, "captury_rename_axes", False)),
+            "captury_calibrate_segment_frames": bool(
+                getattr(args, "captury_calibrate_segment_frames", False)
             ),
             "rotate_body_segments_180_x": bool(args.rotate_body_segments_180_x),
             "reexpress_rotations_zxy": bool(args.reexpress_rotations_zxy),
@@ -468,6 +501,31 @@ def requested_root_offset_mode(
             return frozen
     specific = getattr(args, f"{system}_root_offset_mode", None)
     return specific or args.root_offset_mode
+
+
+def requested_model_to_own_c3d_axis(
+    args: argparse.Namespace,
+    system: str,
+) -> str:
+    """Resolve an explicit system-specific model-to-own-C3D basis mode.
+
+    A single manual axis choice cannot be physically valid for both current
+    exports: Captury C3D is ``+Y`` up and Motive C3D is ``+Z`` up. The legacy
+    shared option is therefore accepted only in ``auto`` mode; explicit
+    diagnostics must name the system they affect.
+    """
+
+    specific = getattr(args, f"{system}_model_to_c3d_axis", None)
+    if specific:
+        return str(specific)
+    legacy = str(getattr(args, "model_to_c3d_axis", "auto"))
+    if legacy != "auto":
+        raise ValueError(
+            "--model-to-c3d-axis is only valid with auto for Captury/Motive "
+            "comparisons. Use --captury-model-to-c3d-axis and "
+            "--motive-model-to-c3d-axis explicitly."
+        )
+    return "auto"
 
 
 def safe_name(value: str) -> str:
@@ -958,7 +1016,7 @@ def build_model_run(
     max_mesh_points: int,
     unit_scale_override: float | None,
     root_offset_mode: str,
-    model_to_c3d_axis: str,
+    model_to_c3d_axis: str | np.ndarray,
     angle_label_regex: str,
 ) -> ModelRun:
     source_kind, source_path = select_model_file(bundle, system, model_source)
@@ -1125,6 +1183,7 @@ def build_model_run_with_rotation_audit(
     args: argparse.Namespace,
     trial_dir: Path,
     root_offset_mode: str | None = None,
+    model_to_own_c3d_axis: str | np.ndarray | None = None,
 ) -> tuple[ModelRun, dict[str, Any]]:
     """Build the selected export and optionally audit BVH/FBX equivalence.
 
@@ -1155,7 +1214,11 @@ def build_model_run_with_rotation_audit(
                 else args.motive_unit_scale_to_m
             ),
             root_offset_mode=root_offset_mode or args.root_offset_mode,
-            model_to_c3d_axis=args.model_to_c3d_axis,
+            model_to_c3d_axis=(
+                args.model_to_c3d_axis
+                if model_to_own_c3d_axis is None
+                else model_to_own_c3d_axis
+            ),
             angle_label_regex=args.angle_label_regex,
         )
 
@@ -1244,7 +1307,24 @@ def build_model_run_with_rotation_audit(
     return runs[selected_kind], audit
 
 
-def model_to_c3d_matrix(axis_mode: str) -> np.ndarray:
+def model_to_c3d_matrix(axis_mode: str | np.ndarray) -> np.ndarray:
+    """Return one validated model-to-C3D basis matrix.
+
+    String modes are kept for backwards-compatible single-source commands.
+    The multi-system workflow resolves source-specific matrices upstream and
+    passes the concrete 3x3 matrix here, avoiding a hidden shared ``auto``
+    assumption for Captury and Motive.
+    """
+
+    if not isinstance(axis_mode, str):
+        matrix = np.asarray(axis_mode, dtype=float)
+        if matrix.shape != (3, 3):
+            raise ValueError(f"Axis matrix must be 3x3, got {matrix.shape}")
+        if not np.allclose(matrix.T @ matrix, np.eye(3), atol=1e-8):
+            raise ValueError("Axis matrix must be orthonormal")
+        if not np.isclose(np.linalg.det(matrix), 1.0, atol=1e-8):
+            raise ValueError("Axis matrix must have determinant +1")
+        return matrix
     if axis_mode == "auto":
         axis_mode = "y_up_to_z_up"
     if axis_mode == "identity":
@@ -1261,7 +1341,9 @@ def model_to_c3d_matrix(axis_mode: str) -> np.ndarray:
 
 
 def centres_to_c3d_mm(
-    centres_native: dict[str, np.ndarray], unit_scale_to_m: float, axis_mode: str
+    centres_native: dict[str, np.ndarray],
+    unit_scale_to_m: float,
+    axis_mode: str | np.ndarray,
 ) -> dict[str, np.ndarray]:
     matrix = model_to_c3d_matrix(axis_mode)
     factor = unit_scale_to_m * 1000.0
@@ -1270,7 +1352,7 @@ def centres_to_c3d_mm(
 
 def rotations_to_c3d(
     rotations_native: dict[str, np.ndarray],
-    axis_mode: str,
+    axis_mode: str | np.ndarray,
     row_global_rotation: np.ndarray | None = None,
 ) -> dict[str, np.ndarray]:
     matrix = model_to_c3d_matrix(axis_mode)
@@ -1845,7 +1927,7 @@ def choose_root_offset_policy_in_c3d(
     time: np.ndarray,
     joint_names: list[str],
     unit_scale_to_m: float,
-    model_to_c3d_axis: str,
+    model_to_c3d_axis: str | np.ndarray,
     c3d_markers_mm: np.ndarray,
     c3d_time: np.ndarray,
     requested_mode: str,
@@ -1886,7 +1968,11 @@ def choose_root_offset_policy_in_c3d(
         "score_mm_subtract_static_offset": corrected_score,
         "score_mm_keep_file_translation": uncorrected_score,
         "score_frame": "c3d_mm_after_model_to_c3d_axis",
-        "model_to_c3d_axis": model_to_c3d_axis,
+        "model_to_c3d_axis": (
+            model_to_c3d_axis
+            if isinstance(model_to_c3d_axis, str)
+            else np.asarray(model_to_c3d_axis, dtype=float).tolist()
+        ),
         "q_names": q_names,
     }
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -3280,6 +3366,7 @@ def propose_marker_correspondences(
     translation: np.ndarray,
     angle_label_regex: str,
     captury_lag_s: float = 0.0,
+    captury_c3d_to_common: np.ndarray | None = None,
 ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
     motive_labels, motive_points, _motive_residuals, motive_time = read_c3d_points_mm(
         motive_c3d, angle_label_regex
@@ -3287,6 +3374,10 @@ def propose_marker_correspondences(
     captury_labels, captury_points, _captury_residuals, captury_time = (
         read_c3d_points_mm(captury_c3d, angle_label_regex)
     )
+    if captury_c3d_to_common is not None:
+        captury_points = transform_point_trajectories(
+            captury_points, captury_c3d_to_common
+        )
     return propose_marker_correspondences_from_points(
         motive_labels,
         motive_points,
@@ -3308,6 +3399,7 @@ def marker_correspondence_rows(
     translation: np.ndarray,
     landmark_map: list[dict[str, Any]],
     captury_lag_s: float = 0.0,
+    captury_c3d_to_common: np.ndarray | None = None,
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
     motive_labels, motive_points, _motive_residuals, motive_time = read_c3d_points_mm(
         motive_c3d
@@ -3315,6 +3407,10 @@ def marker_correspondence_rows(
     captury_labels, captury_points, _captury_residuals, captury_time = (
         read_c3d_points_mm(captury_c3d)
     )
+    if captury_c3d_to_common is not None:
+        captury_points = transform_point_trajectories(
+            captury_points, captury_c3d_to_common
+        )
     captury_time = apply_time_offset(captury_time, captury_lag_s)
     motive_lookup = marker_indices_by_clean_label(motive_labels)
     captury_lookup = marker_indices_by_clean_label(captury_labels)
@@ -3763,18 +3859,44 @@ def compare_trial(
     motive_root_mode = requested_root_offset_mode(
         args, "motive", static_alignment_transform
     )
+    captury_axis_mode = requested_model_to_own_c3d_axis(args, "captury")
+    motive_axis_mode = requested_model_to_own_c3d_axis(args, "motive")
+    captury_coordinates = resolve_system_coordinate_frames("captury", captury_axis_mode)
+    motive_coordinates = resolve_system_coordinate_frames("motive", motive_axis_mode)
     captury, captury_source_audit = build_model_run_with_rotation_audit(
-        bundle, "captury", args, trial_dir, captury_root_mode
+        bundle,
+        "captury",
+        args,
+        trial_dir,
+        captury_root_mode,
+        captury_coordinates.model_to_own_c3d,
     )
     motive, motive_source_audit = build_model_run_with_rotation_audit(
-        bundle, "motive", args, trial_dir, motive_root_mode
+        bundle,
+        "motive",
+        args,
+        trial_dir,
+        motive_root_mode,
+        motive_coordinates.model_to_own_c3d,
     )
-    cap_c3d_mm = centres_to_c3d_mm(
-        captury.centres_native, captury.unit_scale_to_m, args.model_to_c3d_axis
+    cap_own_c3d_mm = centres_to_c3d_mm(
+        captury.centres_native,
+        captury.unit_scale_to_m,
+        captury_coordinates.model_to_own_c3d,
     )
-    mot_c3d_mm = centres_to_c3d_mm(
-        motive.centres_native, motive.unit_scale_to_m, args.model_to_c3d_axis
+    mot_own_c3d_mm = centres_to_c3d_mm(
+        motive.centres_native,
+        motive.unit_scale_to_m,
+        motive_coordinates.model_to_own_c3d,
     )
+    cap_c3d_mm = {
+        name: captury_coordinates.own_c3d_to_common @ values
+        for name, values in cap_own_c3d_mm.items()
+    }
+    mot_c3d_mm = {
+        name: motive_coordinates.own_c3d_to_common @ values
+        for name, values in mot_own_c3d_mm.items()
+    }
     alignment_report: dict[str, Any]
     spatial_calibration = static_alignment_transform
     if args.disable_static_model_alignment:
@@ -3861,6 +3983,65 @@ def compare_trial(
         motive_to_c3d = RowRigidTransform(
             model_marker_rotation, model_marker_translation
         )
+    captury_frame_calibration: dict[str, Any] | None = None
+    if getattr(args, "captury_calibrate_segment_frames", False):
+        if spatial_calibration is not None:
+            stored = spatial_calibration.captury_segment_frame_calibration
+            if not stored:
+                captury_frame_calibration = {
+                    "status": "missing_frozen_static_calibration",
+                    "source_kind": captury.source_kind,
+                }
+            elif stored.get("source_kind") != captury.source_kind:
+                captury_frame_calibration = {
+                    "status": "source_kind_mismatch",
+                    "static_source_kind": stored.get("source_kind"),
+                    "dynamic_source_kind": captury.source_kind,
+                    "note": "The static correction is not applied across BVH and FBX exports.",
+                }
+            else:
+                captury_frame_calibration = dict(stored)
+                captury_frame_calibration["status"] = "reused_frozen_static_calibration"
+        elif not is_static_frame_calibration_trial(bundle.name, args.static_trial):
+            captury_frame_calibration = {
+                "status": "requires_static_trial_calibration",
+                "trial": bundle.name,
+                "static_trial": args.static_trial,
+                "note": (
+                    "A dynamic trial cannot fit a Captury segment-frame "
+                    "calibration; run the named static trial first."
+                ),
+            }
+        else:
+            q_landmarks_config = load_captury_q_landmark_config(
+                args.captury_q_landmarks_json
+                or Path(__file__).with_name("captury_q_landmarks.json")
+            )
+            captury_labels, captury_points_mm, _residuals, _time = read_c3d_points_mm(
+                bundle.captury_c3d, args.angle_label_regex
+            )
+            captury_rotations_own_c3d = rotations_to_c3d(
+                captury.rotations_native, captury_coordinates.model_to_own_c3d
+            )
+            corrections, calibration_report = fit_captury_segment_frame_corrections(
+                captury_rotations_own_c3d,
+                cap_own_c3d_mm,
+                captury_labels,
+                captury_points_mm,
+                q_landmarks_config,
+            )
+            captury_frame_calibration = {
+                "status": calibration_report["status"],
+                "source_kind": captury.source_kind,
+                "q_landmarks_json": str(
+                    args.captury_q_landmarks_json
+                    or Path(__file__).with_name("captury_q_landmarks.json")
+                ),
+                "matrices": {
+                    segment: matrix.tolist() for segment, matrix in corrections.items()
+                },
+                "report": calibration_report,
+            }
     if spatial_calibration is None:
         calibration_centres = tuple(alignment_report.get("calibration_centres", []))
         evaluation_centres = tuple(alignment_report.get("evaluation_centres", []))
@@ -3878,6 +4059,7 @@ def compare_trial(
             status=status,
             captury_root_offset_mode=selected_root_offset_mode(captury),
             motive_root_offset_mode=selected_root_offset_mode(motive),
+            captury_segment_frame_calibration=captury_frame_calibration,
         )
     marker_rotation, marker_translation = compose_row_alignment(
         rotation, translation, model_marker_rotation, model_marker_translation
@@ -3890,12 +4072,12 @@ def compare_trial(
     )
     cap_rotations_c3d = rotations_to_c3d(
         captury.rotations_native,
-        args.model_to_c3d_axis,
+        captury_coordinates.model_to_common_c3d,
         rotation @ model_marker_rotation,
     )
     mot_rotations_c3d = rotations_to_c3d(
         motive.rotations_native,
-        args.model_to_c3d_axis,
+        motive_coordinates.model_to_common_c3d,
         model_marker_rotation,
     )
     segment_orientation_report: dict[str, Any] = {
@@ -3904,8 +4086,33 @@ def compare_trial(
         ),
         "rotate_body_segments_180_x": bool(args.rotate_body_segments_180_x),
         "reexpress_rotations_zxy": bool(args.reexpress_rotations_zxy),
+        "captury_rename_axes": bool(getattr(args, "captury_rename_axes", False)),
+        "captury_calibrate_segment_frames": bool(
+            getattr(args, "captury_calibrate_segment_frames", False)
+        ),
         "applied": [],
     }
+    if getattr(args, "captury_rename_axes", False):
+        cap_rotations_c3d = apply_simple_captury_axis_rename(cap_rotations_c3d)
+        segment_orientation_report["applied"].append(
+            "captury_simple_global_axis_rename_Ry_90_deg"
+        )
+    elif getattr(args, "captury_calibrate_segment_frames", False):
+        calibration_payload = captury_frame_calibration or {}
+        matrices = {
+            segment: np.asarray(matrix, dtype=float)
+            for segment, matrix in calibration_payload.get("matrices", {}).items()
+        }
+        if matrices:
+            cap_rotations_c3d = apply_segment_frame_corrections(
+                cap_rotations_c3d, matrices
+            )
+            segment_orientation_report["applied"].append(
+                "captury_static_q_landmarks_and_own_model_centres"
+            )
+        segment_orientation_report["captury_static_frame_calibration"] = (
+            calibration_payload
+        )
     if args.captury_reorient_thigh_y_from_cor:
         cap_rotations_c3d = correct_captury_thigh_y_from_cor(
             cap_rotations_c3d, cap_aligned_mm
@@ -4193,6 +4400,7 @@ def compare_trial(
         marker_translation,
         args.angle_label_regex,
         temporal_lag_s,
+        captury_coordinates.own_c3d_to_common,
     )
     marker_proposal_path = trial_dir / "skin_marker_correspondence_proposal.json"
     marker_proposal_path.write_text(
@@ -4212,6 +4420,7 @@ def compare_trial(
         marker_translation,
         landmark_map,
         temporal_lag_s,
+        captury_coordinates.own_c3d_to_common,
     )
     phase_points = int(getattr(args, "phase_normalization_points", 101))
     normalized_scientific_rows: list[dict[str, Any]] = []
@@ -4392,7 +4601,15 @@ def compare_trial(
             },
             "biobuddy": biobuddy_dimension_report,
         },
-        "axis_conversion": args.model_to_c3d_axis,
+        "axis_conversion": {
+            "requested_model_to_own_c3d": {
+                "legacy": args.model_to_c3d_axis,
+                "captury": captury_axis_mode,
+                "motive": motive_axis_mode,
+            },
+            "captury": captury_coordinates.to_report(),
+            "motive": motive_coordinates.to_report(),
+        },
         "time_window": {
             "cut_mode": args.cut_mode,
             "effective_cut_mode": effective_cut_mode,
@@ -4658,6 +4875,54 @@ def parse_args() -> argparse.Namespace:
         "--model-to-c3d-axis",
         choices=["auto", "y_up_to_z_up", "identity"],
         default="auto",
+        help=(
+            "Legacy shared mode. Use auto for Captury/Motive comparisons; "
+            "manual modes must use the system-specific options below."
+        ),
+    )
+    parser.add_argument(
+        "--captury-model-to-c3d-axis",
+        choices=["auto", "y_up_to_z_up", "identity"],
+        default=None,
+        help=(
+            "Optional Captury model -> Captury-own-C3D basis override. "
+            "Default auto is +Y -> +Y."
+        ),
+    )
+    parser.add_argument(
+        "--motive-model-to-c3d-axis",
+        choices=["auto", "y_up_to_z_up", "identity"],
+        default=None,
+        help=(
+            "Optional Motive model -> Motive-own-C3D basis override. "
+            "Default auto is +Y -> +Z."
+        ),
+    )
+    parser.add_argument(
+        "--captury-q-landmarks-json",
+        type=Path,
+        default=None,
+        help=(
+            "Optional Captury Q_* occurrence/role configuration. The bundled "
+            "captury_q_landmarks.json is used when omitted."
+        ),
+    )
+    captury_frame_mode = parser.add_mutually_exclusive_group()
+    captury_frame_mode.add_argument(
+        "--captury-rename-axes",
+        action="store_true",
+        help=(
+            "Apply the simple global Captury local-axis relabelling R_y(90 deg). "
+            "It is a diagnostic baseline, not an ISB calibration."
+        ),
+    )
+    captury_frame_mode.add_argument(
+        "--captury-calibrate-segment-frames",
+        action="store_true",
+        help=(
+            "Fit optional Captury pelvis/thigh local-frame matrices from its own "
+            "static Q_* C3D landmarks and Captury model joint centres."
+        ),
     )
     parser.add_argument("--captury-unit-scale-to-m", type=float, default=None)
     parser.add_argument("--motive-unit-scale-to-m", type=float, default=None)
@@ -4817,6 +5082,13 @@ def run_occlusions_only(
 
 def main() -> None:
     args = parse_args()
+    if args.model_to_c3d_axis != "auto":
+        raise ValueError(
+            "--model-to-c3d-axis is a legacy shared option and must be auto "
+            "for Captury/Motive comparisons. Select source-specific overrides "
+            "with --captury-model-to-c3d-axis and "
+            "--motive-model-to-c3d-axis."
+        )
     discovered_trials = discover_trials(args.data_root)
     if args.list_trials:
         for bundle in discovered_trials:

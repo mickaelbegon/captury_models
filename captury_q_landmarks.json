@@ -1,0 +1,29 @@
+{
+  "schema_version": 1,
+  "scope": "Captury-only Q_* landmark aliases and static anatomical-surrogate frames",
+  "source": "Validated occurrence order for Captury P6 static exports; review aliases in the GUI before use on a new export layout.",
+  "matrix_convention": "R_target = R_source @ C_source_to_target; segment rotations store local axes as columns in the laboratory frame.",
+  "markers": {
+    "Q_Wa#1": {"display": "CAP_RASIS", "role": "right_asis", "status": "accepted"},
+    "Q_Wa#2": {"display": "CAP_LASIS", "role": "left_asis", "status": "accepted"},
+    "Q_Wa#3": {"display": "CAP_LPSIS", "role": "left_psis", "status": "accepted"},
+    "Q_Wa#4": {"display": "CAP_RPSIS", "role": "right_psis", "status": "accepted"},
+    "Q_Wa#5": {"display": "CAP_PSIS_mid", "role": "psis_mid", "status": "accepted"},
+    "Q_LK#1": {"display": "CAP_LK_medial", "role": "left_knee_medial", "status": "accepted"},
+    "Q_LK#2": {"display": "CAP_LK_lateral", "role": "left_knee_lateral", "status": "accepted"},
+    "Q_RK#1": {"display": "CAP_RK_medial", "role": "right_knee_medial", "status": "accepted"},
+    "Q_RK#2": {"display": "CAP_RK_lateral", "role": "right_knee_lateral", "status": "accepted"},
+    "Q_LA#1": {"display": "CAP_LeftAnkle", "role": "left_ankle_region", "status": "accepted"},
+    "Q_RA#1": {"display": "CAP_RightAnkle", "role": "right_ankle_region", "status": "accepted"},
+    "Q_LS#1": {"display": "CAP_LeftShank", "role": "left_shank_region", "status": "accepted"},
+    "Q_RS#1": {"display": "CAP_RightShank", "role": "right_shank_region", "status": "accepted"},
+    "Q_LS#2": {"display": "CAP_LeftShoulder", "role": "left_shoulder_region", "status": "accepted"},
+    "Q_RS#2": {"display": "CAP_RightShoulder", "role": "right_shoulder_region", "status": "accepted"},
+    "Q_LA#2": {"display": "CAP_LeftArm", "role": "left_arm_region", "status": "accepted"},
+    "Q_RA#2": {"display": "CAP_RightArm", "role": "right_arm_region", "status": "accepted"},
+    "Q_He#1": {"display": "CAP_Head", "role": "head_region", "status": "accepted"},
+    "Q_Ch#1": {"display": "CAP_Chest", "role": "chest_region", "status": "accepted"},
+    "Q_LT#1": {"display": "CAP_LeftThigh", "role": "left_thigh_region", "status": "accepted"},
+    "Q_RT#1": {"display": "CAP_RightThigh", "role": "right_thigh_region", "status": "accepted"}
+  }
+}

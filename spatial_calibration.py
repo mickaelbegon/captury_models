@@ -92,6 +92,7 @@ class SpatialCalibration:
     status: str
     captury_root_offset_mode: str = "unknown"
     motive_root_offset_mode: str = "unknown"
+    captury_segment_frame_calibration: Mapping[str, Any] | None = None
 
     def __post_init__(self) -> None:
         overlap = set(self.calibration_centres).intersection(self.evaluation_centres)
@@ -105,7 +106,7 @@ class SpatialCalibration:
 
     def to_dict(self) -> dict[str, Any]:
         return {
-            "schema_version": 1,
+            "schema_version": 2,
             "status": self.status,
             "static_trial": self.static_trial,
             "calibration_centres": list(self.calibration_centres),
@@ -118,12 +119,14 @@ class SpatialCalibration:
                 "root_translation_policy_in_native_q",
                 "forward_kinematics_in_native_model_frame",
                 "source_native_to_c3d_mm",
+                "optional_captury_local_segment_frame_calibration",
                 "captury_to_motive_static",
                 "motive_to_c3d_static",
             ],
             "captury_to_motive": self.captury_to_motive.to_dict(),
             "motive_to_c3d": self.motive_to_c3d.to_dict(),
             "captury_to_c3d_composed": self.captury_to_c3d().to_dict(),
+            "captury_segment_frame_calibration": self.captury_segment_frame_calibration,
         }
 
     @classmethod
@@ -140,6 +143,9 @@ class SpatialCalibration:
             ),
             motive_root_offset_mode=str(
                 values.get("root_translation_policy", {}).get("motive", "unknown")
+            ),
+            captury_segment_frame_calibration=values.get(
+                "captury_segment_frame_calibration"
             ),
         )
 
