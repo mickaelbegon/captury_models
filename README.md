@@ -76,6 +76,28 @@ During animation, the marker overlay contains the C3D marker points after this a
 
 ## Run
 
+### Select available comparison sources
+
+In **Données → Sources à inclure si disponibles**, select Captury, Motive and/or
+BioBuddy. The same workflow uses whichever selected sources are available for
+each trial; a missing Captury recording no longer hides Motive-only trials.
+The CLI equivalent is `--sources motive biobuddy` (default: all three).
+Reports identify requested, used and missing sources and explain unavailable data.
+
+BioBuddy requires its model and Motive C3D marker recording, independently of
+whether the Motive skeleton is selected. Lightweight analyses reuse compatible
+saved IK; enable the existing BioBuddy IK batch option to compute missing IK.
+Native q curves stay separate by source. Without paired capture registration,
+Captury/BioBuddy spatial overlays and paired metrics remain unavailable.
+
+The available-source adapter freezes Motive's existing marker-proxy alignment
+from Static and leaves BioBuddy in its C3D fitting frame. Adding Captury later
+uses the existing paired static registration in the same workflow. This feature
+does not establish anatomical equivalence or change joint-angle conventions.
+When no capture pair is available, disable the existing 180-degree segment-frame
+rotation and ZXY reexpression options; this adapter displays native coordinates.
+
+
 To launch the graphical interface:
 
 ```bash
@@ -730,3 +752,5 @@ The BioBuddy batch now uses only the generated BioBuddy bioMod and the Motive C3
 Each cached summary reports elapsed time, `nfev`, successful frames and marker residuals globally, per marker and per parent segment. The NPZ stores `q`, `qdot`, `qddot`, residuals, `nfev` and timing arrays. The cache key includes the IK implementation hash, and the NPZ digest and minimal schema are checked before reuse. On P6 Static, the corrected technical-marker indexing uses 47/47 markers and reduces the 10-frame diagnostic from the historical approximately 58.7 mm to 0.350 mm mean marker residual; the complete 773-frame static trial reaches a 0.192 mm in-sample residual in about 1.0 s. This is goodness of fit on the markers optimized by IK, not independent validation error. The former value came primarily from mixing indices of all BioMod markers with indices of technical markers after interleaved anatomical markers; it was not evidence that TRF tolerances should be relaxed.
 
 P6 `Marche_001` remains a scientific warning rather than a solver-performance target: the complete trial converges in about 8.8 s but retains 34.95 mm mean marker error. At its first frame, independent rigid fits of marker clusters from the static model are only 0.23-6.15 mm RMSE, while the linked BioBuddy chain produces its largest residuals on upper arms and hands. This points toward inter-segment geometry, functional joint centres/axes or model constraints, rather than a global unit error. No acceptance threshold is silently applied: converged frames remain `diagnostic_only` until this dynamic inconsistency is resolved. BioBuddy DoF names are not assumed homologous to Motive/Captury export names; cross-model kinematics are compared through segment rotation matrices and audited joint conventions until an explicit anatomical DoF map exists.
+
+The “Visu 3D essai” preview supports Shift-drag panning, ordinary drag rotation, wheel zoom, and −/+/Recentrer buttons. “Grande fenêtre” opens an independent snapshot of the loaded trial with the same marker and CoR layers, selected frame, camera, and visibility settings; it includes layer toggles, a frame slider, and playback. Reopen it to load a different trial or refreshed analysis.

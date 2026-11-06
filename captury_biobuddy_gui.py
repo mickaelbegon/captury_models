@@ -248,7 +248,7 @@ def inventory_p6_dataset(data_root: Path) -> dict[str, dict[str, dict[str, Path]
     inventory: dict[str, dict[str, dict[str, Path]]] = {}
     captury_dir = data_root / "Captury"
     motive_dir = data_root / "Motive"
-    if captury_dir.is_dir() and motive_dir.is_dir():
+    if motive_dir.is_dir() or captury_dir.is_dir():
         for path in sorted(captury_dir.glob("*")):
             if path.suffix.lower() not in {".bvh", ".fbx", ".c3d"}:
                 continue
@@ -430,6 +430,9 @@ class CapturyBioBuddyGui(tk.Tk):
             "p6_no_figures": True,
             "p6_no_cache": False,
             "p6_model_source": "bvh",
+            "p6_source_captury": True,
+            "p6_source_motive": True,
+            "p6_source_biobuddy": True,
             "p6_model_to_c3d_axis": "auto",
             "p6_captury_model_to_c3d_axis": "auto",
             "p6_motive_model_to_c3d_axis": "auto",
@@ -655,6 +658,22 @@ class CapturyBioBuddyGui(tk.Tk):
             "Désactiver recalage Motive -> marqueurs C3D",
             "p6_disable_motive_marker_alignment",
         )
+        source_panel = ttk.LabelFrame(data, text="Sources à inclure si disponibles")
+        source_panel.grid(row=15, column=0, columnspan=3, sticky="ew", padx=10, pady=8)
+        self.source_selection_checks = {}
+        for column, (source, label) in enumerate(
+            (("captury", "Captury"), ("motive", "Motive"), ("biobuddy", "BioBuddy"))
+        ):
+            check = ttk.Checkbutton(
+                source_panel, text=label, variable=self.vars[f"p6_source_{source}"]
+            )
+            check.grid(row=0, column=column, sticky="w", padx=8, pady=4)
+            self.source_selection_checks[source] = check
+        ttk.Label(
+            source_panel,
+            text="Chaque essai utilise les sources disponibles. Vous pouvez ajouter Captury plus tard.",
+            wraplength=500,
+        ).grid(row=1, column=0, columnspan=3, sticky="w", padx=8, pady=(0, 4))
         inventory = ttk.LabelFrame(tab, text="Fichiers détectés")
         inventory.grid(row=1, column=0, sticky="nsew", pady=(12, 0))
         inventory.rowconfigure(0, weight=1)
@@ -1803,6 +1822,15 @@ class CapturyBioBuddyGui(tk.Tk):
 
         self.embedded_viewer = TkC3DTrialCanvas(panel)
         self.embedded_viewer.grid(row=3, column=0, sticky="nsew", padx=8, pady=4)
+        ttk.Label(view_bar, text="Maj + glisser : déplacer • Molette : zoom").grid(
+            row=1, column=0, columnspan=2, sticky="w", pady=(4, 0)
+        )
+        camera_controls = ttk.Frame(view_bar)
+        camera_controls.grid(row=2, column=0, columnspan=2, sticky="w")
+        for label, action in (("−", lambda: self.embedded_viewer._zoom(1 / 1.25)),
+                              ("+", lambda: self.embedded_viewer._zoom(1.25)),
+                              ("Recentrer", self.embedded_viewer.reset_camera)):
+            ttk.Button(camera_controls, text=label, command=action).pack(side="left", padx=2)
 
         controls = ttk.Frame(panel)
         controls.grid(row=4, column=0, sticky="ew", padx=8, pady=(4, 8))
@@ -1958,7 +1986,7 @@ class CapturyBioBuddyGui(tk.Tk):
     def _refresh_results(self) -> None:
         self._populate_occlusion_table()
         self._refresh_graphs()
-        self._update_embedded_joint_chain()
+        self._update_embedded_trial_viewer()
         self._auto_enable_biobuddy_cor_layer_after_refresh()
         self._update_run_report_summary()
         self._refresh_isb_report_table()
@@ -2321,12 +2349,33 @@ class CapturyBioBuddyGui(tk.Tk):
     def _update_embedded_trial_viewer(self) -> None:
         if not hasattr(self, "embedded_viewer"):
             return
-        c3d_paths = self._selected_trial_c3d_paths()
+        c3d_paths = dict(self._selected_trial_c3d_paths())
+        report_path = self._selected_trial_report_path()
+        report = {}
+        if report_path is not None:
+            try:
+                report = json.loads(report_path.read_text(encoding="utf-8"))
+            except (OSError, ValueError):
+                pass
+        if report.get("workflow") == "source_comparison":
+            requested = set(report.get("requested_sources", []))
+            if "captury" not in requested:
+                c3d_paths.pop("Captury", None)
+            if not requested.intersection({"motive", "biobuddy"}):
+                c3d_paths.pop("Motive", None)
+            if (
+                "captury" in report.get("available_sources", [])
+                and report.get("alignment", {}).get("status") == "native_source_frame"
+            ):
+                # No inter-system registration: do not fit the marker layer
+                # independently of the native Captury centre chain.
+                c3d_paths.pop("Motive", None)
         if not c3d_paths:
             self._stop_embedded_viewer_play()
             self.viewer_path_var.set("Aucun C3D pour l'essai sélectionné")
             self.embedded_viewer.set_marker_layers({})
             self.embedded_viewer.set_joint_centre_chains(None)
+            self._update_cor_layer_check_states()
             self._refresh_marker_correspondence_lists()
             self.viewer_frame_slider.configure(from_=0, to=0)
             self.viewer_frame_var.set(0)
@@ -2366,6 +2415,7 @@ class CapturyBioBuddyGui(tk.Tk):
             self.viewer_path_var.set("Lecture C3D impossible")
             self.embedded_viewer.set_marker_layers({})
             self.embedded_viewer.set_joint_centre_chains(None)
+            self._update_cor_layer_check_states()
             self.viewer_frame_label_var.set("0 / 0")
             return
         self.embedded_viewer.set_marker_layers(layers)
@@ -3832,6 +3882,9 @@ class CapturyBioBuddyGui(tk.Tk):
             "write", lambda *_: self._refresh_trial_inventory()
         )
         for name in (
+            "p6_source_captury",
+            "p6_source_motive",
+            "p6_source_biobuddy",
             "p6_model_source",
             "p6_model_to_c3d_axis",
             "p6_captury_model_to_c3d_axis",
@@ -4231,6 +4284,15 @@ class CapturyBioBuddyGui(tk.Tk):
         return True
 
     def _validate_p6_analysis(self) -> bool:
+        if not any(
+            bool(self.vars[f"p6_source_{source}"].get())
+            for source in ("captury", "motive", "biobuddy")
+        ):
+            messagebox.showerror(
+                "Aucune source sélectionnée",
+                "Sélectionnez au moins une source dans Données.",
+            )
+            return False
         data_root = str(self.vars["p6_data_root"].get()).strip()
         if not data_root or not self._resolve(data_root).exists():
             messagebox.showerror(
@@ -4271,6 +4333,13 @@ class CapturyBioBuddyGui(tk.Tk):
         return True
 
     def _run_selected_trial_auto_analysis(self) -> None:
+        if not any(
+            bool(self.vars[f"p6_source_{source}"].get())
+            for source in ("captury", "motive", "biobuddy")
+        ):
+            self.pending_auto_analysis = False
+            self.status_var.set("Sélectionnez au moins une source dans Données")
+            return
         if self.process is not None:
             self.pending_auto_analysis = True
             self.status_var.set("Analyse P6 différée: exécution en cours")
@@ -4390,6 +4459,16 @@ class CapturyBioBuddyGui(tk.Tk):
         )
         if c3d_path is not None and c3d_path.exists():
             return c3d_path
+        matching_static = [
+            files.get("Motive", {}).get("c3d")
+            for name, files in self.trial_inventory.items()
+            if name.endswith("_" + static_trial)
+        ]
+        matching_static = [
+            path for path in matching_static if path is not None and path.exists()
+        ]
+        if len(matching_static) == 1:
+            return matching_static[0]
         folder = self._biobuddy_c3d_folder_path()
         for candidate in (
             folder / f"P6_{static_trial}.c3d",
@@ -4402,30 +4481,14 @@ class CapturyBioBuddyGui(tk.Tk):
         return None
 
     def _open_selected_trial_viewer(self) -> None:
-        c3d_path = self._selected_trial_c3d_path()
-        if c3d_path is None:
-            messagebox.showerror(
-                "C3D introuvable",
-                "Aucun C3D Motive ou Captury n'a été trouvé pour l'essai sélectionné.",
-            )
+        from gui_trial_viewer import open_trial_view_window
+
+        source = self.embedded_viewer
+        if not source.marker_layers and source.chain_data is None:
+            messagebox.showinfo("Visu 3D essai", "Charge un essai avant d'ouvrir la grande fenêtre.")
             return
-        if importlib.util.find_spec("PySide6") is None:
-            messagebox.showerror(
-                "PySide6 manquant",
-                "La visualisation 3D intégrée nécessite PySide6. "
-                "Mets l'environnement à jour avec environment_bvh_c3d_biobuddy.yml.",
-            )
-            return
-        command = [sys.executable, str(C3D_VIEWER_SCRIPT), str(c3d_path)]
-        env = os.environ.copy()
-        env.setdefault("MPLCONFIGDIR", "/private/tmp/captury_models_mplconfig")
-        try:
-            subprocess.Popen(command, cwd=PROJECT_DIR, env=env)
-        except Exception as exc:
-            messagebox.showerror("Visu 3D C3D", f"Impossible de lancer la visu:\n{exc}")
-            return
-        self._append_log("$ " + " ".join(shlex.quote(part) for part in command) + "\n")
-        self.status_var.set(f"Visu 3D lancée: {c3d_path.name}")
+        open_trial_view_window(source.winfo_toplevel(), source,
+                               "Visu 3D essai — " + self.viewer_path_var.get())
 
     def _run_selected_command(self) -> None:
         if self.process is not None:
